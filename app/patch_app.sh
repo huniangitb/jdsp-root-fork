@@ -174,6 +174,82 @@ p.write_text(s.replace(old, new, 1), encoding="utf-8")
 print("  overlay patches applied")
 PY
 
+echo "== smali: global on/off switch drives the engine parameter"
+python3 - "$WORK/app" <<'PY'
+import sys, pathlib
+root = pathlib.Path(sys.argv[1])
+p = next(root.glob("smali*/me/timschneeberger/rootlessjamesdsp/interop/JamesDspRemoteEngine.smali"))
+s = p.read_text(encoding="utf-8")
+old = """.method public setEnabled(Z)V
+    .locals 1
+
+    .line 52
+    iget-object v0, p0, Lme/timschneeberger/rootlessjamesdsp/interop/JamesDspRemoteEngine;->effect:Landroid/media/audiofx/AudioEffect;
+
+    if-eqz v0, :cond_0
+
+    invoke-virtual {v0, p1}, Landroid/media/audiofx/AudioEffect;->setEnabled(Z)I
+
+    :cond_0
+    return-void
+.end method"""
+new = """.method public setEnabled(Z)V
+    .locals 5
+
+    .line 52
+    iget-object v0, p0, Lme/timschneeberger/rootlessjamesdsp/interop/JamesDspRemoteEngine;->effect:Landroid/media/audiofx/AudioEffect;
+
+    if-eqz v0, :cond_0
+
+    invoke-virtual {v0, p1}, Landroid/media/audiofx/AudioEffect;->setEnabled(Z)I
+
+    # JamesDSP 全局开关：框架在每个新输出会话都会重新 enable 效果实例，
+    # 所以总开关同时写入引擎参数 SET_PARAM(cmd=400)，由引擎持久化并全局旁路。
+    const/4 v1, 0x4
+
+    new-array v1, v1, [B
+
+    fill-array-data v1, :array_master_param
+
+    const/4 v2, 0x2
+
+    new-array v2, v2, [B
+
+    if-eqz p1, :cond_master_off
+
+    const/4 v3, 0x1
+
+    goto :goto_master_set
+
+    :cond_master_off
+    const/4 v3, 0x0
+
+    :goto_master_set
+    const/4 v4, 0x0
+
+    aput-byte v3, v2, v4
+
+    invoke-static {v0, v1, v2}, Lme/timschneeberger/rootlessjamesdsp/utils/extensions/AudioEffectExtensions;->\$r8\$lambda\$2Nm4p6RuTTrFUzd0cCb_ALugltY(Landroid/media/audiofx/AudioEffect;[B[B)I
+
+    :cond_0
+    return-void
+
+    :array_master_param
+    .array-data 1
+        0x90t
+        0x1t
+        0x0t
+        0x0t
+    .end array-data
+.end method"""
+if "array_master_param" not in s:
+    assert old in s, "JamesDspRemoteEngine.setEnabled pattern changed"
+    p.write_text(s.replace(old, new, 1), encoding="utf-8")
+    print("  setEnabled -> SET_PARAM(cmd=400) patched")
+else:
+    print("  already patched")
+PY
+
 echo "== build + sign"
 JAR=$(ls /usr/share/java/android-apktool/apktool.jar 2>/dev/null || echo "")
 if [ -n "$JAR" ]; then

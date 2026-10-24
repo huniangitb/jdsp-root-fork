@@ -61,3 +61,21 @@ AIDL_EFFECT_V=3 AIDL_TYPES_V=5 ./native/aidl/build-aidl.sh vendor
 
 需要从目标机 \`/system/lib64\` 拷出 stub 库到 \`aidl-vendor/device-libs/\`，
 细节与 AOSP 头来源见 \`native/aidl/AIDL-NOTES.md\`。
+
+## 6. 引擎补丁与 App 补丁（全局开关）
+
+引擎侧（native/patches/）：
+
+| 补丁 | 内容 |
+|---|---|
+| 0001-state-persistence-and-hot-reload.patch | 状态持久化 / inotify 热加载 / builder / crossfade |
+| 0002-engine-global-switch.patch | EFFECT_CMD_DISABLE 真正直通；新增 SET_PARAM cmd=400 全局开关；release 也定义日志宏 |
+
+应用侧（app/patch_app.sh）新增一步：把 JamesDspRemoteEngine.setEnabled() 改成同时发送
+SET_PARAM(cmd=400, value=on/off)，这样 App 界面上的总开关可以直接关掉后端处理。
+
+```sh
+./app/patch_app.sh <官方 root-full APK> out.apk jdsp.keystore jdsp123 jdsp123
+```
+
+没有 App 或需要从 shell 切换时，用模块自带的 jdsp_switch.sh on|off（写同一条 cmd400 记录）。

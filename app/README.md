@@ -33,3 +33,11 @@ keytool -genkeypair -keystore jdsp.keystore -alias jdsp -keyalg RSA -keysize 204
 - `SmoothingType` 的 chip 标签会用 `.replace(" smoothing", "")` 截短，中文译名不含该子串，
   因此 chip 上显示的是完整译名（如「1/1 平滑」），这是预期行为。
 - 界面截图见 `docs/screenshots/`。
+
+## 全局开关补丁
+
+patch_app.sh 会把 JamesDspRemoteEngine.setEnabled() 补成：先调用 setEnabled，
+再发送 SET_PARAM(cmd=400)（1=开 0=关）。
+
+原因：模块用 postprocess 让框架为每个输出会话自动创建并 enable 效果，
+setEnabled(false) 只能关掉 App 自己的实例；写成引擎参数后引擎会持久化并全局旁通。

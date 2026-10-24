@@ -1,0 +1,68 @@
+--- src/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c	2026-10-24 21:30:12.426816313 +0800
++++ src/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c	2026-10-24 21:30:12.426816313 +0800
+@@ -5,6 +5,16 @@
+ #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR,TAG,__VA_ARGS__)
+ #define LOGW(...) __android_log_print(ANDROID_LOG_WARN,TAG,__VA_ARGS__)
+ #include "MemoryUsage.h"
++#else
++/* Release builds still need the log calls used by the control path (the global
++ * on/off switch). Keep them available; they are few and only fire on user
++ * initiated commands. */
++#define LOG_ALWAYS 1
++#define TAG "JamesDSP"
++#include <android/log.h>
++#define LOGI(...) __android_log_print(ANDROID_LOG_INFO,TAG,__VA_ARGS__)
++#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR,TAG,__VA_ARGS__)
++#define LOGW(...) __android_log_print(ANDROID_LOG_WARN,TAG,__VA_ARGS__)
+ #endif
+ #include <string.h>
+ #include <math.h>
+@@ -20,6 +30,7 @@
+ 	int32_t engineImpulseResponseHash;
+ 	int32_t hashSlot[4];
+ 	int mEnable;
++	int mMasterOff; /* global bypass set through param 400 */
+ 	JamesDSPLib jdsp;
+     float mSamplingRate;
+     int formatFloatModeInt32Mode;
+@@ -357,6 +368,18 @@
+ 		if (cep->psize == 4 && cep->vsize == 2)
+ 		{
+ 			int32_t cmd = ((int32_t *)cep)[3];
++			/* Global bypass: same SET_PARAM path as every other setting, so the
++			 * value is recorded by the state module and replayed on the next
++			 * boot. framework re-sends ENABLE on every session, which is why the
++			 * off switch cannot be expressed with EFFECT_CMD_DISABLE alone. */
++			if (cmd == 400)
++			{
++				int on = (int)((int16_t *)cep)[8];
++				dspmain->mMasterOff = on ? 0 : 1;
++				LOGI("master switch: %s", dspmain->mMasterOff ? "off (bypass)" : "on");
++				*replyData = 0;
++				return 0;
++			}
+ 			if (cmd == 128)
+ 			{
+ 				int reverbMode = (int)((int16_t *)cep)[8];
+@@ -1081,6 +1104,21 @@
+ {
+ 	size_t actualFrameCount = in->frameCount;
+ 
++	/* Disabled by EFFECT_CMD_DISABLE: stay bit-exact transparent.  The previous
++	 * code ran the whole DSP chain and only returned -ENODATA at the end, which
++	 * left the processed samples in the output buffer - the app's off switch had
++	 * no audible effect. */
++	if (!dspmain->mEnable || dspmain->mMasterOff) {
++		size_t samples = actualFrameCount * 2;
++		switch (dspmain->formatFloatModeInt32Mode) {
++		case 0: memcpy(out->s16, in->s16, samples * sizeof(int16_t)); break;
++		case 1: memcpy(out->f32, in->f32, samples * sizeof(float)); break;
++		case 2: memcpy(out->s32, in->s32, samples * sizeof(int32_t)); break;
++		case 3: memcpy(out->raw, in->raw, samples * 3); break;
++		case 4: memcpy(out->s32, in->s32, samples * sizeof(int32_t)); break;
++		}
++		return 0;
++	}
+ 	switch (dspmain->formatFloatModeInt32Mode)
+ 	{
+ 	case 0:
