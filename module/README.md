@@ -32,3 +32,16 @@ cd src && zip -r -X ../JDSP-fork.zip . -x '*.git*'
 | `post-fs-data.sh` / `service.sh` | 开机调用 `jdsp_state_prepare`，只读自检挂载点 |
 | `sepolicy.rule` | `hal_audio_default` 对 `vendor_audio_data_file` 的读写规则 |
 | `common/files/{arm64,arm}/libjamesdsp.so` | fork 引擎（状态持久化 + 热加载 + 后台重建） |
+
+## 与 Xiaomi/MediaTek 音效模块共存（实测 2026-10）
+
+社区有两个 `XagaSoundBoostTest` 变体（同为该 id，只能装一个）：
+
+| 变体 | dax-default.xml | 是否自带 audio_effects.xml | 结论 |
+|---|---|---|---|
+| `xaga rubens 音频优化 4-251222` | 109 KB / format 3.5.1 | **是**，且只保留 17 条声明，
+丢掉 aec/agc/bassboost/equalizer/reverb/virtualizer/visualizer/volume 等 22 条 | ⚠ 会破坏标准效果与杜比，不要与本模块同装 |
+| `xaga＆rubens音效 Final version` | 86 KB / format 3.3.0 | 否（保留系统 39 条声明） | ✅ 可共存，推荐 |
+
+本模块的 `aml.sh` 会在启动时向获胜的 `audio_effects.xml` 合并**恰好一条**
+`<apply effect="jamesdsp"/>`，并做空文件/截断保护，因此与第二类模块可以共存。
