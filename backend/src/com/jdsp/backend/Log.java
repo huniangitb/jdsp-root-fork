@@ -11,6 +11,15 @@ import java.util.Locale;
  * Daemon logger: file ({@code /data/adb/jdspd/jdspd.log}, rotated at 1 MiB) plus logcat tag
  * "jdspd".
  *
+ * <p>Two rotation sources have to be handled:
+ * <ul>
+ *   <li>the daemon's own size based rotation (1 MiB -&gt; {@code jdspd.log.1});</li>
+ *   <li>the module's boot time rotation ({@code mv jdspd.log jdspd.log.prev}), which replaces the
+ *       inode <em>behind our open file descriptor</em>. Without a check the daemon would keep
+ *       appending to the renamed file forever, so the inode (and, as a fallback, the file size)
+ *       is verified before every write and the file is reopened when it changed.</li>
+ * </ul>
+ *
  * <p>Deliberately tiny and dependency free; every failure is swallowed so that logging can never
  * take the daemon down.
  */
@@ -26,6 +35,9 @@ public final class Log {
     private static File logFile;
     private static FileOutputStream out;
     private static long written;
+    /** inode of the file the current fd points at; used to detect an external rotation. */
+    private static long openInode;
+    private static long openDev;
     private static boolean logcat = true;
     private static boolean echo = false;
 
@@ -102,6 +114,15 @@ public final class Log {
                 return;
             }
             try {
+                // Somebody (the module's boot script) may have rotated the file behind our back;
+                // in that case our fd would keep appending to the renamed file.
+                if (rotatedExternallyLocked()) {
+                    closeLocked();
+                    openLocked();
+                }
+                if (out == null) {
+                    return;
+                }
                 byte[] b = (line + "\n").getBytes("UTF-8");
                 out.write(b);
                 out.flush();
@@ -127,9 +148,70 @@ public final class Log {
             }
             out = new FileOutputStream(logFile, true);
             written = logFile.length();
+            rememberIdentityLocked();
         } catch (Throwable t) {
             out = null;
             System.err.println("jdspd: cannot open log file " + logFile + ": " + t);
+        }
+    }
+
+    /** Remembers which inode the current fd points at (best effort). */
+    private static void rememberIdentityLocked() {
+        openInode = 0L;
+        openDev = 0L;
+        try {
+            android.system.StructStat st = android.system.Os.stat(logFile.getPath());
+            openInode = st.st_ino;
+            openDev = st.st_dev;
+        } catch (Throwable ignored) {
+            // identity check unavailable; the size based rotation still works
+        }
+    }
+
+    /**
+     * True when the file on disk is no longer the one our fd points at, i.e. somebody else
+     * rotated it (the module's boot time {@code mv jdspd.log jdspd.log.prev} does exactly that).
+     * In that case our fd would keep writing into the renamed file, so we have to reopen.
+     */
+    private static boolean rotatedExternallyLocked() {
+        if (out == null || logFile == null) {
+            return false;
+        }
+        if (openInode != 0L) {
+            try {
+                android.system.StructStat st = android.system.Os.stat(logFile.getPath());
+                if (st.st_ino != openInode || st.st_dev != openDev) {
+                    return true; // replaced or renamed away
+                }
+            } catch (Throwable t) {
+                // the file is gone (or unreadable): reopen, which recreates it
+                return true;
+            }
+        }
+        // Truncation (": > jdspd.log" keeps the inode but empties the file): our fd would keep
+        // writing at the old offset and produce a sparse file, so reopen as well.
+        try {
+            long size = logFile.length();
+            return size < written;
+        } catch (Throwable t) {
+            return false;
+        }
+    }
+
+    /**
+     * Reopens the log file when it was rotated by somebody else (the write path does this
+     * automatically; this is the explicit variant for callers that want to force it).
+     */
+    public static void reopenIfRotated() {
+        synchronized (LOCK) {
+            if (rotatedExternallyLocked()) {
+                try {
+                    closeLocked();
+                    openLocked();
+                } catch (Throwable ignored) {
+                    // logging must never throw
+                }
+            }
         }
     }
 
@@ -143,6 +225,7 @@ public final class Log {
             logFile.renameTo(old);
             out = new FileOutputStream(logFile, false);
             written = 0L;
+            rememberIdentityLocked();
         } catch (Throwable t) {
             out = null;
         }

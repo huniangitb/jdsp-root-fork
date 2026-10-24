@@ -43,6 +43,9 @@ SERIAL=${SERIAL:-${ANDROID_SERIAL:-}}
 DEVICE_DIR=${DEVICE_DIR:-/data/local/tmp/jdsp-accept}
 SOAK_SECONDS=${SOAK_SECONDS:-0}
 STRICT_SKIP=${STRICT_SKIP:-0}
+# Primary transport for every measurement: loopback TCP (binder is root-only).
+# Set CLI_TRANSPORT= to use the auto path (binder first), e.g. for a binder-only run.
+CLI_TRANSPORT=${CLI_TRANSPORT:---tcp}
 LOG_DIR="$BACKEND/test/build/device"
 STAMP=$(date +%Y%m%d-%H%M%S)
 MARKER="acc-$$-$STAMP"
@@ -86,7 +89,7 @@ record() { # status item detail
 
 kill_tones() {
     local pids pid
-    pids=$(dev "ps -A -o pid,args 2>/dev/null | grep -F 'Tone ' | grep -F '$MARKER' | grep -v grep | awk '{print \$1}'")
+    pids=$(dev "ps -A -o pid,args 2>/dev/null | grep -F '$MARKER' | grep -v grep | awk '{print \$1}'")
     for pid in $pids; do
         dev "kill $pid" >/dev/null 2>&1 || true
     done
@@ -100,22 +103,28 @@ cleanup() {
 }
 trap cleanup EXIT
 
-run_cli() {
+run_raw() { # exact jdspcli argv (used by the transport probe)
     local raw
     raw=$(dev "CLASSPATH=$DEVICE_DIR/jdspcli.dex app_process /system/bin com.jdsp.cli.Main $* 2>$DEVICE_DIR/cli.err; echo __RC=\$?")
     CLI_RC=${raw##*__RC=}
-    CLI_OUT=${raw%__RC=*}
-    CLI_ERR=$(dev "cat $DEVICE_DIR/cli.err 2>/dev/null")
+    CLI_OUT=$(printf '%s' "${raw%__RC=*}" | tr -d '\r')
+    CLI_ERR=$(dev "cat $DEVICE_DIR/cli.err 2>/dev/null" | tr -d '\r')
+}
+
+run_cli() { # measurements go through ${CLI_TRANSPORT:-auto}
+    run_raw $CLI_TRANSPORT "$@"
 }
 
 start_tone() { # uid|root seconds tag -> prints device stdout file
     local uid=$1 secs=$2 tag=$3
     local out="$DEVICE_DIR/tone-$tag.out"
     dev "rm -f $out"
+    # setsid + ";": the "sh -c ... && nohup ... &" form keeps adb shell's stdout
+    # pipe open (adb then blocks until the tone exits), so avoid that form.
     if [ "$uid" = "root" ]; then
-        dev "cd $DEVICE_DIR && nohup env CLASSPATH=$DEVICE_DIR/tone.dex app_process /system/bin Tone $secs $MARKER $tag > $out 2>&1 </dev/null &"
+        dev "cd $DEVICE_DIR; setsid env CLASSPATH=$DEVICE_DIR/tone.dex app_process /system/bin Tone $secs $MARKER $tag > $out 2>&1 < /dev/null &"
     else
-        dev "nohup su $uid -c 'CLASSPATH=$DEVICE_DIR/tone.dex app_process /system/bin Tone $secs $MARKER $tag' > $out 2>&1 </dev/null &"
+        dev "setsid su $uid -c 'CLASSPATH=$DEVICE_DIR/tone.dex app_process /system/bin Tone $secs $MARKER $tag' > $out 2>&1 < /dev/null &"
     fi
     echo "$out"
 }
@@ -134,11 +143,11 @@ wait_session() { # stdout file -> prints session id
 }
 
 session_object() { # json-array session-id -> one flat object line
-    printf '%s' "$1" | tr '{' '\n' | grep -F "\"session\":$2," | head -1
+    printf '%s' "$1" | tr -d '\r' | tr '{' '\n' | grep -F "\"session\":$2," | head -1
 }
 
 session_by_uid() { # json-array uid -> session line
-    printf '%s' "$1" | tr '{' '\n' | grep -F "\"uid\":$2," | head -1
+    printf '%s' "$1" | tr -d '\r' | tr '{' '\n' | grep -F "\"uid\":$2," | head -1
 }
 
 json_field() { # object key -> raw value
@@ -197,6 +206,7 @@ echo "repo        : $REPO"
 echo "device dir  : $DEVICE_DIR"
 echo "soak        : $SOAK_SECONDS s"
 echo "log dir     : $LOG_DIR"
+echo "cli transport: ${CLI_TRANSPORT:-auto} (measurements)"
 echo
 
 if ! adb_ get-state >/dev/null 2>&1; then
@@ -221,9 +231,9 @@ build_cli_dex() {
     mkdir -p "$LOG_DIR/gen" "$LOG_DIR/cli-classes" "$LOG_DIR/cli-dex"
     local files
     mapfile -t AIDL_FILES < <(find "$BACKEND/aidl" -name '*.aidl' | sort)
-    "$AIDL_BIN" --lang=java -I"$BACKEND/aidl" --out="$LOG_DIR/gen" "@@{AIDL_FILES[@]}" || return 1
+    "$AIDL_BIN" --lang=java -I"$BACKEND/aidl" --out="$LOG_DIR/gen" "${AIDL_FILES[@]}" || return 1
     mapfile -t files < <(find "$BACKEND/src/com/jdsp/cli" "$BACKEND/src/com/jdsp/common"             "$LOG_DIR/gen" -name '*.java' | sort)
-    javac --release 8 -nowarn -Xlint:-options -classpath "$ANDROID_JAR"             -d "$LOG_DIR/cli-classes" "@@{files[@]}" || return 1
+    javac --release 8 -nowarn -Xlint:-options -classpath "$ANDROID_JAR"             -d "$LOG_DIR/cli-classes" "${files[@]}" || return 1
     find "$LOG_DIR/cli-classes" -name '*.class' > "$LOG_DIR/cli-files.txt"
     "$D8" --lib "$ANDROID_JAR" --min-api 29 --output "$LOG_DIR/cli-dex"             $(cat "$LOG_DIR/cli-files.txt") >/dev/null || return 1
     cp "$LOG_DIR/cli-dex/classes.dex" "$LOG_DIR/jdspcli.dex"
@@ -279,14 +289,14 @@ AUTO_RC=1
 AUTO_MSG=""
 AUTO_ERR=""
 for i in $(seq 1 "$DAEMON_WAIT"); do
-    run_cli ping
+    run_raw ping
     AUTO_RC=$CLI_RC
     AUTO_MSG=$CLI_OUT
     AUTO_ERR=$CLI_ERR
     [ "$AUTO_RC" = "0" ] && break
     sleep 1
 done
-run_cli --tcp ping
+run_raw --tcp ping
 TCP_RC=$CLI_RC
 TCP_MSG=$CLI_OUT
 TCP_ERR=$CLI_ERR
@@ -313,6 +323,12 @@ echo "== §6.1 session discovery (no App playback) =="
 TONE_OUT=$(start_tone root 180 root1)
 SID=$(wait_session "$TONE_OUT")
 if [ -z "$SID" ]; then
+    if ! adb_ get-state >/dev/null 2>&1; then
+        echo "ABORT: adb device disconnected during item 1 (device rebooted/occupied?)"
+        record SKIP "1-5" "device disconnected mid-run; rerun when the device is free"
+        report
+        exit 2
+    fi
     echo "ERROR: test tone produced no AudioTrack session (device log $TONE_OUT)"
     record FAIL "1" "tone did not start (see $TONE_OUT)"
     skip_remaining 2 "blocked by item 1 failure"

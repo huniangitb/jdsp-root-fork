@@ -32,10 +32,12 @@ module/package.sh                # 拷 dex → 打 zip → 结构/内容自检 �
 | 项 | 值 |
 |---|---|
 | 文件 | `dist/JDSP-fork-v2.0.0.zip` |
-| 大小 | _待回填_ |
-| sha256 | _待回填_ |
-| `backend/jdspd.dex` | _待回填_ |
-| `backend/jdspcli.dex` | _待回填_ |
+| 大小 | 33,703,634 B |
+| sha256 | `25fd539c92f1df17f4da14c2e39b21179c5807b4429c38a97d3a88de3ff5aed8` |
+| `backend/jdspd.dex` | 99,200 B / `d43d1d0441c349032609f0a0e7eeda5dc098be6fc93edb29c060c750b9a8b498` |
+| `backend/jdspcli.dex` | 62,208 B / `4f0f5a708b1a99bb31d3729b5805627a9f10bb677b649588d92cf1f742423432` |
+| 构建时间 / 环境 | 2026-10-25 00:27 CST（重新打包：含日志轮转 + 挂载归属检测）/ xaga A15 SDK35 / build-tools 37.0.0 + cmdline-tools d8 / JDK 21 |
+| 装机验证 | Lead 装完重启后 `module/accept-v2.sh --tone` **12/12 PASS**；backend 判据见 `docs/ACCEPTANCE-V2.md` |
 | arm64 引擎 `libjamesdsp.so` | `b6e1fc1fdc67b0c7bd73b083e92238eb29b4d0c66f7c02e5b476ad78c9fbf700`（与 P0 基线一致，v2 不动引擎） |
 
 ## 3. 与 v6.7.2 基线的差异（全部为新增，不改引擎）
@@ -51,6 +53,8 @@ module/package.sh                # 拷 dex → 打 zip → 结构/内容自检 �
 | sepolicy：+4 条 `mtk_hal_audio`（dir/file/watch） | `sepolicy.rule` |
 | versionCode 112 → 200 | `module.prop` |
 | 内置 `backend/{jdspd,jdspcli}.dex` | 新目录 |
+| **日志轮转**：`jdspd.sh` 每次开机把 `jdspd.log` 轮成 `jdspd.log.prev`（`jdspd_rotate_log`），否则跨重启累积的 `starting jdspd` 行会被误判成"重启风暴" | `jdspd.sh` |
+| **挂载归属检测**：`jdsp_mode.sh verify` 增加 inode 对比，检出"另一个模块赢了 `/vendor/etc/audio_effects.xml` 的挂载"（backend 模式不生效的根因，见 `docs/MODE-SWITCH.md` §6） | `jdsp_mode.sh` + `module/accept-v2.sh` |
 
 ## 4. 安装与验收
 

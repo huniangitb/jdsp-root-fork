@@ -28,6 +28,13 @@ if [ ! -f "$RUNDIR/mode" ] && [ -f "$MODPATH/backend/mode.default" ]; then
 	chmod 0600 "$RUNDIR/mode" 2>/dev/null
 fi
 
+# 每次开机轮转一次日志，否则跨重启累积的 "starting jdspd" 行会被误判成重启风暴。
+# service.sh 只在本脚本启动前调用一次，所以这里是"每次开机一次"的合适位置。
+jdspd_rotate_log() {
+	[ -f "$LOG" ] || return 0
+	mv -f "$LOG" "$LOG.prev" 2>/dev/null || rm -f "$LOG" 2>/dev/null
+}
+
 jdspd_log() {
 	echo "[$(date '+%m-%d %H:%M:%S')] $*" >> "$LOG" 2>/dev/null
 }
@@ -73,7 +80,7 @@ jdspd_main() {
 	if ! jdspd_wait_af; then
 		jdspd_log "WARN media.audio_flinger not ready after 120s, starting daemon anyway"
 	fi
-	jdspd_log "supervisor start: mode=$(jdspd_mode) dex=$DEX"
+	jdspd_log "supervisor start: mode=$(jdspd_mode) dex=$DEX boot=$(getprop ro.boottime.init 2>/dev/null)"
 
 	_restarts=0
 	while :; do
@@ -110,4 +117,5 @@ case "${1:-}" in
 		;;
 esac
 
+jdspd_rotate_log
 jdspd_main

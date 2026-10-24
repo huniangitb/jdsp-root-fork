@@ -161,8 +161,9 @@ inode 不同 + 挂载点是独立的 `ro` mount ⇒ 挂载时把模块文件**�
 | 注入只发生在安装时、aml.sh 不管 postprocess | ✅ 源码 + 装机实测（§1.1） |
 | 挂载是 ro 快照、inode 与模块副本不同 | ✅ `mount` + `stat`（§1.2） |
 | audioserver 只在启动时读 XML | ✅ AOSP `AudioPolicyEffects` 行为 + 本机"改 XML 不重启无效果"的历史现象 |
-| `jdsp_mode.sh` 全链路（install/post-fs-data/service/CLI） | ⏳ task-4 落盘后随 v2.0.0 包验证 |
-| `mode=backend` 关掉注入后 jdspd 自挂能出声 | ⏳ 依赖 daemon-core 的 EffectManager（PLAN-v2 §2.3 已验证 createEffect 可建链） |
+| `jdsp_mode.sh` 全链路（install/post-fs-data/service/CLI） | ✅ 随 v2.0.0 包验证（`docs/ACCEPTANCE-V2.md`） |
+| `mode=backend` 关掉注入后 jdspd 自挂能出声 | ✅ **P2 正式判据通过**（Lead 00:23 实测，`docs/ACCEPTANCE-V2.md` §3） |
+| 挂载归属检测（inode 对比） | ✅ 已实现并真机验证（§6.2） |
 
 ## 5. 顺带发现的残留（不影响功能）
 
@@ -173,3 +174,54 @@ hybrid_mount 每次开机照挂。属于实验版残留，可安全删除：
 ```sh
 rm -f /data/adb/modules/XagaSoundBoostTest/system/vendor/etc/audio_effects.xml.jdsp.bak   # 下次开机挂载点消失
 ```
+---
+
+## 6. 共存约束：谁能赢 `/vendor/etc/audio_effects.xml` 的挂载
+
+**这是 backend 模式最大的坑**：本模块**不是** `/vendor/etc/audio_effects.xml` 的唯一提供者。
+只要别的模块也提供这个文件并且赢了挂载，**我们把模块副本改成什么都没用**——
+挂载出来的还是别人的文件，`backend` 模式永远不生效（而且表面上看 apply 计数还是 1，
+很容易被误判成"脚本没改成功"）。
+
+### 6.1 本机的实际情况
+
+```console
+$ adb shell 'find /data/adb/modules -name "audio_effects.xml"'
+/data/adb/modules/XagaSoundBoostTest/system/vendor/etc/audio_effects.xml    apply=1   ← 它赢了挂载
+/data/adb/modules/ainur_jamesdsp/system/vendor/etc/audio_effects.xml        apply=0   ← 我们改成 backend 后
+
+$ adb shell 'stat -c "%i %n" /vendor/etc/audio_effects.xml \
+      /data/adb/modules/ainur_jamesdsp/system/vendor/etc/audio_effects.xml'
+1485135 /vendor/etc/audio_effects.xml                    ← 挂载的是 Xaga 那份
+1502537 /data/adb/modules/ainur_jamesdsp/system/vendor/etc/audio_effects.xml
+```
+
+⇒ **inode 对比就是归属判据**：挂载点的 inode == 我们模块副本的 inode ⇒ 挂的是我们那份；
+不相等 ⇒ 别人赢了。
+
+### 6.2 检测方法（已内建）
+
+**`jdsp_mode.sh verify`**（开机由 `service.sh` 调用，写 `boot.log`）：
+
+```
+[mode] service mode=backend /vendor/etc/audio_effects.xml=1 /system/etc/audio_effects.xml=0 WARN mismatch: 已挂载的 xml 与 mode 不一致（需要重启才能生效）
+[mode] service WARN: another module provides /vendor/etc/audio_effects.xml (inode mismatch: mounted=1485135 ours=1502537), backend mode will not take effect
+[mode] service      provided by: /data/adb/modules/XagaSoundBoostTest/system/vendor/etc/audio_effects.xml
+```
+
+- `auto` 模式下别人的文件带 apply 是**正常**的（框架注入由胜出者提供即可），只记 `note:` 不报错；
+- `backend` 模式下必须由本模块赢得挂载，否则记 `WARN` 并让 `verify` 返回非 0。
+
+**`module/accept-v2.sh`** 也加了同一项（`xml owner (inode)`）：
+backend 模式时 FAIL 并直接给出 provider 路径；auto 模式 PASS 但把 provider 写进明细。
+
+### 6.3 用 backend 模式的前置条件
+
+1. 让本模块赢得 `/vendor/etc/audio_effects.xml`（和 `/system/etc/`、`/odm/etc/`）的挂载：
+   禁用/卸载其它提供同一文件的模块（例：`touch /data/adb/modules/XagaSoundBoostTest/disable` 后重启）；
+2. `sh /data/adb/modules/ainur_jamesdsp/jdsp_mode.sh set backend` → 重启；
+3. 用 `accept-v2.sh --mode backend --tone` 确认没有 WARN。
+
+**验完务必恢复**：删掉 `disable`（或恢复文件）、`jdsp_mode.sh set auto` → 重启。
+本机的最终交付状态是 **auto + XagaSoundBoostTest 保持原样**（见 `docs/ACCEPTANCE-V2.md`）。
+

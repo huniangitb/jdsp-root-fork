@@ -199,6 +199,11 @@ jdsp_mode_apply() {
 }
 
 # 只读校验：比对已挂载的 xml 与配置
+#
+# 除了 apply 数量，还要检查**挂载的是不是我们这份文件**（inode 对比）。
+# 原因：别的模块（这台机器上是 XagaSoundBoostTest）也可能提供 /vendor/etc/audio_effects.xml，
+# 并且会赢得挂载。那样我们把模块副本改成什么样都没用 —— 挂载出来的还是别人的文件，
+# backend 模式永远不生效。inode 不同 = 挂载的不是我们那份。
 jdsp_mode_verify() {
 	jdsp_mode_tag=${1:-verify}
 	_mode=$(jdsp_mode_get)
@@ -218,9 +223,41 @@ jdsp_mode_verify() {
 		_c=$(jdsp_mode_count "$_f")
 		_line="$_line $_f=$_c"
 	done
+	# inode 对比：挂载点必须是我们模块里**对应分区**的那份副本。
+	# 别的模块（这台机器上是 XagaSoundBoostTest）也提供 /vendor/etc/audio_effects.xml 并赢得挂载，
+	# 那时我们把副本改成什么都没用 —— 挂载出来的还是别人的文件，backend 模式永远不生效。
+	# 注意要分区对应：/vendor|odm 对应模块的 system/vendor|system/odm，/system 对应 system/system。
+	jdsp_mode_check_inode() {
+		_m=$1        # 挂载点
+		_our=$2      # 我们模块里对应的副本
+		[ -f "$_m" ] || return 0
+		[ -f "$_our" ] || return 0
+		_m_inode=$(stat -c %i "$_m" 2>/dev/null)
+		_our_inode=$(stat -c %i "$_our" 2>/dev/null)
+		[ -n "$_m_inode" ] && [ -n "$_our_inode" ] || return 0
+		[ "$_m_inode" = "$_our_inode" ] && return 0
+		if [ "$_mode" = "backend" ]; then
+			_bad=1
+			jdsp_mode_log "WARN: another module provides $_m (inode mismatch: mounted=$_m_inode ours=$_our_inode), backend mode will not take effect"
+		else
+			jdsp_mode_log "note: $_m is provided by another module (mounted=$_m_inode ours=$_our_inode); harmless in auto mode"
+		fi
+		for _cand in /data/adb/modules/*/system/vendor/etc/audio_effects.xml /data/adb/modules/*/system/etc/audio_effects.xml; do
+			[ -f "$_cand" ] || continue
+			[ "$(stat -c %i "$_cand" 2>/dev/null)" = "$_m_inode" ] || continue
+			jdsp_mode_log "     provided by: $_cand"
+			break
+		done
+		return 0
+	}
+	_M=/data/adb/modules/ainur_jamesdsp
+[ -d "$_M" ] || _M="$JDSP_MODULE_DIR"
+	jdsp_mode_check_inode /vendor/etc/audio_effects.xml "$_M/system/vendor/etc/audio_effects.xml"
+	jdsp_mode_check_inode /odm/etc/audio_effects.xml    "$_M/system/odm/etc/audio_effects.xml"
+	jdsp_mode_check_inode /system/etc/audio_effects.xml "$_M/system/etc/audio_effects.xml"
 	if [ "$_bad" = 1 ]; then
 		jdsp_mode_log "mode=$_mode$_line WARN mismatch: 已挂载的 xml 与 mode 不一致（需要重启才能生效）"
-		return 0
+		return 1
 	fi
 	jdsp_mode_log "mode=$_mode$_line OK"
 	return 0

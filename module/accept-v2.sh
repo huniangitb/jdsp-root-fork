@@ -86,9 +86,38 @@ case "$bl" in
     *) skip "boot.log mode" "no [mode] line yet" ;;
 esac
 
+# 5b 挂载的 audio_effects.xml 是不是我们这份（inode 对比）
+# 别的模块（XagaSoundBoostTest）也提供 /vendor/etc/audio_effects.xml 且会赢得挂载，
+# 那时我们改模块副本没用，backend 模式永远不生效 —— 必须能检出。
+our_inode=$(DR "stat -c %i $MOD/system/vendor/etc/audio_effects.xml 2>/dev/null" | tr -d "\r")
+mounted_inode=$(DR "stat -c %i /vendor/etc/audio_effects.xml 2>/dev/null" | tr -d "\r")
+if [ -n "$our_inode" ] && [ -n "$mounted_inode" ]; then
+    if [ "$our_inode" = "$mounted_inode" ]; then
+        pass "xml owner (inode)" "mounted=$mounted_inode = ours"
+    else
+        # 找出是哪个模块提供了这份文件（用设备的 shell 做，避免本地引号地狱）
+        # 逐个候选路径 stat（避免远端 shell 在双引号里展开 $p / $(...)）
+        owner=""
+        for cand in $(DR "ls -d /data/adb/modules/*/system/vendor/etc/audio_effects.xml 2>/dev/null"); do
+            ci=$(DR "stat -c %i $cand 2>/dev/null" | tr -d "\r")
+            if [ "$ci" = "$mounted_inode" ]; then owner=$cand; break; fi
+        done
+        if [ "$M" = "backend" ]; then
+            fail "xml owner (inode)" "another module provides /vendor/etc/audio_effects.xml (mounted=$mounted_inode ours=$our_inode) provider=$owner -> backend mode will not take effect"
+        else
+            # auto 模式下别人的文件带 apply 是正常的（我们不依赖它），只提示不判失败
+            pass "xml owner (inode)" "mounted=$mounted_inode provider=$owner (auto 模式不影响：框架注入由胜出者提供)"
+        fi
+    fi
+else
+    skip "xml owner (inode)" "cannot stat"
+fi
+
 # 6 jdspd.log health
 if DR "[ -f $RUNDIR/jdspd.log ]" >/dev/null 2>&1; then
-    starts=$(DR "grep -c 'starting jdspd' $RUNDIR/jdspd.log" | tr -d "\r")
+    # 只统计"最近一次 supervisor start"之后的启动次数：日志现在每次开机轮转，
+    # 但旧版本留下的日志可能仍跨重启累积，按最后一个 supervisor 标记切段最稳。
+    starts=$(DR "awk '/supervisor start/{n=0} /starting jdspd/{n++} END{print n+0}' $RUNDIR/jdspd.log" | tr -d "\r")
     if [ -z "$starts" ]; then starts=0; fi
     if [ "$starts" -le 3 ]; then pass "jdspd.log health" "starts=$starts"; else fail "jdspd.log health" "restart storm starts=$starts"; fi
 else
