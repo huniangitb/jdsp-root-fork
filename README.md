@@ -7,6 +7,19 @@
 
 ---
 
+## 适用条件
+
+| 项 | 要求 |
+|---|---|
+| 系统 | Android 15+（AIDL 音效 HAL 时代），已在 ColorOS 16 / Android 16 实测 |
+| Root | KernelSU 或 Magisk（用 hybrid_mount / magic mount 做分区挂载） |
+| 效果配置 | 设备上存在 `audio_effects.xml`（`/odm/etc`、`/vendor/etc` 或 `/vendor/etc/audio/sku_*`） |
+| 架构 | arm64-v8a（音频 HAL 为 64 位）；armv7a 库也会构建，供 32 位 HAL 使用 |
+| 构建 | Android NDK r30（编引擎库）、apktool 3.x + build-tools（改 App） |
+
+不支持：Android 14 及更早（那套走的是旧的 effect 加载路径，上游模块即可）、
+纯 AIDL 且完全没有 legacy 配置文件的设备（效果无处注册）。
+
 ## 现状（一句话）
 
 模块 + 内核态补丁都不需要，只要一个 **Magisk/KernelSU 元模块**：
@@ -84,6 +97,12 @@ adb shell su -c 'ls -l /data/vendor/audio/jamesdsp_state.bin'
 
 - `master`：**可复现二进制的源码**（无二进制、无设备日志、无截图）。
 - 本地另有 `local-full` 分支保留真机验收日志、截图与编译产物，**不推送到远端**。
+
+## 贡献 / 反馈
+
+上游仓库：[evoeram/Loundess-PEQ-RootlessJamesDSP](https://github.com/evoeram/loundess-peq-rootlessjamesdsp)（App）
+与 [evoeram/JamesDSPManager](https://github.com/evoeram/JamesDSPManager)（引擎，`extensions` 分支）。
+本仓库只是把它们接到 ColorOS 16/17 上的一层适配 + 状态持久化/热加载改造，不修改上游行为。
 
 ## 许可
 
