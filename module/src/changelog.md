@@ -1,3 +1,10 @@
+### v6.7.0-fork（AIDL 音效 HAL 支持）
+
+* 新增 AIDL 变体库：\`common/files/aidl/libjamesdsp.so\`，按 Android 16 的 effect V3 + common.types V5 构建，导出 \`createEffect\`/\`queryEffect\`。
+* 安装器自动选择：\`service list\` 里存在 \`android.hardware.audio.effect.IFactory\` 时用 AIDL 库，否则用 legacy 库。
+* 两条路径共用同一套引擎（PEQ + loudness + 状态持久化 + inotify 热加载 + 后台重建）。
+* AIDL 库用 \`native/aidl/build-aidl.sh\` 构建，版本可参数化（\`AIDL_EFFECT_V\` / \`AIDL_TYPES_V\`）。
+
 ### v6.6.5-fork（内置 APK 换成汉化版：按设备配置默认开启 + 界面汉化）
 
 * 内置 APK 更新为 `JamesDSP-root-full-v1.6.15-59-zh.apk`（versionCode 59 / 1.6.15-zh）：

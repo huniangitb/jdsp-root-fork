@@ -49,3 +49,15 @@ cd module/src && zip -r -X ../JDSP-fork.zip . -x '*.git*'
 ```sh
 ./native/test/run_tests.sh      # 状态文件格式 / 热加载 / watcher / 回退路径
 ```
+
+## 5. AIDL 变体（可选）
+
+\`\`\`sh
+# 生成与目标平台版本匹配的 AIDL 头（effect V<n> + common.types V<m>）
+AIDL_EFFECT_V=3 AIDL_TYPES_V=5 ./native/aidl/build-aidl.sh headers
+AIDL_EFFECT_V=3 AIDL_TYPES_V=5 ./native/aidl/build-aidl.sh vendor
+# 产物 out-aidl/libjamesdspaidl.so -> module/src/common/files/aidl/libjamesdsp.so
+\`\`\`
+
+需要从目标机 \`/system/lib64\` 拷出 stub 库到 \`aidl-vendor/device-libs/\`，
+细节与 AOSP 头来源见 \`native/aidl/AIDL-NOTES.md\`。
