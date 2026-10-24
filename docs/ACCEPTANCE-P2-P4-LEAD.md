@@ -185,6 +185,8 @@ I/jdspd: detached session=185 pkg=com.google.android.gms (excluded by policy)
 - daemon 重启后内存缓存清空，第 3 层（config.json）接管；因此"重启后 get 仍等于最后一次 set"
   依赖 setParam 已经把值写进 config.json（见 §4.2）。
 - `vsize` 会被归一化：缺省 4、上限 4096、向上对齐到 4 字节。
+- `getParam` 对**未 attach** 的会话会**先自动 attach**（与 `setParam` 同一约定，见 App 侧协议），
+  因此它可能顺手建出一条效果链；只读查询建议先 `sessions` 确认状态。
 
 ### 4.2 ConfigStore 同步（实现细节）
 
@@ -308,6 +310,12 @@ PASS=10 FAIL=0
   拿不到 stat 时退化为"文件比已写字节数还短 = 被替换/截断"的兜底判断。
   ⇒ daemon 始终写当前的 `jdspd.log`，被轮转走的内容留在 `.prev` 里，不会再分叉。
 - daemon 自己的 1 MiB 轮转（`jdspd.log` → `jdspd.log.1`）保持不变，轮转后也会刷新 inode 记录。
+- 顺带也覆盖了 `service.sh` 里 `: > jdspd.log` 这种**截断**（inode 不变但文件被清空）的情况：
+  检测到"文件比已写字节数还短"同样会 reopen，避免旧 fd 在稀疏偏移上继续写。
+
+**开机时序（已核对）**：`service.sh` → `nohup sh jdspd.sh` → `jdspd_rotate_log`（先轮转）
+→ `jdspd_main`（后起 daemon）。轮转发生在 daemon 启动**之前**，所以开机那一次不会踩到旧 fd；
+但**运行期**任何外部 `mv`/`truncate`（包括看护脚本的日志清理）都会踩到，这正是上面修掉的情况。
 
 **结论**：模块侧 `jdspd_rotate_log` 的改法**可以保留**（daemon 侧已能自愈），无需改成 daemon 侧 reopen 协议
 （daemon 已经是每次写都自检，不需要外部信号）。

@@ -131,6 +131,40 @@ SessionWatcher 轮询 + 各自 attach 同一批 session，现象是**参数被�
   `rc!=0` 视为崩溃按任务要求 **2 s** 重启，两条路径都写日志；
 - **手工排障**：`ps -A | grep jdspd` 只应有一个；有多个先全杀再起（`kill $(pidof jdspd)`）。
 
+### 5.6 远端 shell 会在双引号里展开 `$p`（写 adb 脚本时必踩）
+
+在 `adb shell "su -c \"...\""` 里，双引号内的 `$p` / `$(...)` 会被**本地 shell 先展开**
+（本地没有 `$p` → 变成空串），远端拿到的命令已经坏了：
+
+```console
+$ adb shell "su -c 'for p in /data/adb/modules/*/.../audio_effects.xml; do echo $p $(stat -c %i $p); done'"
+/system/bin/sh: [: 1485135: unexpected operator/operand      <- 远端拿到的是坏命令
+```
+
+**正确写法**：不要在远端循环里用变量。改成“先列出候选路径、再逐个 stat”：
+
+```sh
+for cand in $(DR "ls -d /data/adb/modules/*/system/vendor/etc/audio_effects.xml 2>/dev/null"); do
+    ci=$(DR "stat -c %i $cand 2>/dev/null" | tr -d "\r")
+    [ "$ci" = "$mounted_inode" ] && { owner=$cand; break; }
+done
+```
+
+（`$cand` 在本地展开成具体路径，远端只剩 `stat -c %i <path>`，没有变量歧义。）
+
+### 5.7 `case "$0" in *xxx.sh)` 的分发依赖文件名 —— 改名测试会静默失效
+
+`jdsp_mode.sh` 末尾用 `case "$0" in *jdsp_mode.sh)` 判断“是不是在直接调用我”，
+所以**只有文件名以 `jdsp_mode.sh` 结尾**才会走 CLI 分发。
+测试时把文件 push 成 `jdsp_mode_test.sh` → 分发条件不命中 → **脚本什么都不做、静默退出、rc=0**：
+
+```console
+$ adb shell 'su -c "sh /data/local/tmp/jdsp_mode_test.sh verify test"'
+（无任何输出，rc=0）        <- 看起来像“功能没生效”，其实是分发没命中
+```
+
+=> 测这类脚本要么保持原名，要么 push 成同名的子目录（`/data/local/tmp/mt/jdsp_mode.sh`）。
+
 ## 6. 清理与"首启默认值"语义
 
 打包/重启前做一次干净化（**测试残留不能变成用户默认值**）：
