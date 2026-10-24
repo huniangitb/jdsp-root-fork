@@ -1,7 +1,7 @@
 id=ainur_jamesdsp
 name=JamesDSP Manager
-version=v6.9.5-fork (2026-10-24)
-versionCode=132
+version=v6.9.6-fork (2026-10-24)
+versionCode=133
 banner=JDSP_banner.png
 author=james34602, zackptg5, ahrion, AIDL lib by anonymix007, script upgrades and fixes by ShadoV90, fork PEQ+loudness engine by evoeram
 description=JamesDSPManager is a reformed audio engine based of AOSP and OmniROM DSPManager source code with enhanced features and tuning. [pp1] 安装时向 audio_effects.xml 的 <postprocess> 注入 <apply effect="jamesdsp"/>，由 audioserver 自动把效果挂到 music 流，不再依赖 App 主动 AudioEffect()。[热加载] 播放中修改参数实时生效：渲染回调按状态文件 size+mtime+inode 变更检测，变化即重放，无需重启音频；默认构建去掉 -DDEBUG 日志噪音。 [fork] 内置 fork PEQ+loudness 引擎（evoeram/Loundess-PEQ-RootlessJamesDSP，arm64/arm 两个 ABI），含 native 状态自持久化：用户设置写入 /data/vendor/audio/jamesdsp_state.bin，App 关闭甚至卸载后仍按最后一次设置运行。
