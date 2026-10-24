@@ -1,8 +1,13 @@
 # v2 后端派发 —— P1 (jdspcli) 验收记录
 
-被测物：`backend/out/jdspcli.dex`（sha256 `4f0f5a708b1a99bb31d3729b5805627a9f10bb677b649588d92cf1f742423432`）
+被测物：`backend/out/jdspcli.dex`（sha256 `4f0f5a708b1a99bb31d3729b5805627a9f10bb677b649588d92cf1f742423432`，
+与 `backend/out/jdspd.dex` 同批构建；CLI 侧的 dex 在本轮验收期间**未再改动**）
 设备：Xiaomi xaga / Android 15 / SDK35 / KernelSU，daemon `jdspd 2.0.0`（pid 2458，mode=auto）
-时间：2026-10-25 00:39–00:50
+说明：本轮 §6 第 1-4 项跑在 **v2.0.0 最终包安装之前**（00:39 开始），
+最终包由 module-p0 在 00:54 安装并重启；CLI 源码与契约（`IJdspService.aidl`）此后未改，
+且 `docs/ACCEPTANCE-P2-P4-LEAD.md`、`module/accept-v2.sh`（13/13）、`verify-v2.sh`（10/10）
+在最终包上的结果与本文件结论一致。
+时间：2026-10-25 00:39–00:47（第 1-4 项）、00:47–00:54（soak 尝试，被重启打断）
 配套文档：`docs/ACCEPTANCE-P2-P4-LEAD.md`（Lead 手测的 P2/P3/P4 证据）、`docs/PLAN-v2.md` §6（验收标准）
 
 ---
@@ -381,11 +386,64 @@ soak 期间的判据（每 5 s 一轮）：
 3. `audioserver` pid 不变（没有重启）；
 4. `dump-config` / `stats` 仍可读。
 
-原始输出：
+### 补充：Lead 的短时稳定性观察（非 30 min soak，仅作旁证）
+
+在最终包（sha256 `533c813c…`）上连续播放 7 分钟、期间反复 set/get：
 
 ```
-@@SOAK@@
+audioserver pid before: 1459     after: 1459      ← 没有重启
+Normal mixer raw underrun counters: partial=0 empty=0   ← 两个线程都是 0
+stats: uptimeMs=432091 sessions=10 attached=9 setParamCalls=454 getParamCalls=70
+       avgLatencyUs=2318 maxLatencyUs=39061 watcherTicks=406 watcherFailures=0
+       modeName=auto transport.binder=true transport.tcp.listening=true
 ```
+
+454 次参数下发、406 次 watcher 轮询、0 次失败、0 underrun、audioserver 未重启 —— 短时稳定，
+但**不能替代 30 min / 72 h 长稳**（见上）。
+
+### 本轮结果：未完成（脚本已就绪，原因如下）
+
+**30 分钟 soak 未能跑完**：本轮 00:47 启动 soak 后，设备在 00:54 被 module-p0 装最终包并重启，
+adb 连接中断（脚本日志里 40 条 `adb: no devices/emulators found`），脚本因此没有产出第 5 项的
+PASS/FAIL 行。soak 之前跑通的第 1-4 项结果不受影响（见 §2）。
+
+soak 启动时的原始输出（截断到中断点）：
+
+```
+== jdspcli device acceptance ==
+soak        : 1800 s
+cli transport: --tcp (measurements)
+
+== daemon transport probe ==
+waiting up to 30 s for jdspd ...
+binder service jdsp.service : present
+tcp endpoint files         : yes
+jdspcli ping (auto)        : rc=0 out=ok err=
+jdspcli --tcp ping         : rc=0 out=ok err=
+
+== §6.1 session discovery (no App playback) ==
+tone session: 209
+== §6.2 set -> get consistency ==
+== §6.3 set/get latency + log hygiene ==
+== §6.4 per-app policy (two uids) ==
+player A: com.android.wifi.resources.xiaomi (uid 10000)
+player B: android.aosp.overlay (uid 10001)
+== §6.5 soak ==
+soak for 1800 s ...
+adb: no devices/emulators found      <-- 设备在此期间被重启（module-p0 装最终包）
+adb: no devices/emulators found
+... (共 40 条)
+```
+
+**下一步**：设备空闲后跑
+
+```sh
+$ SOAK_SECONDS=1800 bash backend/test/device/run_acceptance.sh
+```
+
+判据（脚本已实现，失败即 FAIL）：每 5 s 一轮 `set`/`get`/`sessions`/`ping` 全部成功、
+窗口内 `logcat` 无 underrun 与 audioserver/HAL 崩溃、`audioserver` pid 不变、
+`dump-config`/`stats` 仍可读。72 h 版本只需把 `SOAK_SECONDS` 调大（循环逻辑相同）。
 
 ---
 
@@ -394,7 +452,7 @@ soak 期间的判据（每 5 s 一轮）：
 | 项 | 原因 |
 |---|---|
 | §6.2 的 param **115** | 引擎只支持固定查询号（19998/19999/20000/20001/20002/30000…），其余回 EINVAL；判据改用 1500 |
-| §6.5 的 **72 h** 长稳 | 本轮只跑 30 min；72 h 需要持续占用设备，留给用户/夜间任务 |
+| §6.5 的 **30 min / 72 h** 长稳 | 30 min soak 本轮因设备被重启打断（脚本与判据已就绪，见 §4）；72 h 需持续占用设备，留给用户/夜间任务 |
 | **App 直连 jdsp.service** | 属 P5：binder 通道 SELinux 限制普通 App；App 侧走 loopback TCP + token（app-p5 的范围） |
 | **真机并发多 uid 压测** | 设备为共享资源，脚本只起 2 个播放器（够验证策略语义），不做压力测试 |
 | **测试播放器 APK** | 按 lead 决定走 `su <uid>` 路线（零安装、可回退），没有手打 APK |

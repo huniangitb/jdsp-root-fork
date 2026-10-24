@@ -36,10 +36,17 @@ echo "== package dex"
 "$BT/apksigner" sign --ks "$KS" --ks-pass "pass:$KS_PASS" --key-pass "pass:$KEY_PASS" \
     --out "$OUT/jdsp-selftest.apk" "$OUT/aligned.apk"
 
+echo "== javac + d8 (client check: 不装 App 也能验证客户端 ↔ 真 jdspd)"
+rm -rf "$OUT/cc-classes" "$OUT/cc-dex"
+mkdir -p "$OUT/cc-classes" "$OUT/cc-dex"
+javac -source 8 -target 8 -nowarn -Xlint:-options -cp "$JAR" -d "$OUT/cc-classes" "$HERE/ClientCheck.java"
+"$BT/d8" --release --min-api 26 --lib "$JAR" --output "$OUT/cc-dex" \
+    $(find "$OUT/cc-classes" -name '*.class')
+
 echo "== javac + d8 (probe)"
 javac -source 8 -target 8 -nowarn -Xlint:-options -cp "$JAR" -d "$OUT/probe-classes" "$HERE/ProbeServer.java"
 "$BT/d8" --release --min-api 26 --lib "$JAR" --output "$OUT/probe-dex" \
     $(find "$OUT/probe-classes" -name '*.class')
 
 echo "== done"
-ls -l "$OUT/jdsp-selftest.apk" "$OUT/probe-dex/classes.dex"
+ls -l "$OUT/jdsp-selftest.apk" "$OUT/probe-dex/classes.dex" "$OUT/cc-dex/classes.dex"

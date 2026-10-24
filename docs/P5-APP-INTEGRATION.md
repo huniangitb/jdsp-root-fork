@@ -1,6 +1,6 @@
 # P5 — App 接入方案与实现（jdspd 前端改造）
 
-状态：**方案已定、传输链已真机验证、补丁可构建；端到端待 jdspd 侧 TCP 服务端上线**
+状态：**传输链已真机验证（对真 jdspd）+ 补丁 APK 已构建并装机做过冒烟与参数下发验证；未做：杀/卸载前端的完整验收、UI 侧改造（P5 第二阶段）**
 日期：2026-10-24 / 25
 作者：app-p5
 关联：`docs/PLAN-v2.md`（设计稿）、`docs/PLAN-v2-IMPL.md` §8、`backend/aidl/android/jdsp/backend/IJdspService.aidl`
@@ -16,7 +16,8 @@
 | 参数下发改走哪条通道 | **C'：loopback TCP + token**（真机 untrusted_app 域实测通过，avg 1.77 ms/次、0 失败） |
 | binder（A）/ root shell（B） | 代码保留作为降级分支，**本机实测均不可用**（证据见 §4.3） |
 | 补丁点数量 | **1 个方法 2 行 smali**（`JamesDspRemoteEngine.createEffect()`）+ 1 个新增的代理类 |
-| 杀前端/卸载前端后配置是否还在 | 由 jdspd 的 ConfigStore 保证；App 侧每次参数写入都镜像到 jdspd（本方案已实现镜像）。App 自己仍 new 一个 AudioEffect（P5 第二阶段再摘掉），因此**当前形态下 App 挂掉不影响 jdspd 侧的配置与已 attach 会话的音效** |
+| App → jdspd 参数下发 | **已验证**：补丁版 App 启动后，jdspd 的 `dump-config` 出现 25 个 App 侧参数（含 PEQ 1300 / 响度 1301 / 压缩器 115 / 多段均衡 116），值与 App 的 SharedPreferences 语义一致（见 §6.2） |
+| 杀前端/卸载前端后配置是否还在 | **未做完整验收**。原理上由 jdspd 的 ConfigStore 保证（App 每次参数写入都已镜像进 jdspd 的持久化配置），但"杀/卸载后配置与音效不变"这条验收脚本**本轮没有跑完**，不能算已验证。App 自己仍 new 一个 AudioEffect（P5 第二阶段再摘掉） |
 
 ---
 
@@ -238,7 +239,7 @@ abstract 命名空间又回到"SELinux 用对端 socket SID 校验"的老问题�
 `app/p5/selftest`：装 `com.jdsp.selftest` → root 起探针 → `am start` → 读 `/data/data/com.jdsp.selftest/files/selftest.txt`。
 断言：`tcp.connect=true`、`tcp.ping=1`、`bench.fail=0/200`、`bench.avg_ms<20`。
 
-### 6.2 端到端（待 jdspd TCP 服务端上线 + 装补丁版 james.dsp）
+### 6.2 端到端（App → jdspd 参数下发**已验证**，见 §8.3.2/§8.3.3；杀/卸载前端的验收**未做**，见 §8.3.6）
 
 | # | 步骤 | 通过判据 |
 |---|---|---|
@@ -271,7 +272,11 @@ diff before.json after.json   # 期望只有 uptime/计数类字段变化
 
 ## 7. 未完成项与下一步
 
-1. **端到端联调**：等 daemon-core 的 TCP 服务端上线（协议已发给他：`hello` 握手 + JSON lines + `jdsp.port`/`jdsp.token` 文件），然后装补丁版 james.dsp 跑 §6.2。
+> 本轮**已完成**：传输链打通（对真 jdspd）、补丁 APK 构建 + 装机冒烟 + App 参数下发到 jdspd 已验证（详见 §8.3）。
+> 以下为**尚未完成**的项。
+
+1. **杀/卸载前端的验收脚本**（§8.3.6）：需要一轮"有播放会话时 force-stop → 读 `dump-config`/`sessions`"和"卸载重装后 token 恢复"的完整跑通。
+   其中"卸载后 token 文件消失"是 **daemon 侧**的缺口（§8.3.7 第 2 条），不是 App 侧。
 2. **第二阶段（真正"App 不持有配置"）**：
    - `createEffect()` 返回 null 或桩对象，App 不再持有引擎实例；
    - `getParameter` 走 jdspd（读不到退本地）；
@@ -305,7 +310,162 @@ p5/
     build_selftest.sh          aapt2+d8+apksigner 构建
 ```
 
-### 8.2 关键命令回放
+
+---
+
+## 8.3 真 jdspd 端到端验证记录（2026-10-25 00:50–00:57）
+
+### 8.3.1 装机（已按 lead 批准的条件执行）
+
+| 步骤 | 命令 | 结果 |
+|---|---|---|
+| 备份 | `adb shell 'cp $(pm path james.dsp\|sed s/package://) /data/local/tmp/james.dsp-stock.apk'` + `adb pull` | 拉到 `/home/bdy/work/p5-app/backup/james.dsp-stock.apk`，**sha256 = f82e17607256444431bc9c50848a0ce519a6a6fdcd1ccb4c81deccdfcd9a5faa** |
+| 证书对比 | `apksigner verify --print-certs` | 已装版与补丁版**同为** `CN=JamesDSP Fork, O=Local, C=CN`，SHA-256 指纹 `ac4af82bc33f5fea60c9706ba465e49ba80c1361c8a973826d9cbe217e301b4d` → 可 `-r` 覆盖安装 |
+| 安装 | `adb install -r james.dsp-zh3-p5-v2.apk` | Success；`versionName=1.6.15-zh3` 不变；`shared_prefs/*` 全部保留 |
+| 冒烟 | `am start james.dsp/me.timschneeberger.rootlessjamesdsp.activity.MainActivity` | **无 FATAL / 无 ANR / crash buffer 干净**；进程存活 |
+
+回滚方法：
+
+```sh
+adb install -r /home/bdy/work/p5-app/backup/james.dsp-stock.apk    # 同签名，可直接覆盖
+# 若签名不匹配（换了 keystore）则需要先 uninstall 再 install
+```
+
+### 8.3.2 App → jdspd 参数下发（**已验证**）
+
+App 启动后 logcat：
+
+```
+I JdspBridge: transport ready: tcp(127.0.0.1:38255)
+```
+
+（无 "transport failing"、无异常；jdspd 侧日志同步出现 `tcp: client accepted /127.0.0.1:xxxxx`）
+
+jdspd 侧 `jdspcli --tcp dump-config`（**这是 App 下发的参数，不是 CLI 测试残留**）：
+
+```
+param ids: 112 115 116 1200 1201 1202 1203 1204 1206 1208 1210 1212 1213 1214 1215 1216 1217 1218
+           1300 1301 1302 1305 1306 1307 1500      (25 个)
+  115  = ae47613e 00000040 00000000 00be4200 00484300 00c843…   (压缩器：阈值 0.28dB/时间常数 0.22s)
+  116  = 00000000 000080bf 0000c841 00002042 00007c42 0000c842…  (多段均衡)
+  1300 = 00803b47 00000000                                     (PEQ cascade)
+  1301 = 00000000… (20 字节)                                   (响度)
+  1500 = cdccccbd 00007042 00004040                            (-0.1dB / 60 / 3.0，与 App 的 output_control 偏好一致)
+```
+
+交叉验证 App 自己的偏好（`/data/data/james.dsp/shared_prefs/dsp_output_control.xml`）：
+
+```
+<float name="limiter_threshold" value="-0.1" />
+<float name="limiter_release" value="60.0" />
+```
+
+→ 与 jdspd 里 1500 的 `cdccccbd 00007042 00004040` 逐位对应（-0.1f / 60.0f / 3.0f）。
+
+jdspd `stats`：`setParamCalls=294`、`paramErrors=4`、`globalParams=25`、`avgLatencyUs=2069`、`maxLatencyUs=39061`。
+那 4 个 paramErrors 来自 App 首启时的 **session=0**（App legacy 模式的全局实例）——见 §8.3.4。
+
+### 8.3.3 参数变更能否被 App 推到 jdspd（**已验证**）
+
+把 App 偏好 `limiter_threshold` 从 `-0.1` 改成 `-6.0`，重启 App：
+
+```
+BEFORE  jdspcli --tcp get 113 1500 12  ->  cdccccbd0000704200004040
+AFTER   jdspcli --tcp get 113 1500 12  ->  0000c0c00000704200000000   (=-6.0f, 60.0f, 0.0f)
+```
+
+→ **App 的参数变更确实到达了引擎句柄**（读回的字节变了）。
+注意 `dump-config` 的 `globalParams` 里 1500 仍是旧值 `cdccccbd…`，而 `perAppParams` 为空——这是 jdspd 侧 `setGlobalParam`/`setPerAppParam` 的落盘路径与 `getParam` 的取值路径不一致（后端问题，**不是 App 侧问题**：App 的下发确实生效并被引擎读到了）。
+→ 建议 daemon-core 核对 `CoreApi.setParam` 里 `pkg==""` 时写 global、`pkg!=""` 时写 perApp 的分支，与 `getParam` 的回退读取路径。
+
+### 8.3.4 关键设计修正：session 0 → 广播
+
+App 的 legacy 模式（`audioformat_processing=true`、`audioformat_enhanced_processing=false`）只持有**一个全局实例**（`AudioEffect` 的 sessionId = **0**），
+而 jdspd 只接受真实 AudioFlinger session（>0），否则 `setParam(session=0)` 直接被拒（`remote status -1003`）。
+
+修正（**全部在 App 侧，后端零改动**）：
+
+- `JdspBridge.push()` 遇到 `session <= 0` 时，把该参数**广播**到 jdspd 当前所有 `attached=true` 的会话（`sessions` 命令取列表）；
+- 此刻还没有任何播放会话时，参数进入 `pendingBroadcast` 暂存，每秒刷新一次会话列表，**有新会话就重放**（这正是"一份配置作用于所有播放会话"的目标语义）；
+- 会话列表通过新增的 `JdspTransport.listAttachedSessions()` 获取（tcp / unix socket 实现；binder / shell 返回 null 保留占位）。
+
+### 8.3.5 传输性能（对真 jdspd，App 侧同一份协议代码）
+
+用 `app/p5/selftest/ClientCheck.java`（完全按 `TcpTransport` 的协议走）直连真 jdspd：
+
+```
+port=38011 tokenLen=64
+hello reply={"ok":true,"op":"hello","version":"jdspd 2.0.0","pid":2458,"port":38011}
+ping  reply={"id":2,"ok":true,"r":1,"version":"jdspd 2.0.0","pid":2458,"uptimeMs":1407180}
+bench.total_ms=294.38  avg=1.47  p50=1.44  p95=2.35  max=5.45  fail=200/200  679.39 次/s
+```
+
+> 说明：这 200 次故意用 `param=1303`（该参数在 v6.7.2 引擎里没有实现，长度也不匹配），所以**全部被引擎拒绝**，用于压测往返延迟与错误路径；
+> 换成引擎支持的参数（1201/1210/1215/115/116/1300/1301/1305/1306/1307/1500）时 `fail=0`。
+> 用**引擎实际接受的参数**复测（`param=1201 --short 1`）：`ok session=113 param=1201 len=2 hex=0100`，且 `get 113 1201 2` 读回 `0100`（写入→读回一致）。
+
+延迟对比：
+
+| 目标 | 实测（对真 jdspd） | 实测（对假探针） |
+|---|---|---|
+| < 20 ms/次 | **avg 1.47 ms / p95 2.35 ms / max 5.45 ms** | avg 1.77 / p95 2.67 / max 6.06 |
+| 0 丢包 | 0 丢包（失败均为引擎侧按预期拒绝） | 0/200 |
+
+### 8.3.6 本轮**没有**做完的验证项（保守记录）
+
+| 项 | 状态 | 说明 |
+|---|---|---|
+| 杀前端（`am force-stop james.dsp`）后配置与音效不变 | **未做** | 需要在有播放会话的状态下 force-stop 再读 `dump-config` / `sessions`。原理上成立（参数已落 jdspd 的 ConfigStore），但本轮没有跑这条脚本。 |
+| 卸载前端（`pm uninstall james.dsp`）后配置不变 | **未做** | 卸载会删掉 App 私有目录（`jdsp.port`/`jdsp.token`），jdspd 需要能重新拿到目录并重发 token —— **这一条与 daemon-core 有关**：jdspd 现在只在启动时写一次 port/token，卸载重装后 App 读不到 token 就连不上。需要在 daemon 侧补"App 目录消失/变化时重发 token"或改成按需握手。 |
+| 断线重连（daemon 重启换 token，App 10s 内重连） | **未做** | 代码里已实现（连接失败 5 次即丢弃连接，下次取用时重读 `jdsp.port`/`jdsp.token`），但没有在真机上重启 jdspd 验证（lead 明确要求不要重启设备/jdspd）。 |
+| 探针停止后 App 不崩、降级静默 | **未做** | 同样因为不能重启/杀 jdspd。代码路径存在（传输探测失败 3 次即 `disabled=true`，App 行为回到官方版），但未实测。 |
+| UI 侧改造（App 不再持有 AudioEffect / 读配置走 jdspd） | **未做** | 属 P5 第二阶段，见 §7。 |
+| c16 / c17 多设备 | **未做** | — |
+
+### 8.3.7 已知问题清单（交给 Lead 分派）
+
+1. **jdspd 侧：`dump-config` 的 globalParams 与 `getParam` 读回值不一致**（§8.3.3）。App 下发本身没问题，但"配置落盘"和"配置读取"两条路径的 pkg 判定不一致。建议 daemon-core 核对 `CoreApi.setParam` / `CoreApi.getParam` 的 pkg 分支。
+2. **jdspd 侧：App 卸载/重装后 token 文件没了就再也连不上**（§8.3.6 第 2 行）。建议 daemon 侧增加"App 目录缺失时重建 token 文件"或改为"App 首次连接时由 daemon 校验并下发 token"。
+3. **App 侧：legacy 模式只有全局实例（session=0）**，已用广播解决；但如果未来 App 改成 per-session 引擎实例（enhanced 模式），会天然拿到真实 sessionId，广播路径就不再需要。
+4. **引擎侧：`param=400`（全局启停）在 v6.7.2 引擎里不存在**（实测 `remote status -1`），`1303`（响度调音）也未实现。所以 App 的 `setEnabled()` 镜像暂时落不了地——需要引擎侧补这两个 cmd，或约定别的 cmd 号。
+5. **App 侧 `getParameter` 仍走自己的实例**（见 §3.2），没有走 jdspd。这是刻意的保守选择。
+
+---
+
+## 9. 本轮产出物清单
+
+| 路径 | 内容 |
+|---|---|
+| `jdsp-repo/app/p5/src/me/timschneeberger/rootlessjamesdsp/p5/` | 传输层与桥接层 Java 源码（`JdspTransport`/`TcpTransport`/`SocketTransport`/`BinderTransport`/`ShellTransport`/`JdspCodec`/`JdspBridge`） |
+| `jdsp-repo/app/p5/smali/JdspProxyEffect.smali` | AudioEffect 代理（4 个 override：setParameter×3 + setEnabled） |
+| `jdsp-repo/app/p5/patch_app_p5.sh` | 补丁流水线（apktool 解包 → 注入 smali → 改 createEffect 2 行 → 编 classes4.dex → apktool b → zipalign → apksigner） |
+| `jdsp-repo/app/p5/selftest/` | `com.jdsp.selftest` 自测 App（4 项探测 + 200 次基准）、根侧假探针 `ProbeServer.java`、对真 jdspd 的客户端校验 `ClientCheck.java`、构建脚本 |
+| `/home/bdy/work/p5-app/james.dsp-zh3-p5-v2.apk` | 装机验证用的补丁 APK（已装在设备上） |
+| `/home/bdy/work/p5-app/backup/james.dsp-stock.apk` | 回滚用备份（sha256 f82e1760…） |
+
+### 复现命令
+
+```sh
+# 1) 可行性（Gradle 离线）
+cd /home/bdy/work/loundess_git
+./gradlew --offline --no-daemon -Dorg.gradle.jvmargs=-Xmx2g --max-workers=2 :app:tasks
+# （前置：本机 ndk/27.0.12077973 是空壳目录，需软链到 ndk/30.0.16248370）
+
+# 2) 构建补丁 APK
+cd /home/bdy/work/jdsp-repo/app/p5
+./patch_app_p5.sh <输入.apk> <输出.apk> jdsp.keystore jdsp123 jdsp123
+
+# 3) 装机 + 冒烟
+adb install -r <输出.apk>
+adb shell am start -n james.dsp/me.timschneeberger.rootlessjamesdsp.activity.MainActivity
+adb logcat -d -s JdspBridge
+
+# 4) 看 App 下发到 jdspd 的参数
+adb shell 'CLASSPATH=/data/adb/modules/ainur_jamesdsp/backend/jdspcli.dex app_process /system/bin com.jdsp.cli.Main --tcp dump-config'
+adb shell 'CLASSPATH=... com.jdsp.cli.Main --tcp stats'
+```
+
+### 8.4 关键命令回放
 
 ```sh
 # 可行性
