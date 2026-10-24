@@ -1,3 +1,8 @@
+### v6.9.2-fork
+
+* 新增 tools/bin/jdspswitch（arm64/armv7a）：把全局开关参数 SET_PARAM cmd=400 写进
+  引擎状态文件，走普通参数通道并持久化；配套 jdsp_switch.sh on|off。
+
 ### v6.9.1-fork
 
 * 引擎新增全局开关参数 SET_PARAM cmd=400（int16，1=开 0=关）：走普通参数通道，
