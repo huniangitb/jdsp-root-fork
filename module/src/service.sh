@@ -29,12 +29,6 @@ fi
 #    inotify_add_watch 需要 vendor_audio_data_file 的读取权限。post-fs-data
 #    阶段应用会被随后的策略加载覆盖，所以放到 late_start（此时策略已定型）。
 #    规则幂等，重复应用无副作用。
-# 0b) App 总开关同步：读 App 的 powered_on 偏好写入引擎 cmd400。
-#     放在 service 阶段的后台循环里，前端被杀死也不影响音效。
-if [ -f "$MODPATH/jdsp_appsync.sh" ]; then
-	( /system/bin/sh "$MODPATH/jdsp_appsync.sh" & ) >/dev/null 2>&1
-fi
-
 if [ -f "$MODPATH/sepolicy.rule" ]; then
 	if [ -x /data/adb/ksud ]; then
 		/data/adb/ksud sepolicy apply "$MODPATH/sepolicy.rule" >>"$MODPATH/logs/sepolicy.log" 2>&1
