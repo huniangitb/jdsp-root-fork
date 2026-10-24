@@ -1,6 +1,6 @@
 # v2 后端派发 —— P1 (jdspcli) 验收记录
 
-被测物：`backend/out/jdspcli.dex`（sha256 `4f0f5a708b1a99bb31d3729b5805627a9f10bb677b649588d92cf1f742423432`，
+被测物：`backend/out/jdspcli.dex`（sha256 `2e8043731f10f236ee62baf52bbfc0ffd77eb5c0091975c13f318e3e3e468a86`，
 与 `backend/out/jdspd.dex` 同批构建；CLI 侧的 dex 在本轮验收期间**未再改动**）
 设备：Xiaomi xaga / Android 15 / SDK35 / KernelSU，daemon `jdspd 2.0.0`（pid 2458，mode=auto）
 说明：本轮 §6 第 1-4 项跑在 **v2.0.0 最终包安装之前**（00:39 开始），
@@ -466,3 +466,26 @@ $ SOAK_SECONDS=1800 bash backend/test/device/run_acceptance.sh
 - **主机单测 146 项全绿**，无设备依赖。
 - **真机 §6 第 1-4 项全部 PASS**（第 2 项按引擎能力改用 param 1500）。
 - 第 5 项给出 30 min soak 脚本与结果，72 h 待续。
+---
+
+## 最终包复验（2026-10-25 01:35，Lead 实跑）
+
+本文件前面的设备验收来自打包前；以下是**最终包**（sha256 `6d915a71…`，daemon dex `46b0bf7c…`）的复跑结果：
+
+```
+PASS 1        session=129 uid=0 attached=true params=25
+PASS 2        set/get 1500 12B -> cdccccbd0000704200004040
+SKIP 2b       param 115 rejected by daemon/engine (rc=4)
+PASS 3        bench iters=100 roundtrip_max_us=15276 mismatches=0 (< 20 ms)
+PASS 3-log    no underrun lines in the benchmark window
+PASS 3-crash  no audioserver/HAL crash lines in the benchmark window
+PASS 4-init   both players attached (A=137 B=145)
+PASS 4        excluded com.android.wifi.resources.xiaomi: A attached=false, B attached=true
+PASS 4-restore policy follow re-attached com.android.wifi.resources.xiaomi
+SKIP 5        30 min soak not requested
+
+summary: 8 passed, 0 failed, 2 skipped
+EXIT=0
+```
+
+因此“最终包未复验”的限制已解除；30 min/72 h 仍未跑满。

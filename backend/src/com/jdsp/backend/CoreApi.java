@@ -250,6 +250,9 @@ public final class CoreApi {
         int uid = v == null ? -1 : v.uid;
         effects.setOwner(sessionId, uid, pkg, v == null ? -1 : v.pid);
         int applied = bus.applyAll(sessionId, config.paramsFor(pkg));
+        Log.i("attach(" + sessionId + ") pkg=" + pkg + " scope="
+                + (config.scopeFor(pkg) == ConfigStore.SCOPE_PER_APP ? "per-app" : "global")
+                + " params=" + applied);
         effects.setEnabled(sessionId, true);
         Log.i("attach(" + sessionId + ") pkg=" + pkg + " params=" + applied);
         watcher.poke();
@@ -278,11 +281,9 @@ public final class CoreApi {
         if (status == 0 && isPersistable(paramId, value)) {
             SessionView v = getSession(sessionId);
             String pkg = v == null ? "" : v.pkg;
-            if (pkg != null && pkg.length() > 0) {
-                config.setPerAppParam(pkg, paramId, value);
-            } else {
-                config.setGlobalParam(paramId, value);
-            }
+            // One rule for every caller (ConfigStore.scopeFor): global unless the app has its
+            // own per app parameters or an explicit policy entry.
+            config.setParamFor(pkg, paramId, value);
             // Visible on disk almost immediately, but throttled so a slider drag does not fsync
             // on every event; anything throttled here is flushed by the next watcher tick.
             config.saveThrottled(200L);
@@ -305,9 +306,11 @@ public final class CoreApi {
             return reply;
         }
         // Nothing from the engine (the clean engine has no GET_PARAM) and no cached write:
-        // fall back to the configured value of the session's package.
+        // fall back to the configured value of the session's package (same scope rule as the
+        // write path, so get always returns what set stored).
         SessionView v = getSession(sessionId);
-        byte[] configured = v == null ? null : config.paramsFor(v.pkg).get(Integer.valueOf(paramId));
+        byte[] configured = v == null
+                ? config.getParamFor("", paramId) : config.getParamFor(v.pkg, paramId);
         if (configured != null && configured.length > 0) {
             int len = Math.min(n, configured.length);
             byte[] out = new byte[len];

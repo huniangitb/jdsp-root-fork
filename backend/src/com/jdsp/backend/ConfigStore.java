@@ -1,6 +1,7 @@
 package com.jdsp.backend;
 
 import com.jdsp.common.JdspConst;
+import com.jdsp.common.ParamScope;
 
 import java.io.File;
 import java.util.LinkedHashMap;
@@ -260,6 +261,71 @@ public final class ConfigStore {
             }
         }
         return out;
+    }
+
+    // ---- parameter scope: one rule for every caller --------------------------
+
+    /** The parameter is a global one (applies to every session). */
+    public static final int SCOPE_GLOBAL = ParamScope.GLOBAL;
+    /** The parameter belongs to one app (perAppParams[pkg]). */
+    public static final int SCOPE_PER_APP = ParamScope.PER_APP;
+
+    /**
+     * The single rule that decides where a parameter is stored, used by setParam (write),
+     * getParam (read) and the replay on attach.
+     *
+     * <ol>
+     *   <li>no package (unknown owner) -&gt; global;</li>
+     *   <li>the package already has per app parameters, or it has an explicit policy entry
+     *       (i.e. the user configured something for that app) -&gt; per app;</li>
+     *   <li>otherwise -&gt; global.</li>
+     * </ol>
+     *
+     * <p>Consequence: the App's own parameters stay global by default (perAppParams stays
+     * empty), and only apps the user configured explicitly get their own copy. This is the
+     * same decision for writing and for reading, so {@code get} always returns what {@code set}
+     * stored.
+     */
+    public synchronized int scopeFor(String pkg) {
+        boolean hasPerApp = pkg != null && pkg.length() > 0
+                && perAppParams.containsKey(pkg);
+        boolean hasPolicy = pkg != null && pkg.length() > 0 && policies.containsKey(pkg);
+        return ParamScope.decide(pkg, hasPerApp, hasPolicy);
+    }
+
+    /** Stores a parameter according to {@link #scopeFor}. */
+    public synchronized void setParamFor(String pkg, int paramId, byte[] value) {
+        if (scopeFor(pkg) == SCOPE_PER_APP) {
+            setPerAppParam(pkg, paramId, value);
+        } else {
+            setGlobalParam(paramId, value);
+        }
+    }
+
+    /**
+     * Reads a parameter according to {@link #scopeFor}; when the preferred scope has no value the
+     * other scope is used, so nothing ever becomes unreadable.
+     */
+    public synchronized byte[] getParamFor(String pkg, int paramId) {
+        if (scopeFor(pkg) == SCOPE_PER_APP) {
+            byte[] v = perAppValue(pkg, paramId);
+            return v != null ? v : getGlobalParam(paramId);
+        }
+        byte[] v = getGlobalParam(paramId);
+        return v != null ? v : perAppValue(pkg, paramId);
+    }
+
+    /** One value of the per app map of {@code pkg} (null when absent). */
+    private byte[] perAppValue(String pkg, int paramId) {
+        if (pkg == null || pkg.length() == 0) {
+            return null;
+        }
+        Map<Integer, byte[]> map = perAppParams.get(pkg);
+        if (map == null) {
+            return null;
+        }
+        byte[] v = map.get(Integer.valueOf(paramId));
+        return v == null ? null : v.clone();
     }
 
     /** Per app parameters only (used by dumpSession). */

@@ -12,6 +12,8 @@ import java.net.Socket;
 import java.net.SocketTimeoutException;
 import java.security.SecureRandom;
 
+import com.jdsp.common.EndpointFiles;
+
 import org.json.JSONObject;
 
 /**
@@ -58,6 +60,8 @@ public final class TcpService {
     private volatile String lastError = "";
     private volatile String portFile = "";
     private volatile String tokenFile = "";
+    /** Set while the App data directory is missing (only logged once). */
+    private volatile boolean endpointMissingLogged;
 
     public TcpService(CoreApi api, String dirOverride, int portOverride) {
         this.api = api;
@@ -99,14 +103,18 @@ public final class TcpService {
         return running;
     }
 
-    /** Binds loopback, writes the port/token files and starts accepting. Never throws. */
+    /**
+     * Binds loopback and starts accepting. The endpoint files (port/token) are written when the
+     * App's data directory exists; the listener runs in any case, so an App that is installed
+     * (or reinstalled) later can still be served once the files show up.
+     */
     public boolean start() {
         File dir = new File(dirPath);
         if (!dir.isDirectory()) {
+            // The App is not installed (yet). Keep listening: the token file is what actually
+            // gates access, and it is written as soon as the directory appears.
             lastError = "app data dir missing: " + dirPath;
-            Log.w("tcp: " + lastError + " (control channel disabled)");
-            api.setTcpInfo(-1, 0, "", "", lastError);
-            return false;
+            Log.w("tcp: " + lastError + " (listener stays up, endpoint files are written later)");
         }
         try {
             server = new ServerSocket();
@@ -125,9 +133,8 @@ public final class TcpService {
         token = randomToken();
         portFile = new File(dir, PORT_FILE_NAME).getPath();
         tokenFile = new File(dir, TOKEN_FILE_NAME).getPath();
-        boolean okPort = writeSecret(dir, portFile, String.valueOf(port) + "\n");
-        boolean okToken = writeSecret(dir, tokenFile, token + "\n");
-        if (!okPort || !okToken) {
+        boolean okPort = writeEndpointFiles();
+        if (!okPort) {
             lastError = "cannot write port/token files into " + dirPath;
             Log.w("tcp: " + lastError + " (port=" + port + ")");
         } else {
@@ -145,7 +152,7 @@ public final class TcpService {
         acceptThread.setDaemon(true);
         acceptThread.start();
         Log.i("tcp control channel on 127.0.0.1:" + port
-                + " (portFile=" + okPort + " tokenFile=" + okToken + ")");
+                + " (endpoint files written=" + okPort + ")");
         return true;
     }
 
@@ -293,6 +300,69 @@ public final class TcpService {
             api.setTcpInfo(port, clients, portFile, tokenFile, lastError);
             closeQuietly(socket);
         }
+    }
+
+    /**
+     * (Re)writes the endpoint files when they are missing or stale.
+     *
+     * <p>Called at startup and periodically by the watcher, because the App's data directory is
+     * wiped on uninstall/reinstall: without this the daemon would keep serving a port whose
+     * token file no longer exists, and the App could never connect again until the daemon
+     * restarted.
+     *
+     * @return true when the files are in place and match the current listener
+     */
+    public boolean refreshEndpointFiles() {
+        if (port <= 0) {
+            return false;
+        }
+        File dir = new File(dirPath);
+        if (!dir.isDirectory()) {
+            // App not installed: nothing to do, and nothing to complain about.
+            if (!endpointMissingLogged) {
+                endpointMissingLogged = true;
+                Log.i("tcp: app data dir " + dirPath
+                        + " absent, endpoint files not written (App not installed)");
+            }
+            return false;
+        }
+        String wantPort = String.valueOf(port) + "\n";
+        String wantToken = token + "\n";
+        EndpointFiles.Decision decision = EndpointFiles.decide(dir,
+                new File(portFile), new File(tokenFile), wantPort, wantToken);
+        if (decision.upToDate) {
+            if (endpointMissingLogged) {
+                endpointMissingLogged = false;
+                Log.i("tcp: endpoint files present again (" + portFile + ")");
+            }
+            return true;
+        }
+        if (decision.appMissing) {
+            // App not installed: nothing to do, and nothing to complain about.
+            if (!endpointMissingLogged) {
+                endpointMissingLogged = true;
+                Log.i("tcp: app data dir " + dirPath
+                        + " absent, endpoint files not written (App not installed)");
+            }
+            return false;
+        }
+        boolean ok = writeEndpointFiles();
+        if (ok) {
+            endpointMissingLogged = false;
+            Log.i("tcp: endpoint files (re)written: " + portFile + " port=" + port);
+        }
+        return ok;
+    }
+
+    /** Writes port + token files (chown to the dir owner, mode 0400). */
+    private boolean writeEndpointFiles() {
+        File dir = new File(dirPath);
+        if (!dir.isDirectory()) {
+            return false;
+        }
+        boolean okPort = writeSecret(dir, portFile, String.valueOf(port) + "\n");
+        boolean okToken = writeSecret(dir, tokenFile, token + "\n");
+        return okPort && okToken;
     }
 
     // ---- helpers -------------------------------------------------------------

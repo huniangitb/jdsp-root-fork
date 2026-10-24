@@ -32,14 +32,12 @@ module/package.sh                # 拷 dex → 打 zip → 结构/内容自检 �
 | 项 | 值 |
 |---|---|
 | 文件 | `dist/JDSP-fork-v2.0.0.zip` |
-| 大小 | 33,704,660 B |
-| 内置 jdspd.dex | 99,872 B / sha256 `8e0188d29f81fb0da2a68c80332e7a5f3f1e6c7d8fa9cfa1f1182862514fb73f` |
-| 内置 jdspcli.dex | 62,208 B / sha256 `4f0f5a708b1a99bb31d3729b5805627a9f10bb677b649588d92cf1f742423432` |
-| sha256 | `533c813cf70956c4fa05e3f6afd0728db36291672112e763f27b7e0a42f84c31` |
-| `backend/jdspd.dex` | 99,200 B / `d43d1d0441c349032609f0a0e7eeda5dc098be6fc93edb29c060c750b9a8b498` |
-| `backend/jdspcli.dex` | 62,208 B / `4f0f5a708b1a99bb31d3729b5805627a9f10bb677b649588d92cf1f742423432` |
-| 构建时间 / 环境 | 2026-10-25 00:27 CST（重新打包：含日志轮转 + 挂载归属检测）/ xaga A15 SDK35 / build-tools 37.0.0 + cmdline-tools d8 / JDK 21 |
-| 装机验证 | Lead 装完重启后 `module/accept-v2.sh --tone` **12/12 PASS**；backend 判据见 `docs/ACCEPTANCE-V2.md` |
+| 大小 | 33,707,381 B |
+| 内置 jdspd.dex | 103,408 B / sha256 `46b0bf7c5f02b282f2cc8bceba1d29f773505335391073b83c08f08fb3eb9521` |
+| 内置 jdspcli.dex | 64,060 B / sha256 `2e8043731f10f236ee62baf52bbfc0ffd77eb5c0091975c13f318e3e3e468a86` |
+| sha256 | `6d915a718688f36f1d8081a1bf0aa915352439429f1edae0577b2c72983dec2c` |
+| 构建时间 / 环境 | 2026-10-25 01:10 CST（含 token 自愈、统一参数作用域、日志轮转、挂载归属检测）/ xaga A15 SDK35 / build-tools 37.0.0 + cmdline-tools d8 / JDK 21 |
+| 装机验证 | Lead 装完重启后 `module/accept-v2.sh --tone` **13/13 PASS**；backend 判据见 `docs/ACCEPTANCE-V2.md` |
 | arm64 引擎 `libjamesdsp.so` | `b6e1fc1fdc67b0c7bd73b083e92238eb29b4d0c66f7c02e5b476ad78c9fbf700`（与 P0 基线一致，v2 不动引擎） |
 
 ## 3. 与 v6.7.2 基线的差异（全部为新增，不改引擎）
@@ -68,9 +66,9 @@ adb -s LNNZXG8TPFHU69AI reboot && adb -s LNNZXG8TPFHU69AI wait-for-device
 # 等 sys.boot_completed=1，再等 30s（service.sh 里有 sleep 8 + 看护脚本启动）
 ```
 
-验收清单（12 条，见 `docs/MODULE-INTEGRATION.md` §7）：引擎 sha 不变、jdspd 进程在、binder 服务在、
+验收清单（含后续新增判据，见 `docs/MODULE-INTEGRATION.md` §7）：引擎 sha 不变、jdspd 进程在、binder 服务在、
 apply 数量与 mode 一致、日志无 restart 风暴、boot.log 有 mode OK 与 state.bin chmod、杀 daemon 2s 内重启、
-socket 存在且 owner=App uid、tone 下 jdspcli sessions attached=1、state.bin 可写，新增两条：
+TCP 端口/token 文件存在且 owner=App uid、tone 下 jdspcli sessions attached=1、state.bin 可写，新增两条：
 
 - **#11 mode 必须被 daemon 读回（Lead 最担心的失败模式）**：
   `/data/adb/jdspd/config.json` 里 `modeName=backend` 时，重启后 daemon **不能**把它当 auto；
@@ -81,7 +79,7 @@ socket 存在且 owner=App uid、tone 下 jdspcli sessions attached=1、state.bi
   在 `mode=backend` + 重启后，`/vendor/etc/audio_effects.xml` 的 `apply` 计数必须为 0，
   播 tone 后仍能看到 JamesDSP 实例（且 client 是 jdspd），`jdspcli sessions` 显示 `attached=1`。
 
-## 5. 方法学：本轮踩过的 4 个坑（后人也别再踩）
+## 5. 方法学：本轮踩过的坑（后人也别再踩）
 
 ### 5.1 `ksud sepolicy check` 是**假验证**，别拿它当证据
 
@@ -193,8 +191,7 @@ su -c 'rm -rf /data/adb/jdspd'
 
 ## 8. 已知遗留
 
-1. `watch` 规则（2 条）本轮首次随包发布，**重启后要确认 `JamesDSPState: cannot watch` 是否消失**；
-   消失则转正，仍出现说明不是 SELinux 权限问题（可能是 inotify 其它限制）。
+1. `watch` 规则已随最终包发布；01:39 的 logcat 检查中未发现新的 `JamesDSPState: cannot watch`，`state file updated` 正常。长期稳定性仍待观察。
 2. state.bin 每次被 HAL 重写会变回 0600，靠 `jdspd.sh` 每分钟归一化（已实现，实测 600→660）。
 3. `/vendor/etc/audio_effects.xml.jdsp.bak` 是 6.7.3~6.7.6 实验版残留在**别的模块**目录里的文件，
    可以删（见 `docs/MODE-SWITCH.md` §5）。

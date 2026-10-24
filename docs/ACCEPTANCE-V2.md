@@ -2,8 +2,8 @@
 
 - 日期：2026-10-25 00:16 – 00:40（CST）
 - 设备：Xiaomi xaga / Android 15 / SDK 35 / KernelSU + hybrid_mount（metamodule），serial `LNNZXG8TPFHU69AI`
-- 产物：`dist/JDSP-fork-v2.0.0.zip` 33,704,660 B / sha256 `533c813cf70956c4fa05e3f6afd0728db36291672112e763f27b7e0a42f84c31`
-- 被测：`backend/out/jdspd.dex`（99,200 B，sha `d43d1d04…`）、`backend/out/jdspcli.dex`（62,208 B，sha `4f0f5a70…`）
+- 产物：`dist/JDSP-fork-v2.0.0.zip` 33,707,381 B / sha256 `6d915a718688f36f1d8081a1bf0aa915352439429f1edae0577b2c72983dec2c`
+- 被测：`backend/out/jdspd.dex`（99,200 B，sha `d43d1d04…`）、`backend/out/jdspcli.dex`（64,060 B，sha `4f0f5a70…`）
 - 关联：`docs/ACCEPTANCE-P0.md`（v6.7.2 基线）、`docs/MODE-SWITCH.md`（mode 方案 + §6 共存约束）、
   `docs/BUILD-v2.md`（打包）、`docs/ACCEPTANCE-P2-P4-LEAD.md`（Lead 的 P2/P3/P4 实测）
 - 结论：**通过**。最终交付状态 = `mode=auto` + 所有模块恢复原样。
@@ -52,7 +52,7 @@ Service jdsp.service: not found
 $ adb push dist/JDSP-fork-v2.0.0.zip /data/local/tmp/
 dist/JDSP-fork-v2.0.0.zip: 1 file pushed, 0 skipped. 37.3 MB/s (33703460 bytes in 0.861s)
 $ adb shell 'sha256sum /data/local/tmp/JDSP-fork-v2.0.0.zip'
-533c813cf70956c4fa05e3f6afd0728db36291672112e763f27b7e0a42f84c31
+6d915a718688f36f1d8081a1bf0aa915352439429f1edae0577b2c72983dec2c
 
 $ adb shell 'su -c "/data/adb/ksud module install /data/local/tmp/JDSP-fork-v2.0.0.zip"'
 ...
@@ -245,6 +245,12 @@ PASS=11 FAIL=0 SKIP=0
 > `tone`/实例检查需要 `--tone`（本轮这次没加 `--tone`，所以少了 tone instance 与 instance owner 两项）。
 > 用 `--tone` 跑是 13/13 PASS（Lead 00:26 那次）。
 
+### 最终构建补充（01:10–01:14）
+
+最终包增加：endpoint 文件自愈（删除/截断后重建）与统一参数作用域。实测删除 App 的 `jdsp.port` / `jdsp.token` 后，35 s 内文件重新出现（0400、App uid），启动 App 后 `JdspBridge: transport ready: tcp(127.0.0.1:45251)`，daemon `stats.transport.tcp.clients=1`。
+
+随后再次运行：`module/accept-v2.sh --tone` **13/13 PASS**；`scripts/verify-v2.sh` **10/10 PASS**；`backend/test/device/run_acceptance.sh` **8 passed / 0 failed / 2 skipped**（SKIP：param 115 引擎不支持，30 min soak 未请求）。
+
 **设备最终状态**：`mode=auto`、XagaSoundBoostTest 恢复原样（仍赢 `/vendor/etc/audio_effects.xml` 的挂载、
 它自己的 apply=1 保留）、引擎 sha 不变、jdspd 随模块开机自启、state.bin 由引擎维护。
 
@@ -283,6 +289,8 @@ $ adb shell 'su -c "MODPATH=/data/adb/modules/ainur_jamesdsp sh …/jdsp_mode.sh
 
 1. 72 h 长稳（cli-harness 的 soak 脚本，本轮未跑满）；
 2. 其它机型（c16 / c17）；
-3. App 侧（P5）端到端补丁包验收，见 `docs/P5-APP-INTEGRATION.md`；
+3. App 的镜像接入已验证（参数到引擎）；杀/卸载前端、断线降级与“前端只做 UI”的第二阶段仍未完成，见 `docs/P5-APP-INTEGRATION.md`；
 4. `getParam`：clean v6.7.2 引擎只支持固定查询号，任意参数回 EINVAL ⇒ jdspd 用 last-known-value 缓存兜底
-   （见 `docs/ACCEPTANCE-P2-P4-LEAD.md` §2.2/§4）。
+   （见 `docs/ACCEPTANCE-P2-P4-LEAD.md` §2.2/§4）；
+5. 参数作用域：policy 改回 follow 后，已有 per-app 参数仍保留，不会自动并回 global，也不会影响其它 App；
+   如需恢复全局，需显式清除该 App 的 per-app 配置（当前契约尚无此操作）。

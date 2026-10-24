@@ -6,6 +6,7 @@ public final class AllTests {
 
     public static void main(String[] args) {
         Suite suite = new Suite(System.out);
+        com.jdsp.common.BackendCommonTest.run(suite);
         ParserTest.run(suite);
         ValueCodecTest.run(suite);
         FormatTest.run(suite);

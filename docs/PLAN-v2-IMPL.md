@@ -1,6 +1,6 @@
 # JamesDSP 后端派发架构 (v2) —— 实施计划与执行记录
 
-状态：**P0–P6 全部落地，v2.0.0 已装机验收**（本文件是 PLAN-v2 的落地版：把设计稿拆成可执行任务、记录真机验证结论）
+状态：**P0–P4 已验证；P5 完成镜像接入但未完全解耦；P6 仅完成单机验证与打包**（本文件是 PLAN-v2 的落地版：把设计稿拆成可执行任务、记录真机验证结论）
 验收证据：`docs/ACCEPTANCE-P0.md`、`docs/ACCEPTANCE-V2.md`、`docs/ACCEPTANCE-P2-P4-LEAD.md`、`docs/ACCEPTANCE-v2-P1-P4.md`、`docs/P5-APP-INTEGRATION.md`
 基线：v6.7.2-fork（versionCode 112）
 关联：`docs/PLAN-v2.md`（设计稿，不动）
@@ -78,7 +78,7 @@
     ┌──────────────────────────┐
     │ 前端 App（只做 UI）      │  普通 app（untrusted_app）
     └────────────┬─────────────┘
-                 │  AIDL / Binder：jdsp.service（或 root shell → jdspcli 兜底）
+                 │  loopback TCP + token（App）；Binder jdsp.service（root CLI）
     ┌────────────▼─────────────┐
     │ jdspd（常驻，root）      │  App_process (ART) 守护进程
     │  SessionWatcher          │  轮询 AudioFlinger dump 得到 session↔(pid,uid,pkg)
@@ -123,11 +123,12 @@
 
 运行（设备）：
 
-    # 守护进程
-    CLASSPATH=/data/adb/modules/ainur_jamesdsp/jdspd.dex \
+    # 正常部署由模块 service.sh → jdspd.sh 看护，不要手工再起第二实例。
+    # 手工调试（先停止看护与现有 daemon，并保留现场）：
+    CLASSPATH=/data/adb/modules/ainur_jamesdsp/backend/jdspd.dex \
         app_process /system/bin --nice-name=jdspd com.jdsp.backend.Daemon
-    # CLI
-    CLASSPATH=/data/adb/modules/ainur_jamesdsp/jdspcli.dex \
+    # CLI（debug 时可用 /data/local/tmp/jdspcli.dex）
+    CLASSPATH=/data/adb/modules/ainur_jamesdsp/backend/jdspcli.dex \
         app_process /system/bin com.jdsp.cli.Main sessions
 
 ---
@@ -156,18 +157,22 @@
 
 ---
 
-## 8. P5（前端）本轮范围
+## 8. P5（前端）交付范围与未完成项
 
-App 是预编译 APK（Kotlin 源码在 `../loundess_git`，Gradle 全量构建在本机不可行）。
-本轮先交付：
+App 的预编译 APK 通过 `app/p5/patch_app_p5.sh` 打补丁，本轮交付的是**参数镜像接入**：
 
-1. `IJdspService` + `jdspcli`（App 端调用的同一套契约）；
-2. App 侧接入方案：`JamesDspRemoteEngine` 的参数下发改为
-   `jdsp.service`（binder）或 root shell `jdspcli set`（兜底）；
-3. App 仍是"只读 UI"：不持有配置、不 new 自己的 AudioEffect；
-4. App 改造的验收（杀/卸载前端配置不变）其实现有架构已满足，v2 下由 ConfigStore 保证。
+1. `JamesDspRemoteEngine.createEffect()` 使用 `JdspProxyEffect`，保留原 AudioEffect 调用，同时把参数经 TCP 镜像给 jdspd；
+2. `jdsp.service` 是 root CLI 的 AIDL 通道，**不是普通 App 的传输**；App 实际使用 loopback TCP + token；
+3. App 侧 UI 状态/SharedPreferences 与自身 AudioEffect **尚未完全移除**，读取路径也仍走 App 自己的实例；
+4. 已验证：补丁 App 可启动、连接真 jdspd、参数到达后端与引擎；App 连接 token 文件删除后由 daemon 低频自愈重建。
 
----
+**这不是 PLAN-v2 §3 所描述的“前端只做 UI”的完全实现**。P5 第二阶段必须继续：
+- 移除 App 自持有 AudioEffect 的参数控制路径，统一使用 jdspd 的会话与配置模型；
+- 明确读取配置的降级语义（不能把 GET_PARAM 不支持/读 0 误判成引擎故障）；
+- 完整验收杀前端/卸载前端/重装后的配置与音效连续性；
+- 验证断线重连、daemon 重启、无后端时原 App 行为回退。
+
+详见 `docs/P5-APP-INTEGRATION.md`，其“已实现”字样均仅指镜像链路，不代表完全解耦。
 
 ## 8.1 传输层决策（2026-10-24 追加，已真机验证）
 
@@ -219,7 +224,7 @@ App 敞开，**不采纳**。
 |---|---|
 | dumpsys 解析随 ROM 变化 | 解析器单测 + 失败时降级只做 attach(已知 session)；CLI 手工 attach |
 | 双实例（postprocess + backend 同时挂） | `ALREADY_EXISTS` 语义保证不重复；模式切换要求重启 |
-| SELinux：App 直连 `jdsp.service` | 先给 su 域打通（CLI 可用），App 走 root shell 兜底；需要时 `ksud sepolicy apply` 加规则 |
+| SELinux：普通 App 不能访问 su 域 binder | **不给 untrusted_app 开放 su 域**；App 使用 loopback TCP + 私有 token，root CLI 使用 binder |
 | 守护进程被杀 | `service.sh` 看护循环自动重启；`stats` 里暴露启动时间/重启次数 |
 | 回退 | 模块保留 postprocess 链路；`mode=auto` + 禁用 jdspd 即回到 v6.7.2 行为 |
 
@@ -239,9 +244,9 @@ App 敞开，**不采纳**。
 
 ### 关键数字
 
-- `accept-v2.sh --tone`：**13/13 PASS**（最终包 sha256 `533c813c…`）
+- `accept-v2.sh --tone`：**13/13 PASS**（最终包 sha256 `6d915a71…`）
 - `scripts/verify-v2.sh`：**10/10 PASS**
-- `backend/test/run_tests.sh`：**146/146 PASS**
+- `backend/test/run_tests.sh`：**150/150 PASS**
 - setParam 端到端：p50 ≈ 1.6 ms / p95 ≈ 2.7 ms / 0 失败（200 次）
 - 短时稳定：454 次下发 / 406 次 watcher / 0 失败 / 0 underrun / audioserver 未重启
 
@@ -250,5 +255,6 @@ App 敞开，**不采纳**。
 1. **72 h 长稳**未跑（只有 7 分钟观察 + 脚本就绪）。
 2. **c16 / c17 多设备**未验（PLAN-v2 P6 要求三台）。
 3. **P5 第二阶段**（App 彻底不再持有 AudioEffect、配置只从 jdspd 读）未做；当前是"镜像"形态。
-4. App 卸载重装后 token 文件重建（daemon 侧低频自愈）待补。
+4. App 卸载重装后的 token 文件自愈已补：daemon 每 30 s 检查，缺失/过期时重建；实测删除后重建、App 重连成功。
+6. 参数作用域语义：policy 改回 follow **不会**删除该 App 已有的 per-app 参数，也不会自动并回 global；因此该 App 的已有覆盖继续优先于 global，不会泄漏到其它 App。若用户要彻底回到全局，需要显式清除该 App 的 per-app 配置（当前契约尚无此操作）。此语义已独立复核，不是数据丢失 bug。
 5. 引擎 v6.7.2 没有全局启停命令（cmd 400）与响度调音（1303），App 的 setEnabled 镜像暂无法落地。

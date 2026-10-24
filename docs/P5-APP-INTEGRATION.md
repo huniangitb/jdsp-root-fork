@@ -1,7 +1,7 @@
 # P5 — App 接入方案与实现（jdspd 前端改造）
 
 状态：**传输链已真机验证（对真 jdspd）+ 补丁 APK 已构建并装机做过冒烟与参数下发验证；未做：杀/卸载前端的完整验收、UI 侧改造（P5 第二阶段）**
-日期：2026-10-24 / 25
+日期：2026-10-24 / 25（Lead 最终复核：2026-10-25 01:xx）
 作者：app-p5
 关联：`docs/PLAN-v2.md`（设计稿）、`docs/PLAN-v2-IMPL.md` §8、`backend/aidl/android/jdsp/backend/IJdspService.aidl`
 
@@ -182,7 +182,7 @@ abstract 命名空间又回到"SELinux 用对端 socket SID 校验"的老问题�
 3. 连接第一行必须 `{"op":"hello","token":"..."}`，错 token 立即断开；
 4. 之后 JSON lines（`op/id/s/p/v/n/r/e`），单行 ≤1 MiB，服务端保持一请求一应答。
 
-安全边界：**只有 loopback + token 双条件**；token 文件目录 0700、文件 0400 归 App uid，其它 App 读不到；不改任何 SELinux 规则。
+安全边界：**只有 loopback + token 双条件**；token 文件目录 0700、文件 0400 归 App uid，其它 App 读不到；不改任何 SELinux 规则。daemon 每 30 s 检查文件，缺失/截断/过期时重建（01:12 实测删除后 35 s 内恢复，App 可重连）。
 
 ### 4.4 实测矩阵（xaga / Android 15 / KernelSU，域 `u:r:untrusted_app:s0:c70,c257,c512,c768`）
 
@@ -479,3 +479,19 @@ adb shell cat /data/data/com.jdsp.selftest/files/selftest.txt
 # 补丁 APK
 app/p5/patch_app_p5.sh JamesDSP-root-full-v1.6.15-58.apk out.apk jdsp.keystore jdsp123 jdsp123
 ```
+
+
+---
+
+## 9. Lead 最终复核：第二阶段不是已完成项
+
+第二阶段正在探索用 `JdspRemoteEffect` 取代 App 的真实 `AudioEffect`，但**默认补丁流水线与最终设备仍使用 §2–§6 的镜像模式**。下列问题使第二阶段不能直接发布：
+
+1. v6.7.2 引擎不支持 cmd=400，不能把 `setEnabled` 当作已实现的全局启停；
+2. `release()` 不能无条件 detach jdspd 的公共会话句柄，否则 App 释放自身对象会摘掉其它会话的效果；
+3. 远程读不到 19998/20001/20002 等引擎内部参数时，不能用 0/-1 掩盖并触发健康检查反复重建；需要保留本地只读 fallback 或精确区分“未知”与真实故障；
+4. SharedPreferences 仍是 App 的 UI 配置来源，尚未完成“前端不持有配置”。
+
+最终后端包 sha256 `6d915a718688f36f1d8081a1bf0aa915352439429f1edae0577b2c72983dec2c`；
+最终设备验收 `accept-v2.sh --tone` 13/13、`scripts/verify-v2.sh` 10/10、CLI 设备验收 8 PASS / 0 FAIL / 2 SKIP。
+这些数字只覆盖后端与镜像接入，不代表“App 只做 UI”或多设备验收完成。

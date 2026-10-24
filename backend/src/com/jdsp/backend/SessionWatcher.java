@@ -29,6 +29,11 @@ public final class SessionWatcher {
     private final PolicyEngine policy;
     private final EffectManager effects;
     private final ParamBus bus;
+    /** Optional: keeps the App's endpoint files alive across App reinstalls. */
+    private TcpService tcp;
+
+    /** How often the App's endpoint files (port/token) are re-checked. */
+    public static final long ENDPOINT_REFRESH_MS = 30000L;
 
     private final Object wakeLock = new Object();
     private volatile boolean running;
@@ -41,6 +46,7 @@ public final class SessionWatcher {
     private volatile long lastTickAt;
     private volatile int lastDumpBytes;
     private volatile String lastError = "";
+    private long lastEndpointCheck;
 
     public SessionWatcher(ConfigStore config, PolicyEngine policy, EffectManager effects,
                           ParamBus bus) {
@@ -48,6 +54,11 @@ public final class SessionWatcher {
         this.policy = policy;
         this.effects = effects;
         this.bus = bus;
+    }
+
+    /** Lets the watcher re-create the App's port/token files when they disappear. */
+    public void setTcpService(TcpService tcp) {
+        this.tcp = tcp;
     }
 
     public void start() {
@@ -141,6 +152,29 @@ public final class SessionWatcher {
         sessions = list;
         reconcile(list);
         config.saveIfDirty();
+        refreshEndpointFiles();
+    }
+
+    /**
+     * Re-creates the App's endpoint files when they are missing (the App was uninstalled or
+     * reinstalled, which wipes /data/data/&lt;pkg&gt;/files). Without this the App could not
+     * connect until the daemon restarted.
+     */
+    private void refreshEndpointFiles() {
+        TcpService service = tcp;
+        if (service == null) {
+            return;
+        }
+        long now = System.currentTimeMillis();
+        if (now - lastEndpointCheck < ENDPOINT_REFRESH_MS) {
+            return;
+        }
+        lastEndpointCheck = now;
+        try {
+            service.refreshEndpointFiles();
+        } catch (Throwable t) {
+            Log.w("endpoint file refresh failed: " + EffectManager.describe(t));
+        }
     }
 
     /** Runs the dumpsys command with a watchdog. Returns null when it failed. */

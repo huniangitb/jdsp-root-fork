@@ -175,6 +175,8 @@ public final class Daemon {
 
         tcp = new TcpService(api, tcpDir, tcpPort);
         tcp.start();
+        // The watcher re-creates the App's port/token files when they disappear (App reinstall).
+        watcher.setTcpService(tcp);
 
         // ---- watcher ---------------------------------------------------------
         watcher.start();
