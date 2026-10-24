@@ -1,0 +1,6 @@
+id=CORD
+name=Audio Effects Bridge
+version=2.4
+versionCode=15
+author=Lead; Rei Ryuki (Audio Compatibility Patch Reborn, policy part)
+description=Make every audio stream pass through AudioFlinger effects (JamesDSP etc.). Patches audio_policy*.xml at install time and mounts them itself. On ColorOS/OPLUS it binary-patches the AudioTrack client chain (libaaudio and its split sub-libraries, libaudioclient covering AudioTrack::onFirstRef for every app, libwilhelm for OpenSL) AND rewrites mFlags inside AudioTrack::set()/createTrack_l() so the framework cannot drop the deep-buffer bit; v1.6 also re-targets the branches that jump past those rewrites, so clients that never reach the AOSP FAST->PRIMARY downgrade stop getting a fast track (they were the ones still bypassing every effect. v2.0 restores the v1.5 patch exactly: -F alone, no branch retargeting, no libaudioflinger. v1.6/v1.7/v1.9 all forced the flag rewrite onto tracks that never asked for it and broke playback on devices with offload/direct paths. Global effect coverage is now handled by the JamesDSP module's <postprocess> declaration instead of by touching client flags. Other devices skip that part automatically. Auto-detects AIDL HAL policy source and skips useless xml mounts. Verifies mounts by reading /proc/mounts, re-binds late and restarts audioserver if a bind was lost.
