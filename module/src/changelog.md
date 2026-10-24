@@ -1,3 +1,11 @@
+### v6.8.4-fork
+
+* aml.sh 统一负责跨模块合并（声明 + 恰好一条 apply），杜比与 JamesDSP 可共存。
+* 引擎：inotify 失败时记录 errno（本机 errno 13 EACCES）。
+* sepolicy：boot-completed 阶段多次重试应用（KSU 早期应用会被后续策略加载覆盖）。
+* 已知：MTK HAL 域上 inotify_add_watch 被 dontaudit 隐藏的 SELinux 规则拒绝，
+  常规 dir read/search 授权无效，热加载走轮询（每 buffer 一次 stat，实测延迟无差别）。
+
 ### v6.7.9-fork
 
 * aml.sh 现在同时负责 <library>/<effect> 声明与 <postprocess><apply> 条目：
