@@ -51,6 +51,50 @@ static unsigned crc32_of(const unsigned char *buf, size_t len)
     return c ^ 0xFFFFFFFFu;
 }
 
+/* exit 0 when the file holds exactly one cmd400 record with value 1 */
+static int master_check(const char *path)
+{
+    unsigned char *in = NULL;
+    size_t len = 0, off;
+    unsigned count, i, found = 0, value = 0;
+    struct stat st;
+    int fd = open(path, O_RDONLY | O_CLOEXEC);
+
+    if (fd < 0)
+        return 1;
+    if (fstat(fd, &st) == 0 && st.st_size > 0) {
+        in = malloc((size_t)st.st_size);
+        if (in != NULL) {
+            ssize_t n = read(fd, in, (size_t)st.st_size);
+            if (n > 0)
+                len = (size_t)n;
+        }
+    }
+    close(fd);
+    if (in == NULL || len < HDR + TRL || memcmp(in, "JDSP", 4) != 0) {
+        free(in);
+        return 1;
+    }
+    count = get_u32(in + 12);
+    off = HDR;
+    for (i = 0; i < count; i++) {
+        unsigned cmd, size;
+        if (off + 8 > len)
+            break;
+        cmd = get_u32(in + off);
+        size = get_u32(in + off + 4);
+        if (off + 8 + size > len)
+            break;
+        if (cmd == CMD_SET_PARAM && size >= 16u && get_u32(in + off + 8 + 12) == MASTER_CMD) {
+            found++;
+            value = in[off + 8 + 16];
+        }
+        off += 8 + size;
+    }
+    free(in);
+    return (found == 1u && value == 1u) ? 0 : 1;
+}
+
 int main(int argc, char **argv)
 {
     const char *path = DEFAULT_PATH;
@@ -64,6 +108,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: %s <on|off> [state-file]\n", argv[0]);
         return 2;
     }
+    if (strcmp(argv[1], "check") == 0)
+        return master_check(path);
     on = strcmp(argv[1], "off") != 0;
     if (argc > 2)
         path = argv[2];
