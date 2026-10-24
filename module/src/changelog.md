@@ -1,3 +1,13 @@
+### v6.8.6-fork（两个根因修复）
+
+* **修复配置被截断**：aml.sh 的 awk 在某些情况下输出为空，随后 mv 把厂商的
+  audio_effects.xml 覆盖成 0 字节，导致 MiSound/杜比注册消失、App 报
+  "Cannot initialize effect engine ... Error: -3"。现在改为先写临时文件，
+  校验非空且含 </audio_effects_conf> 才替换，并保留 .jdsp.bak 备份。
+* **修复 inotify 降级**：反编译 vendor_sepolicy.cil 发现 inotify_add_watch 检查的是
+  SELinux 的 watch/watch_reads 权限（不是 dir read）；MTK 只对 mtk_audiohal_data_file
+  授予了该权限。补上后热加载恢复事件驱动，不再降级轮询。
+
 ### v6.8.4-fork
 
 * aml.sh 统一负责跨模块合并（声明 + 恰好一条 apply），杜比与 JamesDSP 可共存。

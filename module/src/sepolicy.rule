@@ -6,19 +6,19 @@ allow zygote vendor_file file { read open getattr map }
 # process that reads and writes /data/vendor/audio/jamesdsp_state.bin.
 # Path-scoped only; no domain-wide permissions. rename/unlink are required
 # because the engine saves via  .tmp.<pid> + fsync + rename.
-allow hal_audio_default vendor_audio_data_file dir { search read open getattr write add_name remove_name create }
-allow hal_audio_default vendor_audio_data_file file { read write open create getattr setattr map unlink rename }
+allow hal_audio_default vendor_audio_data_file dir { search read open getattr write add_name remove_name create watch watch_reads }
+allow hal_audio_default vendor_audio_data_file file { read write open create getattr setattr map unlink rename watch watch_reads }
 # Keep audioserver-hosted instances working too (older layouts / other devices).
-allow audioserver vendor_audio_data_file dir { search read open getattr write add_name remove_name create }
-allow audioserver vendor_audio_data_file file { read write open create getattr setattr map unlink rename }
+allow audioserver vendor_audio_data_file dir { search read open getattr write add_name remove_name create watch watch_reads }
+allow audioserver vendor_audio_data_file file { read write open create getattr setattr map unlink rename watch watch_reads }
 allow audioserver vendor_file file { read open getattr map execute }
 
 # Vendor audio HALs run in SoC-specific domains (MediaTek uses
 # mtk_hal_audio, Qualcomm uses hal_audio_default, ...).  Grant the same
 # state-file access to the known ones; domains a device does not define
 # are simply skipped by the policy loader.
-allow mtk_hal_audio vendor_audio_data_file dir { search read open getattr write add_name remove_name create }
-allow mtk_hal_audio vendor_audio_data_file file { read write open create getattr setattr map unlink rename }
+allow mtk_hal_audio vendor_audio_data_file dir { search read open getattr write add_name remove_name create watch watch_reads }
+allow mtk_hal_audio vendor_audio_data_file file { read write open create getattr setattr map unlink rename watch watch_reads }
 allow mtk_hal_audio vendor_file file { read open getattr map execute }
 
 # inotify_add_watch() on the state directory walks the whole path: the

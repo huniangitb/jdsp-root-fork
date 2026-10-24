@@ -21,9 +21,15 @@ TYPE=f98765f4-c321-5de6-9a45-123459495ab2
 # 建链失败，并连带把厂商的全局效果（例如杜比 DAP）一起带掉。
 aml_apply_music() {
 	XML="$1"
-	[ -f "$XML" ] || return 0
+	[ -s "$XML" ] || return 0
 	grep -q "<audio_effects_conf" "$XML" 2>/dev/null || return 0
-	sed -i 's|<apply effect="jamesdsp"/>||g' "$XML"
+
+	TMP="$XML.aml"
+	STRIP="$XML.strip"
+
+	# 先做纯文本处理，绝不就地修改：任何一步失败都不会破坏原文件。
+	sed 's|<apply effect="jamesdsp"/>||g' "$XML" > "$STRIP" 2>/dev/null || { rm -f "$STRIP"; return 0; }
+
 	awk '
 		{ L[NR] = $0 }
 		END {
@@ -55,7 +61,18 @@ aml_apply_music() {
 				print L[i]
 			}
 		}
-	' "$XML" > "$XML.aml" && mv -f "$XML.aml" "$XML"
+	' "$STRIP" > "$TMP" 2>/dev/null
+
+	# 安全闸：输出为空或缺少结束标签就放弃，保留原文件（历史事故：曾把厂商配置截断成 0 字节，
+	# 导致 MiSound/杜比无法创建效果）。
+	if [ ! -s "$TMP" ] || ! grep -q "</audio_effects_conf>" "$TMP"; then
+		rm -f "$TMP" "$STRIP"
+		return 0
+	fi
+
+	[ -f "$XML.jdsp.bak" ] || cp -f "$XML" "$XML.jdsp.bak" 2>/dev/null
+	rm -f "$STRIP"
+	mv -f "$TMP" "$XML"
 }
 
 patchxml() {
