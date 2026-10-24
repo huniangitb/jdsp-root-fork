@@ -1,3 +1,9 @@
+### v6.9.0-fork
+
+* 引擎：EFFECT_CMD_DISABLE 现在真正直通（按采样格式 memcpy 输入到输出）。
+  此前即使 disabled 也会跑完整 DSP 链，只是最后返回 -ENODATA，输出里仍是处理过的样本，
+  所以 App 的关闭开关听感上无效。
+
 ### v6.8.6-fork（两个根因修复）
 
 * **修复配置被截断**：aml.sh 的 awk 在某些情况下输出为空，随后 mv 把厂商的
