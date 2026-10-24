@@ -77,7 +77,8 @@ elif [ "$LIB" == "lib64" ] || [ "$LIB2" == "64-bit" ]; then
 elif [ "$LIB" == "lib" ] || [ "$LIB2" == "32-bit" ]; then
 	QARCH=$ARCH32
 	ui_print "   32 bit audio libs detected  "
-	cp_ch $MODPATH/common/files/$QARCH/libjamesdsp.so $MODPATH/system/lib/soundfx/libjamesdsp.so
+	# AIDL libraries are 64-bit only; do not install them into the 32-bit path.
+[ "$QARCH" = "aidl" ] || cp_ch $MODPATH/common/files/$QARCH/libjamesdsp.so $MODPATH/system/lib/soundfx/libjamesdsp.so
 else
 	ui_print "   Unable to detect audio lib bit...  "
 	ui_print "   Is this a device with 64bit only audio libs?"
