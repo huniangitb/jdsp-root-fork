@@ -4,3 +4,4 @@ build/
 backend/out/
 dist/
 backend/.build.lock
+module/src/backend/

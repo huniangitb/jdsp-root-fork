@@ -49,6 +49,9 @@ public final class ConfigStore {
     private String importedFrom = "";
     private long updatedAt;
     private boolean dirty;
+    /** Runtime only override (--mode), never serialised. -1 = use the stored mode. */
+    private int modeOverride = -1;
+    private long lastSaveAt;
 
     public ConfigStore(File file) {
         this.file = file;
@@ -124,6 +127,21 @@ public final class ConfigStore {
         return dirty ? saveLocked() : true;
     }
 
+    /**
+     * Writes the config when dirty, at most once per {@code minIntervalMs}. Used by the hot
+     * parameter path so a slider drag does not fsync on every event, while a single set is still
+     * on disk almost immediately (the watcher tick flushes anything throttled within 1 s).
+     */
+    public synchronized boolean saveThrottled(long minIntervalMs) {
+        if (!dirty) {
+            return true;
+        }
+        if (System.currentTimeMillis() - lastSaveAt < minIntervalMs) {
+            return true;
+        }
+        return saveLocked();
+    }
+
     public synchronized boolean save() {
         dirty = true;
         return saveLocked();
@@ -139,7 +157,9 @@ public final class ConfigStore {
                 return false;
             }
             updatedAt = System.currentTimeMillis() / 1000L;
+            lastSaveAt = System.currentTimeMillis();
             dirty = false;
+            writeModeMirrorLocked();
             return true;
         } catch (Throwable t) {
             Log.e("config save failed", t);
@@ -149,11 +169,23 @@ public final class ConfigStore {
 
     // ---- mode / enable -------------------------------------------------------
 
+    /** Effective mode: the runtime override (--mode) when present, else the stored mode. */
     public synchronized int getMode() {
-        return mode;
+        int override = modeOverride;
+        return override >= 0 ? override : mode;
+    }
+
+    /** Runtime only mode override (used by --mode); cleared by an explicit setMode. */
+    public synchronized void setModeOverride(int override) {
+        if (override == JdspConst.MODE_AUTO || override == JdspConst.MODE_BACKEND) {
+            modeOverride = override;
+        } else {
+            modeOverride = -1;
+        }
     }
 
     public synchronized void setMode(int newMode) {
+        modeOverride = -1;
         int m = newMode == JdspConst.MODE_BACKEND ? JdspConst.MODE_BACKEND : JdspConst.MODE_AUTO;
         if (m != mode) {
             mode = m;
@@ -413,6 +445,23 @@ public final class ConfigStore {
         } catch (Throwable t) {
             Log.e("savePreset failed: " + path, t);
             return -1004;
+        }
+    }
+
+    /**
+     * Plain text mirror of the mode ({@code /data/adb/jdspd/mode}) for shell scripts. The config
+     * file stays the single source of truth; this is only a convenience for module hooks.
+     */
+    private void writeModeMirrorLocked() {
+        try {
+            File dir = file == null ? null : file.getParentFile();
+            if (dir == null || !dir.isDirectory()) {
+                return;
+            }
+            String text = (mode == JdspConst.MODE_BACKEND ? "backend" : "auto") + "\n";
+            FileUtil.writeAtomic(new File(dir, "mode"), text.getBytes("UTF-8"), 0640);
+        } catch (Throwable ignored) {
+            // best effort mirror
         }
     }
 

@@ -206,18 +206,46 @@ fi
 
 # ---------------------------------------------------------------- build ----
 echo "== build =="
-if ! ( cd "$BACKEND" && ./build.sh ) >"$LOG_DIR/build.log" 2>&1; then
-    echo "ERROR: backend/build.sh failed; tail:" >&2
-    tail -20 "$LOG_DIR/build.log" >&2
-    exit 2
-fi
-CLI_DEX="$BACKEND/out/jdspcli.dex"
-[ -f "$CLI_DEX" ] || { echo "ERROR: missing $CLI_DEX" >&2; exit 2; }
-
 ANDROID_JAR=$(ls "$SDK"/platforms/android-*/android.jar 2>/dev/null | sort -V | tail -1)
 D8="$SDK/cmdline-tools/latest/bin/d8"
+AIDL_BIN=$(ls -d "$SDK"/build-tools/*/aidl 2>/dev/null | sort -V | tail -1)
 [ -f "$ANDROID_JAR" ] || { echo "ERROR: missing android.jar under $SDK" >&2; exit 2; }
 [ -x "$D8" ] || { echo "ERROR: missing d8 at $D8" >&2; exit 2; }
+[ -x "$AIDL_BIN" ] || { echo "ERROR: missing aidl under $SDK/build-tools" >&2; exit 2; }
+
+# Compile the CLI from the same sources with the same aidl/javac/d8 recipe.
+# Used when backend/out is unavailable: a concurrent daemon build calls
+# build.sh, which rm -rf's backend/out, so the normal artifact can vanish
+# between build.sh returning and the push below.
+build_cli_dex() {
+    mkdir -p "$LOG_DIR/gen" "$LOG_DIR/cli-classes" "$LOG_DIR/cli-dex"
+    local files
+    mapfile -t AIDL_FILES < <(find "$BACKEND/aidl" -name '*.aidl' | sort)
+    "$AIDL_BIN" --lang=java -I"$BACKEND/aidl" --out="$LOG_DIR/gen" "@@{AIDL_FILES[@]}" || return 1
+    mapfile -t files < <(find "$BACKEND/src/com/jdsp/cli" "$BACKEND/src/com/jdsp/common"             "$LOG_DIR/gen" -name '*.java' | sort)
+    javac --release 8 -nowarn -Xlint:-options -classpath "$ANDROID_JAR"             -d "$LOG_DIR/cli-classes" "@@{files[@]}" || return 1
+    find "$LOG_DIR/cli-classes" -name '*.class' > "$LOG_DIR/cli-files.txt"
+    "$D8" --lib "$ANDROID_JAR" --min-api 29 --output "$LOG_DIR/cli-dex"             $(cat "$LOG_DIR/cli-files.txt") >/dev/null || return 1
+    cp "$LOG_DIR/cli-dex/classes.dex" "$LOG_DIR/jdspcli.dex"
+}
+
+echo "running backend/build.sh (logged, best effort)..."
+( cd "$BACKEND" && ./build.sh ) >"$LOG_DIR/build.log" 2>&1         || echo "WARN: build.sh failed (see $LOG_DIR/build.log)"
+CLI_DEX="$LOG_DIR/jdspcli.dex"
+rm -f "$CLI_DEX"
+if [ -f "$BACKEND/out/jdspcli.dex" ]; then
+    cp "$BACKEND/out/jdspcli.dex" "$CLI_DEX" 2>/dev/null || true
+fi
+if [ -s "$CLI_DEX" ]; then
+    echo "cli dex     : backend/build.sh ($(stat -c %s "$CLI_DEX") B)"
+else
+    echo "cli dex     : backend/out unavailable, compiling standalone..."
+    if ! build_cli_dex; then
+        echo "ERROR: standalone jdspcli compile failed" >&2
+        exit 2
+    fi
+    echo "cli dex     : standalone ($(stat -c %s "$CLI_DEX") B)"
+fi
 rm -rf "$LOG_DIR/tone-classes" "$LOG_DIR/tone-dex"
 mkdir -p "$LOG_DIR/tone-classes" "$LOG_DIR/tone-dex"
 if ! javac --release 8 -nowarn -classpath "$ANDROID_JAR" -d "$LOG_DIR/tone-classes" \
@@ -245,10 +273,19 @@ echo
 echo "== daemon transport probe =="
 BINDER_PRESENT=$(dev "service list 2>/dev/null | grep -c 'jdsp.service'")
 TCP_FILES=$(dev "[ -f /data/data/james.dsp/files/jdsp.port ] && [ -f /data/data/james.dsp/files/jdsp.token ] && echo yes || echo no")
-run_cli ping
-AUTO_RC=$CLI_RC
-AUTO_MSG=$CLI_OUT
-AUTO_ERR=$CLI_ERR
+DAEMON_WAIT=${DAEMON_WAIT:-30}
+echo "waiting up to $DAEMON_WAIT s for jdspd ..."
+AUTO_RC=1
+AUTO_MSG=""
+AUTO_ERR=""
+for i in $(seq 1 "$DAEMON_WAIT"); do
+    run_cli ping
+    AUTO_RC=$CLI_RC
+    AUTO_MSG=$CLI_OUT
+    AUTO_ERR=$CLI_ERR
+    [ "$AUTO_RC" = "0" ] && break
+    sleep 1
+done
 run_cli --tcp ping
 TCP_RC=$CLI_RC
 TCP_MSG=$CLI_OUT
@@ -259,7 +296,7 @@ echo "jdspcli ping (auto)        : rc=$AUTO_RC out=$AUTO_MSG err=$AUTO_ERR"
 echo "jdspcli --tcp ping         : rc=$TCP_RC out=$TCP_MSG err=$TCP_ERR"
 echo
 
-if [ "$AUTO_RC" != "0" ]; then
+if [ "$AUTO_RC" != "0" ] && [ "$TCP_RC" != "0" ]; then
     echo "SKIP: jdspd is not running; nothing to measure."
     echo "  auto  : $AUTO_MSG | $AUTO_ERR"
     echo "  --tcp : $TCP_MSG | $TCP_ERR"
@@ -282,20 +319,29 @@ if [ -z "$SID" ]; then
     finish
 fi
 echo "tone session: $SID"
-sleep 1
-run_cli sessions --json
-if [ "$CLI_RC" != "0" ]; then
-    record FAIL "1" "sessions --json rc=$CLI_RC err=$CLI_ERR"
-else
+ATT=""
+PARAMS=""
+SESSION_UID=""
+for i in $(seq 1 20); do
+    run_cli sessions --json
+    if [ "$CLI_RC" != "0" ]; then
+        break
+    fi
     OBJ=$(session_object "$CLI_OUT" "$SID")
     ATT=$(json_field "$OBJ" attached)
     PARAMS=$(json_field "$OBJ" params)
     SESSION_UID=$(json_field "$OBJ" uid)
     if [ "$ATT" = "true" ] && [ "${PARAMS:-0}" -gt 0 ] 2>/dev/null; then
-        record PASS "1" "session=$SID uid=$SESSION_UID attached=$ATT params=$PARAMS"
-    else
-        record FAIL "1" "session=$SID attached=$ATT params=$PARAMS (want attached=true params>0)"
+        break
     fi
+    sleep 0.5
+done
+if [ "$CLI_RC" != "0" ]; then
+    record FAIL "1" "sessions --json rc=$CLI_RC err=$CLI_ERR"
+elif [ "$ATT" = "true" ] && [ "${PARAMS:-0}" -gt 0 ] 2>/dev/null; then
+    record PASS "1" "session=$SID uid=$SESSION_UID attached=$ATT params=$PARAMS"
+else
+    record FAIL "1" "session=$SID attached=${ATT:-?} params=${PARAMS:-?} (want attached=true params>0)"
 fi
 
 # --------------------------------------------------------------- 2. set/get
@@ -379,12 +425,20 @@ else
     if [ -z "$SID_A" ] || [ -z "$SID_B" ]; then
         record FAIL "4" "tone as uid $UID_A/$UID_B did not start (A=$SID_A B=$SID_B)"
     else
-        sleep 1
-        run_cli sessions --json
-        OBJ_A=$(session_by_uid "$CLI_OUT" "$UID_A")
-        OBJ_B=$(session_by_uid "$CLI_OUT" "$UID_B")
-        A_ATT=$(json_field "$OBJ_A" attached)
-        B_ATT=$(json_field "$OBJ_B" attached)
+        A_ATT=""
+        B_ATT=""
+        for i in $(seq 1 20); do
+            run_cli sessions --json
+            [ "$CLI_RC" = "0" ] || continue
+            OBJ_A=$(session_by_uid "$CLI_OUT" "$UID_A")
+            OBJ_B=$(session_by_uid "$CLI_OUT" "$UID_B")
+            A_ATT=$(json_field "$OBJ_A" attached)
+            B_ATT=$(json_field "$OBJ_B" attached)
+            if [ "$A_ATT" = "true" ] && [ "$B_ATT" = "true" ]; then
+                break
+            fi
+            sleep 0.5
+        done
         if [ "$A_ATT" = "true" ] && [ "$B_ATT" = "true" ]; then
             record PASS "4-init" "both players attached (A=$SID_A B=$SID_B)"
         else

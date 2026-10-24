@@ -88,9 +88,16 @@ jdspd_main() {
 		done
 		wait "$_pid"
 		_rc=$?
-		jdspd_log "jdspd exited rc=$_rc, restart in 2s"
 		jdspd_normalize_state
-		sleep 2
+		# daemon 自己会做单实例保护（/data/adb/jdspd/jdspd.lock + FileChannel.tryLock），
+		# 抢不到锁时打印 "another jdspd is running" 并以 0 退出 —— 这种情况不要 2s 狂重启。
+		if [ "$_rc" = "0" ]; then
+			jdspd_log "jdspd exited rc=0 (clean stop or instance already running), retry in 30s"
+			sleep 30
+		else
+			jdspd_log "jdspd exited rc=$_rc (crash), restart in 2s"
+			sleep 2
+		fi
 	done
 }
 

@@ -283,6 +283,9 @@ public final class CoreApi {
             } else {
                 config.setGlobalParam(paramId, value);
             }
+            // Visible on disk almost immediately, but throttled so a slider drag does not fsync
+            // on every event; anything throttled here is flushed by the next watcher tick.
+            config.saveThrottled(200L);
         }
         return status;
     }
@@ -466,6 +469,11 @@ public final class CoreApi {
 
     public int getMode() {
         return config.getMode();
+    }
+
+    /** Runtime only mode override (--mode); never persisted. */
+    public void setModeOverride(int mode) {
+        config.setModeOverride(mode);
     }
 
     // ---- transports / stats --------------------------------------------------

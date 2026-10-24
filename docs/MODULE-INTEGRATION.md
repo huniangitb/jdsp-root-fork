@@ -38,11 +38,26 @@ daemon 的 ConfigStore 是 `/data/adb/jdspd/config.json`，里面有 `"mode":0|1
 
 ## 1. sepolicy 结论：**一条都不用加**（已实测）
 
-### 1.1 App ↔ jdspd 的 unix socket 放哪
+### 1.0 最终传输：loopback TCP + token 文件（Lead 拍板，**不再用 unix socket**）
 
-按 Lead 的决定：`/data/data/james.dsp/files/jdsp.sock`（类型 `app_data_file`）。
-理由：`untrusted_app` 只能访问 `app_data_file` 类型，放在 App 自己的数据目录里，
-**不需要给 untrusted_app 加任何规则**；jdspd 是 root，能创建。
+| 项 | 值（真机实测） |
+|---|---|
+| 监听 | `127.0.0.1:<port>`，非 loopback 连接直接断开 |
+| 端口文件 | `/data/data/james.dsp/files/jdsp.port`（内容 `<port>\n`） |
+| token 文件 | `/data/data/james.dsp/files/jdsp.token`（64 hex + `\n`） |
+| 属主/权限 | `-r-------- 1 10322 10322`（= App uid u0_a322，0400，daemon 写完 chown） |
+| 握手 | 首行 `{"op":"hello","token":"<hex>"}`，之后 JSON lines |
+| App 未安装/未启动 | 目录不存在 → 跳过 TCP（`stats.transport.tcp.listening=false`），daemon 其它功能正常 |
+
+- binder `jdsp.service` 仍然注册（root/CLI 用）；untrusted_app 连不上 binder 是预期。
+- 停止：`Daemon --stop`（读 port/token → TCP hello → `{"cmd":"shutdown","confirm":true}`）
+  或 `/data/adb/jdspd/stop` 文件；**`kill -TERM` 不会执行句柄释放逻辑**（ART 不跑 shutdown hook），只作兜底。
+
+### 1.1 （历史记录）曾经考虑的 unix socket 方案
+
+早期按 Lead 决定试过 `/data/data/james.dsp/files/jdsp.sock`（类型 `app_data_file`），
+SELinux 侧一条规则都不用加；最终因传输方案改成 TCP+token 而未采用。
+下面 §1.2–§1.4 的实测结论保留，作为"为什么不需要加规则"和"DAC 坑"的排障记录。
 
 ### 1.2 实测 1：root（`u:r:ksu:s0`）能在 app_data_file 下 bind 一个 socket
 
@@ -107,18 +122,21 @@ unix socket 的 `connect()` 要求对 socket 文件**有写权限** ⇒ App（ui
 └── （其余 v6.7.2 原文件不动）
 
 /data/adb/jdspd/             0700 root:root   # jdspd 运行目录（新）
-├── mode                     0600             # "auto"|"backend"
-├── config.json              0600             # ConfigStore（daemon 写）
-├── jdspd.log                0600             # 看护循环 + daemon stdout
-└── jdsp.sock                0600 app_uid     # 由 daemon 创建并 chown/chmod
+├── mode                     0600/0640        # "auto"|"backend"（脚本写 0600，daemon 也写一份兜底）
+├── config.json              0600             # ConfigStore 权威配置（mode/params/policies）
+├── jdspd.log                0600             # 看护循环 + daemon 日志
+├── jdspd.lock               0600             # 单实例锁（FileChannel.tryLock）
+└── stop                     出现即优雅停机（daemon 每 1s 检查，处理后自删）
 
 /data/data/james.dsp/files/  由 App 自己拥有    # **只检查不创建**（module 不 mkdir）
+├── jdsp.port                0400 app_uid     # daemon 写：端口号（loopback TCP）
+└── jdsp.token               0400 app_uid     # daemon 写：64 hex
 /data/vendor/audio/jamesdsp_state.bin          # 引擎状态（1041:1005，开机归一化 0660）
 ```
 
-注意：模块**不创建** `/data/data/james.dsp/files`——它由 App 首次启动时自己建；
-jdspd 只在"目录已存在"时 bind socket，不存在就退化成 `/data/adb/jdspd/jdsp.sock`（root 用，App 连不上）
-并写日志，等 App 启动后再提升。
+注意：模块**不创建** `/data/data/james.dsp/files`——它由 App 首次启动时自己建。
+daemon 只在"目录已存在"时写 `jdsp.port`/`jdsp.token` 并监听 loopback TCP；目录不存在就跳过 TCP
+（`stats.transport.tcp.listening=false`），binder/其它功能照常。
 
 ---
 
@@ -247,26 +265,33 @@ fi
 ## 5. `uninstall.sh` 追加
 
 ```sh
-# 停掉看护循环与 daemon，清理运行目录（配置/日志/socket）
+# 1) 先停看护循环（否则 2s/30s 后它会把 daemon 再拉起来）
+for p in /proc/[0-9]*; do
+    case "$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null)" in *jdspd.sh*) kill "${p#/proc/}" ;; esac
+done
+# 2) 优雅停 daemon：--stop 会释放句柄、删 port/token（kill -TERM 不会，只作兜底）
+CLASSPATH=/data/adb/modules/ainur_jamesdsp/backend/jdspd.dex \
+    app_process /system/bin com.jdsp.backend.Daemon --stop
+# 3) stop 文件兜底，最后才 kill
+: > /data/adb/jdspd/stop; sleep 1
 for p in $(pidof jdspd 2>/dev/null); do kill "$p" 2>/dev/null; done
-pkill -f "jdspd.sh" 2>/dev/null
 rm -rf /data/adb/jdspd
 ```
 
 保留 `/data/vendor/audio/jamesdsp_state.bin`（属主 1041，引擎状态；卸载模块后引擎不再加载，留着无害，
 下次重装仍是用户最后一次设置）。
 
-## 6. 打包（dex 就绪后执行）
+## 6. 打包
+
+已脚本化（详见 `docs/BUILD-v2.md` §1）：
 
 ```sh
 cd /home/bdy/work/jdsp-repo
-cp backend/out/jdspd.dex   module/src/backend/jdspd.dex
-cp backend/out/jdspcli.dex module/src/backend/jdspcli.dex
-chmod 0644 module/src/backend/*.dex
-# module.prop: version=v2.0.0-fork, versionCode=200
-mkdir -p dist && (cd module/src && zip -r -X ../../dist/JDSP-fork-v2.0.0.zip . -x '*.git*')
-sha256sum dist/JDSP-fork-v2.0.0.zip
+backend/build.sh          # -> backend/out/{jdspd,jdspcli}.dex
+module/package.sh         # 拷 dex + 打 dist/JDSP-fork-v2.0.0.zip + 16 项结构/内容自检 + 打印 sha256
 ```
+
+`module/package.sh` 打完会删掉 `module/src/backend/`，避免 dex 二进制进 git（`--keep` 保留、`--check` 只自检）。
 
 包内校验清单：
 
@@ -289,9 +314,14 @@ sha256sum dist/JDSP-fork-v2.0.0.zip
 | 5 | `cat /data/adb/jdspd/jdspd.log` | 有 "supervisor start"、无 restart 风暴 |
 | 6 | `cat /data/adb/modules/ainur_jamesdsp/boot.log` | `[mode] …OK`；`state.bin chmod … -> 660` |
 | 7 | 杀 daemon：`kill <pid>` | 2 s 内重启，日志有 `exited rc=… restarting in 2s` |
-| 8 | `ls -l /data/data/james.dsp/files/jdsp.sock` | 存在，owner = App uid，mode 0600 |
+| 8 | `ls -ln /data/data/james.dsp/files/jdsp.{port,token}` | 存在，owner = App uid(10322)，mode **0400**；port 内容是端口号，token 是 64 hex（**不是 unix socket**） |
 | 9 | 播 tone + `jdspcli sessions` | `attached=1`（auto 模式下 attach 的是框架实例） |
 | 10 | state.bin | `jdspcli set` 后 mtime/size 变化（回归 P0 判据） |
+| **11** | **mode 被 daemon 读回**（Lead 指出的最危险失败模式）：`config.json` 是 `modeName=backend` 时重启 | daemon 日志 `config loaded: ... mode=1`；config.json **没被改回** mode=0 |
+| **12** | **P2 正式判据（优先验）**：`mode=backend` + 重启 | `/vendor/etc/audio_effects.xml` 的 `apply` 计数 **0**，但播 tone 后仍有 JamesDSP 实例且 `1 Clients: Pid <jdspd>`、`jdspcli sessions` `attached=1` → "关掉 postprocess 也能出声且有效果" |
+
+> **#11 不成立 = 完全没效果**：模块按 backend 把 postprocess 关了，daemon 却按 auto 以为框架会挂 →
+> 谁都不创建实例。所以每次改 mode 都要同时确认"模块侧读到的 mode"和"daemon 读到的 mode"是同一个值。
 
 ## 8. 待别人交付
 

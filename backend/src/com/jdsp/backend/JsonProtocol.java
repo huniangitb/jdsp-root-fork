@@ -224,6 +224,7 @@ public final class JsonProtocol {
         }
         if ("mode".equals(cmd) || "getmode".equals(cmd) || "setmode".equals(cmd)) {
             Object raw = firstValue(req, new String[] {"mode", "m", "value"});
+            boolean changed = false;
             if (raw != null) {
                 int m = parseMode(raw);
                 if (m < 0) {
@@ -233,10 +234,17 @@ public final class JsonProtocol {
                 if (rc < 0) {
                     return Reply.error("setMode failed", rc);
                 }
+                changed = true;
             }
             int mode = api.getMode();
-            return Reply.ok().with("mode", mode)
+            Reply reply = Reply.ok().with("mode", mode)
                     .with("modeName", mode == 1 ? "backend" : "auto");
+            if (changed) {
+                // audio_effects.xml is mounted read only from an image snapshot at boot, so the
+                // XML side of a mode change can only be applied by the module on the next boot.
+                reply.with("reboot_required", true).with("rebootRequired", true);
+            }
+            return reply;
         }
         if ("policy".equals(cmd) || "getpolicy".equals(cmd) || "setpolicy".equals(cmd)) {
             String pkg = firstString(req, new String[] {"pkg", "package", "app"});

@@ -61,6 +61,7 @@ public final class Daemon {
         int tcpPort = 0;
         boolean selftest = false;
         boolean stopRequested = false;
+        String modeArg = null;
 
         for (int i = 0; i < args.length; i++) {
             String a = args[i];
@@ -74,6 +75,8 @@ public final class Daemon {
                 tcpDir = args[++i];
             } else if ("--tcp-port".equals(a) && i + 1 < args.length) {
                 tcpPort = parseInt(args[++i], 0);
+            } else if ("--mode".equals(a) && i + 1 < args.length) {
+                modeArg = args[++i];
             } else if ("--stop".equals(a)) {
                 stopRequested = true;
             } else if ("--help".equals(a) || "-h".equals(a)) {
@@ -131,6 +134,17 @@ public final class Daemon {
         watcher = new SessionWatcher(config, policy, effects, bus);
         api = new CoreApi(config, policy, effects, bus, watcher);
 
+        if (modeArg != null) {
+            int m = "backend".equalsIgnoreCase(modeArg) ? JdspConst.MODE_BACKEND
+                    : ("auto".equalsIgnoreCase(modeArg) ? JdspConst.MODE_AUTO : -1);
+            if (m < 0) {
+                Log.w("--mode: invalid value '" + modeArg + "' (auto|backend), ignored");
+            } else {
+                api.setModeOverride(m);
+                Log.i("mode override for this run only: "
+                        + (m == JdspConst.MODE_BACKEND ? "backend" : "auto") + " (not persisted)");
+            }
+        }
         api.setInstanceInfo(instanceLockFile, System.currentTimeMillis());
         api.setShutdownHook(new CoreApi.ShutdownHook() {
             @Override
@@ -205,7 +219,10 @@ public final class Daemon {
         BinderService b = new BinderService(api);
         boolean binderOk = b.publish();
 
-        TcpService t = new TcpService(api, tcpDir, tcpPort);
+        // Never clobber the port/token files of a running daemon: the selftest uses its own dir.
+        File selftestTcpDir = new File(dataDir, "tcp-selftest");
+        FileUtil.mkdirs(selftestTcpDir, 0700);
+        TcpService t = new TcpService(api, selftestTcpDir.getPath(), tcpPort);
         boolean tcpOk = t.start();
 
         JSONObject out = new JSONObject();
@@ -233,6 +250,8 @@ public final class Daemon {
             tcpJson.put("portFile", t.portFile());
             tcpJson.put("tokenFile", t.tokenFile());
             tcpJson.put("error", t.lastError());
+            tcpJson.put("dirUsed", selftestTcpDir.getPath());
+            tcpJson.put("appDir", tcpDir);
             out.put("tcp", tcpJson);
             JSONArray sessions = new JSONArray();
             java.util.List<CoreApi.SessionView> views = api.listSessions();
@@ -488,6 +507,8 @@ public final class Daemon {
         System.out.println("  --data DIR            runtime dir (log + default config)");
         System.out.println("  --tcp-dir DIR         where jdsp.port/jdsp.token are written");
         System.out.println("  --tcp-port N          fixed control port (0 = system assigned)");
+        System.out.println("  --mode auto|backend   override the stored mode for this run (not persisted)");
+        System.out.println("  --stop                ask the running daemon to release everything and exit");
         System.out.println("  --help                this text");
     }
 
