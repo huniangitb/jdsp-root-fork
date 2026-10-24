@@ -1,3 +1,5 @@
 *.o
 *.apk
 build/
+backend/out/
+dist/
