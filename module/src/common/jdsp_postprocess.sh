@@ -16,12 +16,7 @@ jdsp_apply_music() {
 	f="$1"
 	[ -f "$f" ] || return 0
 	grep -q '<audio_effects_conf' "$f" 2>/dev/null || return 0
-	# Normalise: keep exactly one <apply effect="jamesdsp"/> so that a
-	# file patched by an older module run does not end up with duplicates.
-	# Strip the token in place (not the whole line) so a <stream> wrapper that we
-	# added earlier survives and can be reused instead of accumulating blocks.
-	sed -i 's|<apply effect="jamesdsp"/>||g' "$f" 2>/dev/null
-
+	grep -q 'effect="jamesdsp"' "$f" 2>/dev/null && return 2
 
 	awk '
 		{ L[NR] = $0 }
@@ -100,49 +95,4 @@ jdsp_apply_music_conf() {
 		}
 	' "$f" > "$f.jdsp" && mv -f "$f.jdsp" "$f"
 	return 0
-}
-
-# Merge-only variant, used for audio_effects.xml files owned by ANOTHER module.
-# It never creates a new <postprocess> block: enabling post processing on a
-# device whose vendor left it commented out changes the effect routing and can
-# break vendor effects (e.g. Dolby/DAP on MediaTek).  It only adds the apply
-# entry when the file already has an active music post-process stream.
-jdsp_merge_music() {
-	f="$1"
-	[ -f "$f" ] || return 0
-	grep -q '<audio_effects_conf' "$f" 2>/dev/null || return 0
-	awk -v OUT="$f.jdsp_merge" '
-		{ L[NR] = $0 }
-		END {
-			n = NR; inc = 0
-			for (i = 1; i <= n; i++) {
-				C[i] = inc
-				s = L[i]; k = 1
-				while (k <= length(s)) {
-					if (!inc && substr(s, k, 4) == "<!--") { inc = 1; k += 4; continue }
-					if (inc && substr(s, k, 3) == "-->") { inc = 0; k += 3; continue }
-					k++
-				}
-			}
-			APPLY = "<apply effect=\"jamesdsp\"/>"
-			OPEN  = "<stream type=\"music\">"
-			seen = 0
-			for (i = 1; i <= n; i++) {
-				if (C[i] == 0 && index(L[i], "effect=\"jamesdsp\"") > 0) seen = 1
-			}
-			if (seen) {
-				for (i = 1; i <= n; i++) print L[i]
-				exit
-			}
-			for (i = 1; i <= n; i++) {
-				if (C[i] == 0 && index(L[i], OPEN) > 0) {
-					p = index(L[i], OPEN) + length(OPEN)
-					L[i] = substr(L[i], 1, p - 1) APPLY substr(L[i], p)
-					for (j = 1; j <= n; j++) print L[j]
-					exit
-				}
-			}
-			for (i = 1; i <= n; i++) print L[i]
-		}
-	' "$f" > "$f.jdsp_merge" && mv -f "$f.jdsp_merge" "$f"
 }

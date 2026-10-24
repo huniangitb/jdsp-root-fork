@@ -121,12 +121,6 @@ fi
 
 cp_ch $MODPATH/common/files/$QARCH/libjamesdsp.so $MODPATH/system/lib/soundfx/libjamesdsp.so
 
-
-# Cross-module merging is done by aml.sh at boot: it scans every module's
-# audio_effects.xml/.conf, adds the library/effect declarations and exactly
-# one <apply> for the music stream.  Keep install-time work limited to our
-# own copies so a failed install cannot leave another module half patched.
-
 set +x
 # App only works when installed normally to data in oreo+
 INSVER=$(cmd package list packages -3 --show-versioncode  2>/dev/null | grep james.dsp | sed 's/.*versionCode://')

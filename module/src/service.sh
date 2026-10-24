@@ -25,20 +25,6 @@ else
 	MOD_ODM="$MODPATH/odm"
 fi
 
-# 0) SELinux：KernelSU 3.3.1 不会自动应用模块的 sepolicy.rule，而 HAL 侧
-#    inotify_add_watch 需要 vendor_audio_data_file 的读取权限。post-fs-data
-#    阶段应用会被随后的策略加载覆盖，所以放到 late_start（此时策略已定型）。
-#    规则幂等，重复应用无副作用。
-if [ -f "$MODPATH/sepolicy.rule" ]; then
-	if [ -x /data/adb/ksud ]; then
-		/data/adb/ksud sepolicy apply "$MODPATH/sepolicy.rule" >>"$MODPATH/logs/sepolicy.log" 2>&1
-	elif command -v ksud >/dev/null 2>&1; then
-		ksud sepolicy apply "$MODPATH/sepolicy.rule" >>"$MODPATH/logs/sepolicy.log" 2>&1
-	elif command -v magiskpolicy >/dev/null 2>&1; then
-		magiskpolicy --live "$(cat "$MODPATH/sepolicy.rule")" >>"$MODPATH/logs/sepolicy.log" 2>&1
-	fi
-fi
-
 # 0) fork 引擎的 native 状态自持久化：只准备 /data/vendor/audio（目录/属主/0660/标签/日志），
 #    不 mount、不建软链、不批量 chcon；挂载与分区上下文由元模块负责。
 if [ -f "$MODPATH/jdsp_state.sh" ]; then
