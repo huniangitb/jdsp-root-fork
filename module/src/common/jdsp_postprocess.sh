@@ -16,7 +16,10 @@ jdsp_apply_music() {
 	f="$1"
 	[ -f "$f" ] || return 0
 	grep -q '<audio_effects_conf' "$f" 2>/dev/null || return 0
-	grep -q 'effect="jamesdsp"' "$f" 2>/dev/null && return 2
+	# Normalise: keep exactly one <apply effect="jamesdsp"/> so that a
+	# file patched by an older module run does not end up with duplicates.
+	sed -i '/<apply effect="jamesdsp"\/>/d' "$f" 2>/dev/null
+
 
 	awk '
 		{ L[NR] = $0 }

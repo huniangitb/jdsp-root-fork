@@ -121,6 +121,22 @@ fi
 
 cp_ch $MODPATH/common/files/$QARCH/libjamesdsp.so $MODPATH/system/lib/soundfx/libjamesdsp.so
 
+
+# Another module can ship its own copy of audio_effects.xml (e.g. an audio
+# "boost" patch).  Only one of them wins the mount, so make sure every copy,
+# including ours, carries the jamesdsp declaration.  Idempotent.
+jdsp_patch_sibling_modules() {
+	for f in $(find /data/adb/modules /data/adb/modules_update -name 'audio_effects.xml' 2>/dev/null); do
+		case "$f" in */ainur_jamesdsp/*) continue;; esac
+		command -v jdsp_apply_music >/dev/null 2>&1 && jdsp_apply_music "$f"
+	done
+	for f in $(find /data/adb/modules /data/adb/modules_update -name 'audio_effects.conf' 2>/dev/null); do
+		case "$f" in */ainur_jamesdsp/*) continue;; esac
+		command -v jdsp_apply_music_conf >/dev/null 2>&1 && jdsp_apply_music_conf "$f"
+	done
+}
+jdsp_patch_sibling_modules
+
 set +x
 # App only works when installed normally to data in oreo+
 INSVER=$(cmd package list packages -3 --show-versioncode  2>/dev/null | grep james.dsp | sed 's/.*versionCode://')

@@ -1,3 +1,14 @@
+### v6.7.4-fork（联发科 / 小米设备适配）
+
+* sepolicy：补 mtk_hal_audio 域，并在目录权限里加 read/open/getattr（状态文件写入 + inotify）。
+* audio_effects.xml 去重：先删掉所有 apply effect=jamesdsp 再插入一条，避免历史残留导致重复挂载。
+
+### v6.7.3-fork
+
+* 安装时同时修补其它模块里的 audio_effects.xml 副本：多个音频模块争抢同一文件时，
+  谁赢得挂载都带着我们的声明（例如 XagaSoundBoostTest 会覆盖 /vendor/etc/audio_effects.xml）。
+* sepolicy：新增 mtk_hal_audio 域的状态文件访问规则。
+
 ### v6.7.2-fork
 
 * 安装器新增 AIDL 版本校验：只有当设备同时具备 `android.hardware.audio.effect.IFactory`
