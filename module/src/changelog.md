@@ -1,3 +1,14 @@
+### v6.7.6-fork（修回杜比）
+
+* 不再改动其它模块的 audio_effects.xml。此前会往 XagaSoundBoostTest（杜比增强）的配置里
+  插入 postprocess + apply，导致该设备的杜比链路失效；现在只做检测并在安装日志里提示。
+* 原因：该机 vendor 把 postprocess 整段注释掉了，杜比走全局效果（session 0）；
+  我们新增 postprocess 会改变音乐会话的效果链，杜比随之失效。
+
+### v6.7.5-fork
+
+* 新增 merge-only 模式（仅在已存在活动 music postprocess 时才并入 apply）。
+
 ### v6.7.4-fork（联发科 / 小米设备适配）
 
 * sepolicy：补 mtk_hal_audio 域，并在目录权限里加 read/open/getattr（状态文件写入 + inotify）。

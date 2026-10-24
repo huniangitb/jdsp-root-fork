@@ -122,20 +122,21 @@ fi
 cp_ch $MODPATH/common/files/$QARCH/libjamesdsp.so $MODPATH/system/lib/soundfx/libjamesdsp.so
 
 
-# Another module can ship its own copy of audio_effects.xml (e.g. an audio
-# "boost" patch).  Only one of them wins the mount, so make sure every copy,
-# including ours, carries the jamesdsp declaration.  Idempotent.
-jdsp_patch_sibling_modules() {
+# Another module (e.g. a vendor audio boost patch) can ship its own copy of
+# audio_effects.xml and win the mount.  We deliberately do NOT edit those
+# files: enabling post processing on a device whose vendor left the block
+# commented out changes effect routing and has been observed to break
+# vendor effects (Dolby/DAP on MediaTek).  Just report the situation.
+jdsp_report_foreign_config() {
 	for f in $(find /data/adb/modules /data/adb/modules_update -name 'audio_effects.xml' 2>/dev/null); do
 		case "$f" in */ainur_jamesdsp/*) continue;; esac
-		command -v jdsp_apply_music >/dev/null 2>&1 && jdsp_apply_music "$f"
-	done
-	for f in $(find /data/adb/modules /data/adb/modules_update -name 'audio_effects.conf' 2>/dev/null); do
-		case "$f" in */ainur_jamesdsp/*) continue;; esac
-		command -v jdsp_apply_music_conf >/dev/null 2>&1 && jdsp_apply_music_conf "$f"
+		grep -q 'jamesdsp' "$f" 2>/dev/null && continue
+		ui_print "   ! another module owns $f"
+		ui_print "   ! JamesDSP will not be applied globally while it wins the mount;"
+		ui_print "   ! use the app, or disable that module to hand the config back"
 	done
 }
-jdsp_patch_sibling_modules
+jdsp_report_foreign_config
 
 set +x
 # App only works when installed normally to data in oreo+
