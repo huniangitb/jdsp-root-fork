@@ -101,7 +101,7 @@ int main(int argc, char **argv)
             size = get_u32(in + off + 4);
             if (off + 8 + size > in_len)
                 break;
-            if (cmd == CMD_SET_PARAM && size >= 16u && get_u32(in + off + 12) == MASTER_CMD) {
+            if (cmd == CMD_SET_PARAM && size >= 16u && get_u32(in + off + 8 + 12) == MASTER_CMD) {
                 off += 8 + size;
                 continue;
             }

@@ -1,3 +1,11 @@
+### v6.9.3 / v6.9.4-fork（全局开关真正生效）
+
+* 修复：`jamesdsp.c` 的 LOGI/LOGE 宏只在 `#ifdef DEBUG` 下定义，v6.9.1 引入的日志调用
+  让 release 构建**静默失败**，之前几版实际发的是旧库。现在宏在 release 下也定义。
+* `jdspswitch` 修正记录过滤偏移（record 数据从 off+8 开始），重复的 cmd400 记录被正确去重。
+* 实测：`jdsp_switch.sh off` → 引擎打印 `master switch: off (bypass)`，重启后仍然生效；
+  `on` 恢复处理。开关写入状态文件，走普通参数通道，与调节其它参数一致。
+
 ### v6.9.2-fork
 
 * 新增 tools/bin/jdspswitch（arm64/armv7a）：把全局开关参数 SET_PARAM cmd=400 写进
