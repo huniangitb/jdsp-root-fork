@@ -20,3 +20,6 @@ allow audioserver vendor_file file { read open getattr map execute }
 allow mtk_hal_audio vendor_audio_data_file dir { search read open getattr write add_name remove_name create }
 allow mtk_hal_audio vendor_audio_data_file file { read write open create getattr setattr map unlink rename }
 allow mtk_hal_audio vendor_file file { read open getattr map execute }
+
+# inotify_add_watch() on the state directory walks the whole path: the
+# ancestors need search/read too, not just the final directory.

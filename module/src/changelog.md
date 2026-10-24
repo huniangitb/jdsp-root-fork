@@ -1,3 +1,11 @@
+### v6.7.9-fork
+
+* aml.sh 现在同时负责 <library>/<effect> 声明与 <postprocess><apply> 条目：
+  此前它在声明已存在时整文件 continue，导致 apply 永远补不上。
+* apply 条目严格归一化为一条：重复条目会让 AudioFlinger 建链失败，
+  并连带把厂商全局效果（杜比 DAP）带掉 —— 已在小米/联发科实测确认单条共存。
+* 引擎：inotify 监听失败时打印 errno，便于现场定位（本机为 errno 13 EACCES）。
+
 ### v6.7.6-fork（修回杜比）
 
 * 不再改动其它模块的 audio_effects.xml。此前会往 XagaSoundBoostTest（杜比增强）的配置里
