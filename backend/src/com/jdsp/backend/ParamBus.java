@@ -41,6 +41,8 @@ public final class ParamBus {
         public long totalLatencyUs;
         public long maxLatencyUs;
         public long bulkApplied;
+        public long cacheHits;
+        public long engineHits;
     }
 
     private static final class Pending {
@@ -55,9 +57,18 @@ public final class ParamBus {
         }
     }
 
+    /** Upper bound of cached (session, param) values; the cache is dropped when exceeded. */
+    private static final int MAX_CACHE_ENTRIES = 20000;
+
     private final EffectManager effects;
     private final ScheduledExecutorService scheduler;
     private final Map<String, Pending> pending = new LinkedHashMap<String, Pending>();
+    /**
+     * Last value successfully written per (session, param). The clean JamesDSP engine does not
+     * implement EFFECT_CMD_GET_PARAM (it returns -EINVAL), so a read is answered from here when
+     * the engine has no reply.
+     */
+    private final Map<String, byte[]> lastValues = new LinkedHashMap<String, byte[]>();
     private final Stats stats = new Stats();
     private ScheduledFuture<?> flushTask;
 
@@ -81,6 +92,9 @@ public final class ParamBus {
         long t0 = System.nanoTime();
         int rc = effects.setParam(sessionId, paramId, value);
         long us = (System.nanoTime() - t0) / 1000L;
+        if (rc == 0) {
+            rememberValue(sessionId, paramId, value);
+        }
         synchronized (stats) {
             stats.setCalls++;
             stats.lastLatencyUs = us;
@@ -95,11 +109,26 @@ public final class ParamBus {
         return rc;
     }
 
-    /** One GET_PARAM; the value is written into {@code reply}. Returns the engine status. */
+    /**
+     * One GET_PARAM; the value is written into {@code reply}.
+     *
+     * <p>The engine is asked first. When it has no support for GET_PARAM (the clean v6.7.2
+     * engine returns -EINVAL) or no handle answers, the last value that was successfully written
+     * for this (session, param) is returned instead, so {@code get} reflects the last {@code set}.
+     *
+     * @return 0 when {@code reply} holds a value, negative otherwise
+     */
     public int getParam(int sessionId, int paramId, byte[] reply) {
         long t0 = System.nanoTime();
         int rc = effects.getParam(sessionId, paramId, reply);
         long us = (System.nanoTime() - t0) / 1000L;
+        boolean cached = false;
+        if (rc != 0) {
+            cached = readCached(sessionId, paramId, reply);
+            if (cached) {
+                rc = 0;
+            }
+        }
         synchronized (stats) {
             stats.getCalls++;
             stats.lastLatencyUs = us;
@@ -107,11 +136,56 @@ public final class ParamBus {
             if (us > stats.maxLatencyUs) {
                 stats.maxLatencyUs = us;
             }
-            if (rc != 0) {
+            if (cached) {
+                stats.cacheHits++;
+            } else if (rc == 0) {
+                stats.engineHits++;
+            } else {
                 stats.errors++;
             }
         }
         return rc;
+    }
+
+    private void rememberValue(int sessionId, int paramId, byte[] value) {
+        if (value.length > 64 * 1024) {
+            return;
+        }
+        synchronized (lastValues) {
+            if (lastValues.size() >= MAX_CACHE_ENTRIES) {
+                lastValues.clear();
+            }
+            lastValues.put(sessionId + ":" + paramId, value.clone());
+        }
+    }
+
+    private boolean readCached(int sessionId, int paramId, byte[] reply) {
+        byte[] cached;
+        synchronized (lastValues) {
+            cached = lastValues.get(sessionId + ":" + paramId);
+        }
+        if (cached == null || cached.length == 0) {
+            return false;
+        }
+        int n = Math.min(cached.length, reply.length);
+        System.arraycopy(cached, 0, reply, 0, n);
+        for (int i = n; i < reply.length; i++) {
+            reply[i] = 0;
+        }
+        return true;
+    }
+
+    /** Drops the cached values of a session (called when its handle is released). */
+    public void forgetSession(int sessionId) {
+        String prefix = sessionId + ":";
+        synchronized (lastValues) {
+            java.util.Iterator<String> it = lastValues.keySet().iterator();
+            while (it.hasNext()) {
+                if (it.next().startsWith(prefix)) {
+                    it.remove();
+                }
+            }
+        }
     }
 
     /** Applies a whole parameter set to one session (used when a handle is created). */
@@ -233,6 +307,8 @@ public final class ParamBus {
             copy.totalLatencyUs = stats.totalLatencyUs;
             copy.maxLatencyUs = stats.maxLatencyUs;
             copy.bulkApplied = stats.bulkApplied;
+            copy.cacheHits = stats.cacheHits;
+            copy.engineHits = stats.engineHits;
         }
         return copy;
     }

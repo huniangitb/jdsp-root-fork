@@ -330,9 +330,14 @@ v6.7.2 fork 引擎的核心卖点之一就是 native 状态自持久化（App �
    allow mtk_hal_audio vendor_audio_data_file dir { watch }
    allow mtk_hal_audio vendor_audio_data_file file { watch }
    ```
-   没有纳入本轮基线包（未在本包重启后确认有效），留到 v2 包下次重启时验证后再决定是否并入。
+   **处理决定（Lead 2026-10-25）**：两条 `watch` 规则**已并入 `module/src/sepolicy.rule`，随 v2.0.0 包发布**；
+   **本轮未在重启后确认**（本轮设备跑的是不含 watch 规则的 P0 基线包，sha `20299935…`）——
+   **v2.0.0 重启后要确认这条 `cannot watch` 是否消失**，消失则转正，仍出现则说明不是 SELinux 权限问题
+   （可能是 inotify 别的限制），届时把结论回填到本节。
 2. **state.bin 权限位**：HAL 进程重写后是 `0600`（引擎用 .tmp + rename，umask 决定），
    开机时 `jdsp_state.sh` 会归一化成 `0660`（boot.log 里可见）。owner 始终 1041:1005，不影响功能。
+   **已知不足**：HAL 每次写盘都会重建成 0600，只在开机归一化一次不够 →
+   v2.0.0 的 `jdspd.sh` 看护循环里增加"每分钟检查一次、非 0660 就 chmod"（见 docs/MODULE-INTEGRATION.md §3）。
 3. 安装日志有 `! Conflicting audio mod found!`（XagaSoundBoostTest）——按 `module/README.md` 记载，
    "Final version" 变体保留系统 39 条声明、可共存；本轮 39 条声明与杜比(DAP)/MiSound 都在，无冲突迹象。
 
@@ -343,6 +348,10 @@ v6.7.2 fork 引擎的核心卖点之一就是 native 状态自持久化（App �
 | `dist/JDSP-fork-v6.7.2.zip`（最终基线包，已装到设备并验收） | 33621328 | `202999354ee6b52f7166def93dfc7717da988b4cd0558d8b9c0bb9e1fde3d4ca` |
 | `module/src/common/files/arm64/libjamesdsp.so` | 1667344 | `b6e1fc1fdc67b0c7bd73b083e92238eb29b4d0c66f7c02e5b476ad78c9fbf700` |
 | `module/src/common/files/arm/libjamesdsp.so` | — | `804a3ce42b366c5b0b7e77775f60207b4f44c054a257d106773edee99690dea0` |
+
+> 说明：仓库 HEAD 的 `sepolicy.rule` 在本轮验收之后又加了 2 条 `watch` 规则（§7.1），
+> 因此**从现在起从 HEAD 重新打包得到的 zip 与上表 P0 基线包不再逐字节相同**。
+> 上表那个包就是设备上实际通过验收的产物；含 watch 规则的版本将作为 `v2.0.0` 包发布并重新验收。
 
 设备上的最终状态（2026-10-24 23:58）：
 ```

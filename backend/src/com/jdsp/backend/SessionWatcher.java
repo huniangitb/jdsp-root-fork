@@ -211,7 +211,7 @@ public final class SessionWatcher {
                 if (!effects.isAttached(s.sessionId)) {
                     int rc = effects.attach(s.sessionId, s.effectId);
                     if (rc == EffectManager.OK) {
-                        effects.setOwner(s.sessionId, s.uid, s.pkg);
+                        effects.setOwner(s.sessionId, s.uid, s.pkg, s.pid);
                         bus.applyAll(s.sessionId, d.params);
                         effects.setEnabled(s.sessionId, true);
                         Log.i("attached session=" + s.sessionId + " uid=" + s.uid
@@ -220,7 +220,7 @@ public final class SessionWatcher {
                         Log.w("attach session=" + s.sessionId + " failed rc=" + rc);
                     }
                 } else {
-                    effects.setOwner(s.sessionId, s.uid, s.pkg);
+                    effects.setOwner(s.sessionId, s.uid, s.pkg, s.pid);
                 }
             } else if (effects.isAttached(s.sessionId)) {
                 effects.setEnabled(s.sessionId, false);

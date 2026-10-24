@@ -2,33 +2,28 @@ package com.jdsp.cli;
 
 import android.jdsp.backend.IJdspService;
 import android.jdsp.backend.JdspSession;
-import android.net.LocalSocket;
-import android.net.LocalSocketAddress;
 import android.os.IBinder;
 import android.os.RemoteException;
 
 import com.jdsp.common.JdspConst;
 
-import java.io.IOException;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.List;
 
 /**
- * Binder client for jdspd.
+ * Binder client for jdspd, plus the transport wiring.
  *
- * android.os.ServiceManager is a hidden API (not in the public android.jar),
- * so it is reached through reflection; IBinder and the AIDL stub are public.
- * A missing jdsp.service becomes a CliException with exit code 2.
+ * android.os.ServiceManager is a hidden API (not in the public android.jar), so
+ * it is reached through reflection; IBinder and the AIDL stub are public. A
+ * missing jdsp.service becomes a CliException with exit code 2, which makes
+ * AutoTransport fall back to the loopback TCP channel.
  */
 public final class Client implements Backend {
 
-    /** Read timeout for one socket request (daemon answers in milliseconds). */
-    private static final int SOCKET_READ_TIMEOUT_MS = 2000;
-
     /**
-     * Production transports: binder first, unix socket as fallback.
-     * {@code jdspcli --socket [path]} forces the socket.
+     * Production transports: binder first, loopback TCP (token handshake) as
+     * fallback. {@code jdspcli --tcp [host:port]} forces TCP.
      */
     public static final TransportFactory TRANSPORTS = new AutoTransport(
             new AutoTransport.BinderOpener() {
@@ -37,10 +32,10 @@ public final class Client implements Backend {
                     return Client.connect();
                 }
             },
-            new AutoTransport.SocketOpener() {
+            new AutoTransport.TcpOpener() {
                 @Override
-                public Backend open(String path) throws CliException {
-                    return Client.connectSocket(path);
+                public Backend open(String endpoint) throws CliException {
+                    return Client.connectTcp(endpoint);
                 }
             });
 
@@ -68,32 +63,8 @@ public final class Client implements Backend {
         return new Client(service);
     }
 
-    /** Connects to jdspd's filesystem unix socket (JSON lines protocol). */
-    private static Backend connectSocket(String path) throws CliException {
-        LocalSocket socket = new LocalSocket();
-        try {
-            socket.connect(new LocalSocketAddress(path,
-                    LocalSocketAddress.Namespace.FILESYSTEM));
-            socket.setSoTimeout(SOCKET_READ_TIMEOUT_MS);
-            return new SocketBackend(socket.getInputStream(), socket.getOutputStream(), path);
-        } catch (IOException e) {
-            closeQuietly(socket);
-            throw new CliException(Exit.UNAVAILABLE,
-                    "socket " + path + " unavailable: " + describe(e), e);
-        }
-    }
-
-    private static void closeQuietly(LocalSocket socket) {
-        try {
-            socket.close();
-        } catch (IOException ignored) {
-            // nothing useful to do while reporting the original failure
-        }
-    }
-
-    private static String describe(IOException e) {
-        String message = e.getMessage();
-        return message == null || message.isEmpty() ? e.getClass().getSimpleName() : message;
+    private static Backend connectTcp(String endpoint) throws CliException {
+        return TcpBackend.open(endpoint);
     }
 
     private static IBinder lookupBinder(String name) {

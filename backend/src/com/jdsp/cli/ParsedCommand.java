@@ -11,23 +11,23 @@ public final class ParsedCommand {
     private final boolean json;
     private final boolean help;
     private final boolean raw;
-    private final boolean socket;
-    private final String socketPath;
+    private final boolean tcp;
+    private final String tcpEndpoint;
     private final String hex;
     private final String intValue;
     private final String shortValue;
     private final String iters;
 
     ParsedCommand(String command, List<String> args, boolean json, boolean help, boolean raw,
-                  boolean socket, String socketPath, String hex, String intValue,
+                  boolean tcp, String tcpEndpoint, String hex, String intValue,
                   String shortValue, String iters) {
         this.command = command;
         this.args = Collections.unmodifiableList(new ArrayList<String>(args));
         this.json = json;
         this.help = help;
         this.raw = raw;
-        this.socket = socket;
-        this.socketPath = socketPath;
+        this.tcp = tcp;
+        this.tcpEndpoint = tcpEndpoint;
         this.hex = hex;
         this.intValue = intValue;
         this.shortValue = shortValue;
@@ -62,14 +62,14 @@ public final class ParsedCommand {
         return raw;
     }
 
-    /** True when --socket was given (force the unix socket transport). */
-    public boolean socket() {
-        return socket;
+    /** True when --tcp was given (force the loopback TCP transport). */
+    public boolean tcp() {
+        return tcp;
     }
 
-    /** Socket path from --socket <path>/--socket=<path>, or null for the default. */
-    public String socketPath() {
-        return socketPath;
+    /** "host:port"/"port" from --tcp, or null for the default endpoint files. */
+    public String tcpEndpoint() {
+        return tcpEndpoint;
     }
 
     public String hex() {

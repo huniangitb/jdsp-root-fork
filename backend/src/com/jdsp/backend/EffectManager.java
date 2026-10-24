@@ -55,6 +55,7 @@ public final class EffectManager {
         public int paramCount;
         public int uid = -1;
         public String pkg = "";
+        public int pid = -1;
 
         Handle(int sessionId, AudioEffect effect, int effectId, long attachedAt) {
             this.sessionId = sessionId;
@@ -74,6 +75,7 @@ public final class EffectManager {
         public final long attachedAt;
         public final int uid;
         public final String pkg;
+        public final int pid;
 
         HandleState(Handle h, boolean enabled, boolean hasControl) {
             this.sessionId = h.sessionId;
@@ -84,6 +86,7 @@ public final class EffectManager {
             this.attachedAt = h.attachedAt;
             this.uid = h.uid;
             this.pkg = h.pkg;
+            this.pid = h.pid;
         }
     }
 
@@ -261,11 +264,12 @@ public final class EffectManager {
     }
 
     /** Remembers which app a handle belongs to (for diagnostics and policing). */
-    public synchronized void setOwner(int sessionId, int uid, String pkg) {
+    public synchronized void setOwner(int sessionId, int uid, String pkg, int pid) {
         Handle h = handles.get(Integer.valueOf(sessionId));
         if (h != null) {
             h.uid = uid;
             h.pkg = pkg == null ? "" : pkg;
+            h.pid = pid;
         }
     }
 

@@ -1,7 +1,7 @@
 package com.jdsp.cli;
 
 /**
- * Binder-first transport with unix-socket fallback.
+ * Binder-first transport with a loopback-TCP fallback.
  *
  * Only "unavailable" failures (exit 2) fall back; any other local error is
  * propagated unchanged.
@@ -13,29 +13,23 @@ public final class AutoTransport implements TransportFactory {
         Backend open() throws CliException;
     }
 
-    /** Opens the unix-socket transport at an explicit path. */
-    public interface SocketOpener {
-        Backend open(String path) throws CliException;
+    /** Opens the loopback TCP transport (endpoint may be null = default). */
+    public interface TcpOpener {
+        Backend open(String endpoint) throws CliException;
     }
 
     private final BinderOpener binder;
-    private final SocketOpener socket;
-    private final String defaultSocketPath;
+    private final TcpOpener tcp;
 
-    public AutoTransport(BinderOpener binder, SocketOpener socket) {
-        this(binder, socket, TransportFactory.DEFAULT_SOCKET_PATH);
-    }
-
-    public AutoTransport(BinderOpener binder, SocketOpener socket, String defaultSocketPath) {
+    public AutoTransport(BinderOpener binder, TcpOpener tcp) {
         this.binder = binder;
-        this.socket = socket;
-        this.defaultSocketPath = defaultSocketPath;
+        this.tcp = tcp;
     }
 
     @Override
-    public Backend open(String socketPath) throws CliException {
-        if (socketPath != null) {
-            return socket.open(socketPath);
+    public Backend open(String tcpEndpoint, boolean forceTcp) throws CliException {
+        if (forceTcp) {
+            return tcp.open(tcpEndpoint);
         }
         CliException binderFailure;
         try {
@@ -47,13 +41,13 @@ public final class AutoTransport implements TransportFactory {
             binderFailure = e;
         }
         try {
-            return socket.open(defaultSocketPath);
-        } catch (CliException socketFailure) {
-            if (socketFailure.exitCode() != Exit.UNAVAILABLE) {
-                throw socketFailure;
+            return tcp.open(null);
+        } catch (CliException tcpFailure) {
+            if (tcpFailure.exitCode() != Exit.UNAVAILABLE) {
+                throw tcpFailure;
             }
             throw new CliException(Exit.UNAVAILABLE,
-                    binderFailure.getMessage() + " and " + socketFailure.getMessage(),
+                    binderFailure.getMessage() + " and " + tcpFailure.getMessage(),
                     binderFailure);
         }
     }

@@ -40,17 +40,30 @@ public final class FileUtil {
         }
     }
 
-    /** Chown a file to the owner of its parent directory (used for the app data socket). */
-    public static void chownToParentOwner(File f) {
+    /** Chown a file to the owner of its parent directory. Returns true when it worked. */
+    public static boolean chownToParentOwner(File f) {
         if (f == null || f.getParentFile() == null) {
-            return;
+            return false;
         }
         try {
             android.system.StructStat parent =
                     android.system.Os.stat(f.getParentFile().getPath());
             android.system.Os.chown(f.getPath(), parent.st_uid, parent.st_gid);
+            return true;
         } catch (Throwable ignored) {
-            // best effort
+            return false;
+        }
+    }
+
+    /** uid owning a path, -1 when unknown. */
+    public static int ownerUid(File f) {
+        if (f == null) {
+            return -1;
+        }
+        try {
+            return android.system.Os.stat(f.getPath()).st_uid;
+        } catch (Throwable ignored) {
+            return -1;
         }
     }
 

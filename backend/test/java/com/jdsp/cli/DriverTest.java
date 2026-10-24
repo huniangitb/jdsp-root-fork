@@ -193,7 +193,7 @@ public final class DriverTest {
     static TransportFactory of(final Backend backend) {
         return new TransportFactory() {
             @Override
-            public Backend open(String socketPath) {
+            public Backend open(String tcpEndpoint, boolean forceTcp) {
                 return backend;
             }
         };
@@ -202,7 +202,7 @@ public final class DriverTest {
     static TransportFactory failing(final int code, final String message) {
         return new TransportFactory() {
             @Override
-            public Backend open(String socketPath) throws CliException {
+            public Backend open(String tcpEndpoint, boolean forceTcp) throws CliException {
                 throw new CliException(code, message);
             }
         };
@@ -236,12 +236,20 @@ public final class DriverTest {
             Assert.eq("ok\n", r.out);
         });
 
-        suite.test("driver: ping remote failure exits 4", () -> {
+        suite.test("driver: ping positive status proves liveness", () -> {
             FakeBackend backend = new FakeBackend();
-            backend.pingStatus = 7;
+            backend.pingStatus = 1; // jdspd TcpBackendTest: PING_OK = 1
+            Result r = run(of(backend), "ping", "--json");
+            Assert.eq(Exit.OK, r.code);
+            Assert.contains(r.out, "\"status\":1");
+        });
+
+        suite.test("driver: ping negative status exits 4", () -> {
+            FakeBackend backend = new FakeBackend();
+            backend.pingStatus = -1004;
             Result r = run(of(backend), "ping");
             Assert.eq(Exit.REMOTE, r.code);
-            Assert.contains(r.err, "remote status 7");
+            Assert.contains(r.err, "remote status -1004");
         });
 
         suite.test("driver: sessions table", () -> {
@@ -451,7 +459,7 @@ public final class DriverTest {
             final boolean[] opened = {false};
             TransportFactory factory = new TransportFactory() {
                 @Override
-                public Backend open(String socketPath) {
+                public Backend open(String tcpEndpoint, boolean forceTcp) {
                     opened[0] = true;
                     return new FakeBackend();
                 }
@@ -474,7 +482,7 @@ public final class DriverTest {
             Assert.eq(Exit.OK, r.code);
             Assert.contains(r.out, "Usage:");
             Assert.contains(r.out, "Exit codes:");
-            Assert.contains(r.out, "--socket");
+            Assert.contains(r.out, "--tcp");
         });
 
         suite.test("driver: --help flag works without a daemon", () -> {

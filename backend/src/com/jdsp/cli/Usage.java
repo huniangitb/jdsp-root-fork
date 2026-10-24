@@ -36,10 +36,11 @@ public final class Usage {
             + "\n"
             + "Global flags:\n"
             + "  --json                         Machine readable output\n"
-            + "  --socket [path]                Force the unix-socket transport. Without --socket\n"
-            + "                                 the binder service is tried first and the socket\n"
-            + "                                 is used as a fallback. Default path:\n"
-            + "                                 " + TransportFactory.DEFAULT_SOCKET_PATH + "\n"
+            + "  --tcp [host:port]              Force the loopback TCP transport. Without --tcp\n"
+            + "                                 the binder service is tried first and TCP is the\n"
+            + "                                 fallback. Default endpoint: " + TransportFactory.DEFAULT_TCP_HOST + "\n"
+            + "                                 + the port in " + TransportFactory.PORT_FILE + "\n"
+            + "                                 authenticated with " + TransportFactory.TOKEN_FILE + "\n"
             + "  --help, -h                     This text\n"
             + "\n"
             + "Exit codes:\n"
@@ -49,7 +50,7 @@ public final class Usage {
             + "  jdspcli sessions --json\n"
             + "  jdspcli set 161 1500 -0.1 60 3.0\n"
             + "  jdspcli get 161 1500 12\n"
-            + "  jdspcli --socket policy list\n"
+            + "  jdspcli --tcp policy list\n"
             + "  jdspcli policy set com.example.music exclude\n";
 
     public static String synopsis(String command) {

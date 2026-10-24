@@ -3,17 +3,25 @@ package com.jdsp.cli;
 /**
  * Chooses how jdspcli talks to jdspd.
  *
- * jdspd publishes both a binder service (jdsp.service) and a filesystem unix
- * socket. Production uses {@link AutoTransport}: binder first, unix socket as
- * fallback. {@code jdspcli --socket} forces the socket path.
+ * jdspd exposes two usable channels:
+ *  - the binder service "jdsp.service" (reachable from the root/su domain);
+ *  - loopback TCP guarded by a token (reachable from the App and from root).
+ *
+ * Production uses {@link AutoTransport}: binder first, TCP as fallback when the
+ * binder service is absent. {@code jdspcli --tcp} forces the TCP channel.
  */
 public interface TransportFactory {
-    /** Default unix socket created by jdspd. */
-    String DEFAULT_SOCKET_PATH = "/data/data/james.dsp/files/jdsp.sock";
+    /** Host used when the endpoint has no host part. */
+    String DEFAULT_TCP_HOST = "127.0.0.1";
+    /** Port file written by jdspd (plain decimal). */
+    String PORT_FILE = "/data/data/james.dsp/files/jdsp.port";
+    /** Token file written by jdspd (hex). */
+    String TOKEN_FILE = "/data/data/james.dsp/files/jdsp.token";
 
     /**
-     * @param socketPath null = auto (binder first, then default socket);
-     *                   non-null = force the unix socket at this path
+     * @param tcpEndpoint "host:port" or "port"; null = default (host 127.0.0.1,
+     *                    port from PORT_FILE, token from TOKEN_FILE)
+     * @param forceTcp    true = skip the binder and use TCP only (--tcp)
      */
-    Backend open(String socketPath) throws CliException;
+    Backend open(String tcpEndpoint, boolean forceTcp) throws CliException;
 }

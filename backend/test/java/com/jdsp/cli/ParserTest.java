@@ -131,40 +131,51 @@ public final class ParserTest {
             Assert.cliCode(Exit.USAGE, () -> cmd.intArg(0, "session"));
         });
 
-        suite.test("parser: --socket flag before the command", () -> {
-            ParsedCommand cmd = CommandParser.parse(new String[]{"--socket", "sessions"});
-            Assert.eq(Boolean.TRUE, cmd.socket());
-            Assert.eq(null, cmd.socketPath());
+        suite.test("parser: --tcp flag before the command", () -> {
+            ParsedCommand cmd = CommandParser.parse(new String[]{"--tcp", "sessions"});
+            Assert.eq(Boolean.TRUE, cmd.tcp());
+            Assert.eq(null, cmd.tcpEndpoint());
             Assert.eq("sessions", cmd.command());
         });
 
-        suite.test("parser: --socket after the command", () -> {
-            ParsedCommand cmd = CommandParser.parse(new String[]{"sessions", "--socket"});
-            Assert.eq(Boolean.TRUE, cmd.socket());
+        suite.test("parser: --tcp after the command", () -> {
+            ParsedCommand cmd = CommandParser.parse(new String[]{"sessions", "--tcp"});
+            Assert.eq(Boolean.TRUE, cmd.tcp());
             Assert.eq("sessions", cmd.command());
         });
 
-        suite.test("parser: --socket=/path", () -> {
+        suite.test("parser: --tcp=host:port", () -> {
             ParsedCommand cmd = CommandParser.parse(
-                    new String[]{"--socket=/tmp/x.sock", "ping"});
-            Assert.eq("/tmp/x.sock", cmd.socketPath());
+                    new String[]{"--tcp=127.0.0.1:4321", "ping"});
+            Assert.eq("127.0.0.1:4321", cmd.tcpEndpoint());
             Assert.eq("ping", cmd.command());
         });
 
-        suite.test("parser: --socket /path", () -> {
+        suite.test("parser: --tcp host:port and --tcp port", () -> {
             ParsedCommand cmd = CommandParser.parse(
-                    new String[]{"--socket", "/tmp/x.sock", "get", "1", "2"});
-            Assert.eq("/tmp/x.sock", cmd.socketPath());
+                    new String[]{"--tcp", "127.0.0.1:4321", "get", "1", "2"});
+            Assert.eq("127.0.0.1:4321", cmd.tcpEndpoint());
             Assert.eq("get", cmd.command());
             Assert.eq(2, cmd.argCount());
+            ParsedCommand portOnly = CommandParser.parse(new String[]{"--tcp", "4321", "ping"});
+            Assert.eq("4321", portOnly.tcpEndpoint());
+            Assert.eq("ping", portOnly.command());
         });
 
-        suite.test("parser: duplicate --socket rejected", () ->
-                Assert.cliCode(Exit.USAGE, () ->
-                        CommandParser.parse(new String[]{"--socket", "--socket", "ping"})));
+        suite.test("parser: --tcp followed by the command keeps the default endpoint", () -> {
+            ParsedCommand cmd = CommandParser.parse(new String[]{"--tcp", "policy", "list"});
+            Assert.eq(Boolean.TRUE, cmd.tcp());
+            Assert.eq(null, cmd.tcpEndpoint());
+            Assert.eq("policy", cmd.command());
+            Assert.eq(1, cmd.argCount());
+        });
 
-        suite.test("parser: --socket= with an empty path rejected", () ->
+        suite.test("parser: duplicate --tcp rejected", () ->
                 Assert.cliCode(Exit.USAGE, () ->
-                        CommandParser.parse(new String[]{"--socket=", "ping"})));
+                        CommandParser.parse(new String[]{"--tcp", "--tcp", "ping"})));
+
+        suite.test("parser: --tcp= with an empty endpoint rejected", () ->
+                Assert.cliCode(Exit.USAGE, () ->
+                        CommandParser.parse(new String[]{"--tcp=", "ping"})));
     }
 }

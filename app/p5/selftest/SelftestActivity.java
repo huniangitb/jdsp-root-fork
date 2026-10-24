@@ -2,27 +2,27 @@ package com.jdsp.selftest;
 
 import android.app.Activity;
 import android.os.Bundle;
-import android.os.Process;
 import android.util.Log;
 import android.widget.ScrollView;
 import android.widget.TextView;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileReader;
 import java.io.FileWriter;
-import java.io.InputStreamReader;
 
 import me.timschneeberger.rootlessjamesdsp.p5.BinderTransport;
 import me.timschneeberger.rootlessjamesdsp.p5.SocketTransport;
+import me.timschneeberger.rootlessjamesdsp.p5.TcpTransport;
 
 /**
- * 传输连通性自测（包名 com.jdsp.selftest，与被测 App 完全隔离）。
+ * 传输连通性 + 性能自测（包名 com.jdsp.selftest，与被测 App 完全隔离）。
  *
- * 测三件事：
- *  1) socket：能否连上 root 进程在 App 私有目录里创建的 jdsp.sock（C 方案）
- *  2) binder：能否 find/transact root 进程注册的 jdsp.probe 服务（A 方案）
- *  3) shell ：su 是否可用（B 方案的前置条件）
- * 结果同时写 logcat(tag=JdspSelftest) 和 filesDir/selftest.txt。
+ * 1) C  unix socket（filesystem 命名空间）
+ * 2) C' loopback TCP + token（现阶段首选）
+ * 3) A  binder：ServiceManager.getService + transact
+ * 4) B  root shell：su 是否可用
+ * 5) 性能：连续 200 次 setParam（模拟滑条拖动）
  */
 public class SelftestActivity extends Activity {
 
@@ -35,7 +35,9 @@ public class SelftestActivity extends Activity {
         super.onCreate(savedInstanceState);
         view = new TextView(this);
         view.setTextSize(11f);
-        setContentView(new ScrollView(this) {{ addView(view); }});
+        ScrollView sc = new ScrollView(this);
+        sc.addView(view);
+        setContentView(sc);
         new Thread(new Runnable() { @Override public void run() { runAll(); } }, "selftest").start();
     }
 
@@ -50,14 +52,17 @@ public class SelftestActivity extends Activity {
     private void runAll() {
         try {
             log("== env");
-            log("uid=" + Process.myUid() + " pid=" + Process.myPid());
+            log("uid=" + android.os.Process.myUid() + " pid=" + android.os.Process.myPid());
             log("filesDir=" + getFilesDir().getAbsolutePath());
             log("selinux=" + readFile("/proc/self/attr/current").trim());
-            log("package=" + getPackageName());
 
-            testSocket();
+            testUnixSocket();
+            String token = readFile(new File(getFilesDir(), "jdsp.token").getAbsolutePath()).trim();
+            int port = parseInt(readFile(new File(getFilesDir(), "jdsp.port").getAbsolutePath()).trim(), 37501);
+            testTcp(port, token);
             testBinder();
             testShell();
+            benchmarkTcp(port, token);
         } catch (Throwable t) {
             log("FATAL " + t);
         } finally {
@@ -72,20 +77,13 @@ public class SelftestActivity extends Activity {
         }
     }
 
-    private void testSocket() {
-        log("== socket (C)");
+    private void testUnixSocket() {
+        log("== unix socket (C)");
         File sock = new File(getFilesDir(), "jdsp.sock");
-        log("sockPath=" + sock.getAbsolutePath() + " exists=" + sock.exists()
-                + " canRead=" + sock.canRead() + " canWrite=" + sock.canWrite());
+        log("sockPath=" + sock.getAbsolutePath() + " exists=" + sock.exists());
         SocketTransport t = new SocketTransport(sock.getAbsolutePath());
-        boolean ok = t.connect();
-        log("socket.connect=" + ok);
-        if (ok) {
-            log("socket.ping=" + t.ping());
-            int rc = t.setParam(4242, 1500, new byte[] { 0x00, 0x00, 0x00, 0x40 });
-            log("socket.setParam rc=" + rc);
-            t.close();
-        }
+        log("unix.connect=" + t.connect());
+        t.close();
         try {
             android.net.LocalSocket ls = new android.net.LocalSocket();
             ls.connect(new android.net.LocalSocketAddress(sock.getAbsolutePath(),
@@ -97,12 +95,35 @@ public class SelftestActivity extends Activity {
         }
     }
 
+    private void testTcp(int port, String token) {
+        log("== tcp loopback (C')");
+        log("port=" + port + " tokenLen=" + token.length());
+        TcpTransport t = new TcpTransport("127.0.0.1", port, token);
+        boolean ok = t.connect();
+        log("tcp.connect=" + ok);
+        if (ok) {
+            log("tcp.ping=" + t.ping());
+            log("tcp.setParam rc=" + t.setParam(4242, 1500, new byte[] { 0x00, 0x00, 0x00, 0x40 }));
+            log("tcp.attach rc=" + t.attach(4242));
+            t.close();
+        } else {
+            try {
+                java.net.Socket s = new java.net.Socket();
+                s.connect(new java.net.InetSocketAddress("127.0.0.1", port), 500);
+                log("raw tcp connect=ok");
+                s.close();
+            } catch (Throwable e) {
+                log("raw tcp failed: " + e.getClass().getSimpleName() + ": " + e.getMessage());
+            }
+        }
+    }
+
     private void testBinder() {
         log("== binder (A)");
         try {
             Class<?> sm = Class.forName("android.os.ServiceManager");
             Object b = sm.getMethod("getService", String.class).invoke(null, "jdsp.probe");
-            log("ServiceManager.getService(jdsp.probe)=" + (b == null ? "null" : b.getClass().getName()));
+            log("getService(jdsp.probe)=" + (b == null ? "null" : "found"));
             if (b instanceof android.os.IBinder) {
                 android.os.Parcel data = android.os.Parcel.obtain();
                 android.os.Parcel reply = android.os.Parcel.obtain();
@@ -114,9 +135,9 @@ public class SelftestActivity extends Activity {
                 } finally { reply.recycle(); data.recycle(); }
             }
         } catch (Throwable t) {
-            log("binder failed: " + t.getClass().getName() + ": " + t.getMessage());
+            log("binder failed: " + t.getClass().getSimpleName() + ": " + t.getMessage());
             Throwable c = t.getCause();
-            while (c != null) { log("  cause: " + c.getClass().getName() + ": " + c.getMessage()); c = c.getCause(); }
+            while (c != null) { log("  cause: " + c.getClass().getSimpleName() + ": " + c.getMessage()); c = c.getCause(); }
         }
         BinderTransport bt = new BinderTransport("jdsp.service");
         log("BinderTransport(jdsp.service).connect=" + bt.connect() + " err=" + bt.lastError());
@@ -127,7 +148,7 @@ public class SelftestActivity extends Activity {
         java.lang.Process p = null;
         try {
             p = Runtime.getRuntime().exec(new String[] { "su", "-c", "id" });
-            BufferedReader r = new BufferedReader(new InputStreamReader(p.getInputStream()));
+            BufferedReader r = new BufferedReader(new java.io.InputStreamReader(p.getInputStream()));
             String line = r.readLine();
             int code = p.waitFor();
             log("su -c id exit=" + code + " out=" + line);
@@ -138,14 +159,50 @@ public class SelftestActivity extends Activity {
         }
     }
 
+    /** 200 次 setParam，模拟滑条拖动：目标 < 20ms/次、零丢包。 */
+    private void benchmarkTcp(int port, String token) {
+        log("== benchmark: 200 x setParam (tcp)");
+        TcpTransport t = new TcpTransport("127.0.0.1", port, token);
+        if (!t.connect()) { log("bench.skip (no transport)"); return; }
+        int n = 200;
+        long[] nanos = new long[n];
+        int fail = 0;
+        long start = System.nanoTime();
+        for (int i = 0; i < n; i++) {
+            float gain = -12f + (i % 24) * 1.0f;
+            byte[] value = me.timschneeberger.rootlessjamesdsp.p5.JdspCodec.floatBytes(new float[] { gain });
+            long t0 = System.nanoTime();
+            int rc = t.setParam(4242, 1303, value);
+            nanos[i] = System.nanoTime() - t0;
+            if (rc < 0) fail++;
+        }
+        long total = System.nanoTime() - start;
+        java.util.Arrays.sort(nanos);
+        double totalMs = total / 1e6;
+        log("bench.total_ms=" + fmt(totalMs));
+        log("bench.avg_ms=" + fmt(totalMs / n));
+        log("bench.p50_ms=" + fmt(nanos[n / 2] / 1e6));
+        log("bench.p95_ms=" + fmt(nanos[(int) (n * 0.95)] / 1e6));
+        log("bench.max_ms=" + fmt(nanos[n - 1] / 1e6));
+        log("bench.fail=" + fail + "/" + n);
+        log("bench.throughput_per_s=" + fmt(n / (totalMs / 1000.0)));
+        t.close();
+    }
+
+    private static String fmt(double v) { return String.format(java.util.Locale.US, "%.2f", v); }
+
+    private static int parseInt(String s, int def) {
+        try { return Integer.parseInt(s.trim()); } catch (Throwable t) { return def; }
+    }
+
     private static String readFile(String path) {
         try {
-            BufferedReader r = new BufferedReader(new java.io.FileReader(path));
+            BufferedReader r = new BufferedReader(new FileReader(path));
             String s = r.readLine();
             r.close();
             return s == null ? "" : s;
         } catch (Throwable t) {
-            return "(unreadable)";
+            return "";
         }
     }
 }

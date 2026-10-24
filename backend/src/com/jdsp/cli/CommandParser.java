@@ -30,8 +30,8 @@ public final class CommandParser {
         boolean json = false;
         boolean help = false;
         boolean raw = false;
-        boolean socket = false;
-        String socketPath = null;
+        boolean tcp = false;
+        String tcpEndpoint = null;
         boolean endOfOptions = false;
         String hex = null;
         String intValue = null;
@@ -68,20 +68,19 @@ public final class CommandParser {
             } else if ("--raw".equals(name)) {
                 requireNoInline(name, inline);
                 raw = true;
-            } else if ("--socket".equals(name)) {
-                if (socket) {
-                    throw new CliException(Exit.USAGE, "option --socket given more than once");
+            } else if ("--tcp".equals(name)) {
+                if (tcp) {
+                    throw new CliException(Exit.USAGE, "option --tcp given more than once");
                 }
-                socket = true;
+                tcp = true;
                 if (inline != null) {
                     if (inline.isEmpty()) {
                         throw new CliException(Exit.USAGE,
-                                "option --socket needs a non-empty path");
+                                "option --tcp needs a non-empty endpoint");
                     }
-                    socketPath = inline;
-                } else if (i + 1 < argv.length && argv[i + 1].startsWith("/")) {
-                    // an absolute path is unambiguous; otherwise it is the command
-                    socketPath = argv[i + 1];
+                    tcpEndpoint = inline;
+                } else if (i + 1 < argv.length && looksLikeTcpEndpoint(argv[i + 1])) {
+                    tcpEndpoint = argv[i + 1];
                     i++;
                 }
             } else if ("--hex".equals(name)) {
@@ -123,7 +122,7 @@ public final class CommandParser {
 
         if (positional.isEmpty()) {
             if (help) {
-                return new ParsedCommand("help", positional, json, true, raw, socket, socketPath,
+                return new ParsedCommand("help", positional, json, true, raw, tcp, tcpEndpoint,
                         hex, intValue, shortValue, iters);
             }
             throw new CliException(Exit.USAGE, "missing command (try 'jdspcli help')");
@@ -133,12 +132,31 @@ public final class CommandParser {
             throw new CliException(Exit.USAGE,
                     "unknown command: " + command + " (try 'jdspcli help')");
         }
-        return new ParsedCommand(command, positional, json, help, raw, socket, socketPath, hex,
+        return new ParsedCommand(command, positional, json, help, raw, tcp, tcpEndpoint, hex,
                 intValue, shortValue, iters);
     }
 
     private static boolean isOption(String token) {
         return "--".equals(token) || token.startsWith("--") || "-h".equals(token);
+    }
+
+    /**
+     * An optional --tcp value looks like "host:port", "port" or "[::1]:port";
+     * anything else (e.g. the command name) is left for the positional parser.
+     */
+    private static boolean looksLikeTcpEndpoint(String token) {
+        if (token.isEmpty()) {
+            return false;
+        }
+        if (token.indexOf(':') >= 0) {
+            return true;
+        }
+        for (int i = 0; i < token.length(); i++) {
+            if (!Character.isDigit(token.charAt(i))) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private static void requireNoInline(String name, String inline) throws CliException {

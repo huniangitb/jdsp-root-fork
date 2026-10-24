@@ -168,24 +168,38 @@ App 是预编译 APK（Kotlin 源码在 `../loundess_git`，Gradle 全量构建�
 
 ---
 
-## 8.1 传输层决策（2026-10-24 追加）
+## 8.1 传输层决策（2026-10-24 追加，已真机验证）
 
-三条通道，运行时按顺序降级：
-
-| 通道 | 路径 | 谁能用 | 状态 |
+| 通道 | 形态 | 实测可用性 | 用途 |
 |---|---|---|---|
-| A binder | service `jdsp.service` | root/su 域（CLI、jdspd 自身） | 已验证可用（跨进程 AIDL 实测通过） |
-| **C unix socket** | `/data/data/james.dsp/files/jdsp.sock`（app_data_file） | 本 App + root | **主用**，App 走这条 |
-| B root shell | `su -c jdspcli ...` | App（root flavor 自带 libsu） | 兜底 |
+| **C' loopback TCP + token** | jdspd 绑 127.0.0.1:0，端口与 token 写进 App 私有目录 | **App（untrusted_app）与 root 都可用**；200 次 setParam avg 1.77 ms / p95 2.67 ms / 0 失败 | **主用** |
+| A binder | service `jdsp.service` | root 域可用；**untrusted_app 不可用**（getService 返回 null，find 被拒） | CLI / 其它 root 工具 |
+| B root shell | `su -c jdspcli ...` | 取决于用户是否给该 App 授权；测试 App 未授权 → 不可用 | 兜底 |
 
-为什么 App 不走 binder：AOSP servicemanager 对 `service_contexts` 里**没有登记**的服务名，
-按注册进程的域给 SID；jdspd 跑在 ksu/su 域 → 服务标签即 su 域。要让 untrusted_app 连上就得
+### 为什么不是 unix socket
+
+`LocalServerSocket(String)` 只创建 **abstract 命名空间**（不落盘）；能创建 filesystem 命名空间的
+`LocalServerSocket(LocalSocketAddress)` 在 Android 15 运行时是隐藏 API，实测 `NoSuchMethodException`。
+纯 Java 守护进程无法在 `/data/data/<pkg>/files/` 下建 socket 文件，除非引入 native 辅助进程 ——
+不值得，loopback TCP 达到同样效果。
+
+### 为什么不是 binder（给 App 用）
+
+AOSP servicemanager 对 `service_contexts` 里没有登记的服务名，按注册进程的域给 SID；
+jdspd 跑在 ksu/su 域 → 服务标签即 su 域。要让 untrusted_app 连上就得
 `allow untrusted_app su:binder { call transfer }` + `service_manager find`，等于把 su 域对普通
-App 敞开，**不采纳**。socket 放在 App 自己的数据目录里：只有本 App（app_data_file）与 root 能连，
-不需要任何 SELinux 放行，且是长连接，滑条拖动也扛得住。
+App 敞开，**不采纳**。
 
-socket 协议（JSON lines，一行请求一行响应）：
+### C' 的协议
 
+    # 发现
+    /data/data/james.dsp/files/jdsp.port    纯数字端口，mode 0400，owner = App uid
+    /data/data/james.dsp/files/jdsp.token   32 字节随机 hex，mode 0400
+    （每次 jdspd 启动重新生成；App 每次连接前重读）
+
+    # 握手（首行）
+    {"op":"hello","token":"<hex>"}          -> {"ok":true}
+    # 之后一行一请求
     {"cmd":"ping"}                                    -> {"ok":true,"version":"jdspd 2.0.0"}
     {"cmd":"sessions"}                                -> {"ok":true,"sessions":[{sessionId,uid,pkg,attached,enabled,paramCount,effectId,policyMode,pid}]}
     {"cmd":"setParam","session":145,"param":1500,"value":"cdccccbd..."} -> {"ok":true,"status":0}
@@ -195,7 +209,8 @@ socket 协议（JSON lines，一行请求一行响应）：
     {"cmd":"policy","pkg":"com.x","mode":2} / {"cmd":"policies"}
     {"cmd":"dumpConfig"} / {"cmd":"stats"}
 
-服务端 handler 与 AIDL 共用同一份实现，`jdspcli --socket` 也走这条通道。
+安全：只绑 loopback、token 只在 App 私有目录（0700，其它 App 读不到）、连接数上限 + 空闲超时。
+服务端 handler 与 AIDL 共用同一份 CoreApi 实现；`jdspcli --tcp` 走同一条通道。
 
 ## 9. 风险与回退
 

@@ -119,11 +119,13 @@ public final class CommandRunner {
         requireArgs(cmd, 0, 0);
         rejectValueOptions(cmd);
         int status = backend().ping();
-        if (status != 0) {
+        // AIDL: int ping(); "ok" answers prove the daemon is alive. jdspd uses
+        // PING_OK=1, so any non-negative answer is alive; negative codes are errors.
+        if (status < 0) {
             throw new CliException(Exit.REMOTE, "ping failed: remote status " + status);
         }
         if (cmd.json()) {
-            out.println("{\"ok\":true,\"status\":0}");
+            out.println("{\"ok\":true,\"status\":" + status + "}");
         } else {
             out.println("ok");
         }

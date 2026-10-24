@@ -8,36 +8,115 @@ import java.io.InputStreamReader;
 import java.io.OutputStream;
 import java.io.OutputStreamWriter;
 import java.io.Writer;
+import java.net.InetSocketAddress;
+import java.net.Socket;
 import java.nio.charset.Charset;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 
 /**
- * Backend over the jdspd unix-socket JSON-lines protocol.
+ * Backend over jdspd's loopback-TCP JSON-lines protocol.
  *
  * Wire format (agreed with jdspd):
- *   request  = one line of JSON {cmd:..., ...}
- *   response = one line of JSON, always has "ok":boolean
- *   errors   = {"ok":false,"error":"...","code":-1001..-1005}
- *   byte[]   = lower-case hex string
+ *   hello    : client sends {"op":"hello","token":"<hex>"} as the first line
+ *   request  : one JSON line {cmd:..., ...}
+ *   response : one JSON line, always has "ok":boolean
+ *   errors   : {"ok":false,"error":"...","code":-1001..-1005}
+ *   byte[]   : lower-case hex string
  *
- * Pure Java streams in, JSON out: no Android classes, so this class is
- * covered by the host unit tests with in-memory streams.
+ * Plain java.net.Socket + java.nio.file, no Android classes: the whole class
+ * (including the token handshake) is covered by host unit tests with a local
+ * ServerSocket.
  */
-public final class SocketBackend implements Backend {
+public final class TcpBackend implements Backend {
     private static final Charset UTF8 = Charset.forName("UTF-8");
+    private static final int CONNECT_TIMEOUT_MS = 1500;
+    private static final int READ_TIMEOUT_MS = 2000;
 
     private final BufferedReader reader;
     private final Writer writer;
-    private final String path;
+    private final String label;
 
-    public SocketBackend(InputStream in, OutputStream out, String path) {
+    /** Protocol-only view over an already connected stream pair (unit tests). */
+    TcpBackend(InputStream in, OutputStream out, String label) {
         this.reader = new BufferedReader(new InputStreamReader(in, UTF8));
         this.writer = new BufferedWriter(new OutputStreamWriter(out, UTF8));
-        this.path = path;
+        this.label = label;
     }
+
+    /**
+     * Connects to jdspd using the default files
+     * ({@link TransportFactory#PORT_FILE}, {@link TransportFactory#TOKEN_FILE}).
+     */
+    public static TcpBackend open(String endpoint) throws CliException {
+        return open(endpoint, TransportFactory.PORT_FILE, TransportFactory.TOKEN_FILE);
+    }
+
+    /** Testable variant: explicit endpoint file paths. */
+    static TcpBackend open(String endpoint, String portFile, String tokenFile) throws CliException {
+        String host = TransportFactory.DEFAULT_TCP_HOST;
+        int port;
+        if (endpoint != null && !endpoint.isEmpty()) {
+            String[] parsed = parseEndpoint(endpoint);
+            host = parsed[0];
+            port = Integer.parseInt(parsed[1]);
+        } else {
+            Path portPath = Paths.get(portFile);
+            Path tokenPath = Paths.get(tokenFile);
+            if (!Files.isRegularFile(portPath) || !Files.isRegularFile(tokenPath)) {
+                throw new CliException(Exit.UNAVAILABLE, missingFilesMessage(portFile, tokenFile));
+            }
+            port = readPort(portPath, portFile);
+        }
+        String token = readToken(Paths.get(tokenFile), tokenFile);
+
+        Socket socket = new Socket();
+        TcpBackend backend;
+        try {
+            socket.connect(new InetSocketAddress(host, port), CONNECT_TIMEOUT_MS);
+            socket.setSoTimeout(READ_TIMEOUT_MS);
+            backend = new TcpBackend(socket.getInputStream(), socket.getOutputStream(),
+                    host + ":" + port);
+        } catch (IOException e) {
+            closeQuietly(socket);
+            throw new CliException(Exit.UNAVAILABLE,
+                    "tcp endpoint unreachable (" + host + ":" + port + ": " + describe(e) + ")",
+                    e);
+        }
+        try {
+            backend.handshake(token);
+        } catch (CliException e) {
+            closeQuietly(socket);
+            throw e;
+        }
+        return backend;
+    }
+
+    private void handshake(String token) throws CliException {
+        Map<String, Object> request = new LinkedHashMap<String, Object>();
+        request.put("op", "hello");
+        request.put("token", token);
+        Map<String, Object> response = exchange(request);
+        if (isOk(response)) {
+            return;
+        }
+        String error = Json.string(response, "error");
+        if (error != null && error.toLowerCase(Locale.ROOT).contains("token")) {
+            throw new CliException(Exit.UNAVAILABLE, "tcp hello rejected (bad token)");
+        }
+        throw new CliException(Exit.UNAVAILABLE, "tcp hello rejected ("
+                + (error == null ? "unknown error" : error) + ")");
+    }
+
+    // ------------------------------------------------------------------
+    // Backend
+    // ------------------------------------------------------------------
 
     @Override
     public String getVersion() throws CliException {
@@ -112,10 +191,10 @@ public final class SocketBackend implements Backend {
             return new byte[0];
         }
         try {
-            return ValueCodec.parseHex(hex, "socket getParam reply");
+            return ValueCodec.parseHex(hex, "tcp getParam reply");
         } catch (CliException e) {
             throw new CliException(Exit.UNAVAILABLE,
-                    "invalid hex value in jdspd socket reply: " + hex, e);
+                    "invalid hex value in jdspd tcp reply: " + hex, e);
         }
     }
 
@@ -206,6 +285,10 @@ public final class SocketBackend implements Backend {
     }
 
     private Map<String, Object> call(Map<String, Object> request) throws CliException {
+        return exchange(request);
+    }
+
+    private Map<String, Object> exchange(Map<String, Object> request) throws CliException {
         String line = Json.write(request);
         try {
             writer.write(line);
@@ -214,17 +297,17 @@ public final class SocketBackend implements Backend {
             String reply = reader.readLine();
             if (reply == null) {
                 throw new CliException(Exit.UNAVAILABLE,
-                        "jdspd socket " + path + " closed the connection");
+                        "tcp " + label + " closed the connection");
             }
             Map<String, Object> response = Json.object(Json.parse(reply));
             if (response == null) {
                 throw new CliException(Exit.UNAVAILABLE,
-                        "invalid jdspd socket reply: " + reply);
+                        "invalid jdspd tcp reply: " + reply);
             }
             return response;
         } catch (IOException e) {
             throw new CliException(Exit.UNAVAILABLE,
-                    "jdspd socket " + path + ": " + describe(e), e);
+                    "tcp " + label + ": " + describe(e), e);
         }
     }
 
@@ -271,6 +354,93 @@ public final class SocketBackend implements Backend {
                 Json.intValue(session, "effectId", -1),
                 Json.intValue(session, "policyMode", 0),
                 Json.intValue(session, "pid", 0));
+    }
+
+    // ------------------------------------------------------------------
+    // endpoint files and parsing
+    // ------------------------------------------------------------------
+
+    private static String missingFilesMessage(String portFile, String tokenFile) {
+        if (TransportFactory.PORT_FILE.equals(portFile)
+                && TransportFactory.TOKEN_FILE.equals(tokenFile)) {
+            return "tcp endpoint files missing (/data/data/james.dsp/files/jdsp.{port,token})";
+        }
+        return "tcp endpoint files missing (" + portFile + ", " + tokenFile + ")";
+    }
+
+    private static int readPort(Path path, String displayPath) throws CliException {
+        String text;
+        try {
+            text = new String(Files.readAllBytes(path), UTF8).trim();
+        } catch (IOException e) {
+            throw new CliException(Exit.UNAVAILABLE,
+                    "tcp endpoint files unreadable (" + displayPath + ": " + describe(e) + ")", e);
+        }
+        try {
+            int port = Integer.parseInt(text);
+            if (port <= 0 || port > 65535) {
+                throw new NumberFormatException("out of range");
+            }
+            return port;
+        } catch (NumberFormatException e) {
+            throw new CliException(Exit.UNAVAILABLE,
+                    "bad tcp port in " + displayPath + ": '" + text + "'");
+        }
+    }
+
+    private static String readToken(Path path, String displayPath) throws CliException {
+        if (!Files.isRegularFile(path)) {
+            if (TransportFactory.TOKEN_FILE.equals(displayPath)) {
+                throw new CliException(Exit.UNAVAILABLE, missingFilesMessage(
+                        TransportFactory.PORT_FILE, TransportFactory.TOKEN_FILE));
+            }
+            throw new CliException(Exit.UNAVAILABLE,
+                    "tcp endpoint files missing (" + displayPath + ")");
+        }
+        String token;
+        try {
+            token = new String(Files.readAllBytes(path), UTF8).trim();
+        } catch (IOException e) {
+            throw new CliException(Exit.UNAVAILABLE,
+                    "tcp token file unreadable (" + displayPath + ": " + describe(e) + ")", e);
+        }
+        if (token.isEmpty()) {
+            throw new CliException(Exit.UNAVAILABLE,
+                    "tcp token file is empty (" + displayPath + ")");
+        }
+        return token.toLowerCase(Locale.ROOT);
+    }
+
+    static String[] parseEndpoint(String endpoint) throws CliException {
+        String text = endpoint.trim();
+        String host = TransportFactory.DEFAULT_TCP_HOST;
+        String portText = text;
+        int colon = text.lastIndexOf(':');
+        if (colon >= 0) {
+            host = text.substring(0, colon);
+            portText = text.substring(colon + 1);
+            if (host.isEmpty()) {
+                host = TransportFactory.DEFAULT_TCP_HOST;
+            }
+        }
+        try {
+            int port = Integer.parseInt(portText);
+            if (port <= 0 || port > 65535) {
+                throw new NumberFormatException("out of range");
+            }
+            return new String[]{host, Integer.toString(port)};
+        } catch (NumberFormatException e) {
+            throw new CliException(Exit.USAGE, "invalid --tcp endpoint '" + endpoint
+                    + "': expected [host:]port");
+        }
+    }
+
+    private static void closeQuietly(Socket socket) {
+        try {
+            socket.close();
+        } catch (IOException ignored) {
+            // reporting the original failure is more useful
+        }
     }
 
     private static String describe(IOException e) {

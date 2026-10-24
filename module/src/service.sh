@@ -45,6 +45,23 @@ done
 # 2) app 安装/启用
 [ -f "$MODPATH/jdsp_app.sh" ] && . "$MODPATH/jdsp_app.sh" 2>/dev/null &
 
+# 2.5) jdspd 后端守护（看护循环：等 AudioFlinger → 起 daemon → 退出 2s 重启 →
+#      每分钟把 state.bin 归一化回 0660，因为 HAL 每次写盘都会重建成 0600）
+if [ -f "$MODPATH/jdspd.sh" ]; then
+	mkdir -p /data/adb/jdspd 2>/dev/null
+	chmod 0700 /data/adb/jdspd 2>/dev/null
+	JDSP_LOG_SIZE=$(stat -c %s /data/adb/jdspd/jdspd.log 2>/dev/null || echo 0)
+	[ "$JDSP_LOG_SIZE" -gt 1048576 ] && : > /data/adb/jdspd/jdspd.log
+	nohup sh "$MODPATH/jdspd.sh" >/dev/null 2>&1 &
+fi
+
+# 2.6) mode 校验：这是唯一能发现"以为切了其实没切"的地方
+#      （XML 由 audioserver 在启动时读一次，且 hybrid_mount 的挂载是 ro 快照）
+if [ -f "$MODPATH/jdsp_mode.sh" ]; then
+	. "$MODPATH/jdsp_mode.sh"
+	jdsp_mode_verify service
+fi
+
 # 3) 自检（关掉 set -x 以免日志噪音）
 sleep 8
 {

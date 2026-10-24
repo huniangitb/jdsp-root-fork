@@ -24,6 +24,15 @@ fi
 # AIDL 设备：按系统版本修 lib 依赖
 . "$MODPATH/patch.sh"
 
+# v2: 按 /data/adb/jdspd/mode 纠正模块内的 audio_effects.xml 副本。
+# 注意：hybrid_mount 在 metamount 阶段已把模块文件拷进各分区镜像（ro 快照），
+# 所以这一步对**本次**开机无效，作用是把副本纠正到当前 mode，**下次开机**生效；
+# 平时靠 jdsp_mode.sh set 在切换时就把副本改好，这里是自愈兜底。
+if [ -f "$MODPATH/jdsp_mode.sh" ]; then
+	. "$MODPATH/jdsp_mode.sh"
+	jdsp_mode_apply post-fs-data
+fi
+
 # 注：标准分区（system/vendor/odm）的 SELinux 上下文由元模块在挂载时自动按目标上下文处理，
 #     安装器的 set_perm_recursive 也会设一次；这里不再重复 chcon。
 

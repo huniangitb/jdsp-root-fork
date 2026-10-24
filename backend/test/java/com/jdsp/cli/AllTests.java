@@ -10,7 +10,7 @@ public final class AllTests {
         ValueCodecTest.run(suite);
         FormatTest.run(suite);
         JsonTest.run(suite);
-        SocketBackendTest.run(suite);
+        TcpBackendTest.run(suite);
         TransportTest.run(suite);
         DriverTest.run(suite);
         System.out.flush();

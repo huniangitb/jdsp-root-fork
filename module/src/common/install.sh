@@ -191,3 +191,11 @@ cp -rf $MODPATH/common/files/JamesDSP /storage/emulated/0/
 [ -d $MODPATH/JamesDSP ] && cp -rf $MODPATH/JamesDSP/* /storage/emulated/0/JamesDSP/
 cp -f $MODPATH/JamesDSPManager.apk /storage/emulated/0/JamesDSPManager.apk
 [ $API -gt 29 ] && { ui_print "   Enabling hidden api policy"; settings put global hidden_api_policy 1 2>/dev/null; }
+
+# v2: 按已保存的 mode（/data/adb/jdspd/mode，缺省 auto）决定本次安装出来的
+# audio_effects.xml 副本要不要保留 <postprocess> 注入，避免升级重装把 backend 用户切回 auto。
+if [ -f "$MODPATH/jdsp_mode.sh" ]; then
+	ui_print "   Applying jdsp mode"
+	. "$MODPATH/jdsp_mode.sh"
+	jdsp_mode_apply install
+fi

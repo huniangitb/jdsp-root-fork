@@ -37,9 +37,20 @@ public final class CoreApi {
     private final SessionWatcher watcher;
     private final long startedAt = System.currentTimeMillis();
 
+    /** Implemented by the daemon so a transport can request a graceful shutdown. */
+    public interface ShutdownHook {
+        void requestShutdown(String reason);
+    }
+
+    private volatile ShutdownHook shutdownHook;
+    private volatile String instanceLockFile = "";
+    private volatile long instanceStartedAt;
     private volatile boolean binderPublished;
-    private volatile String socketPath = "";
-    private volatile String socketError = "";
+    private volatile int tcpPort = -1;
+    private volatile int tcpClients;
+    private volatile String tcpPortFile = "";
+    private volatile String tcpTokenFile = "";
+    private volatile String tcpError = "";
 
     public CoreApi(ConfigStore config, PolicyEngine policy, EffectManager effects,
                    ParamBus bus, SessionWatcher watcher) {
@@ -124,6 +135,22 @@ public final class CoreApi {
                 if (st.pkg != null && st.pkg.length() > 0) {
                     v.pkg = st.pkg;
                 }
+                // Once the owning App dies the session ref belongs to us (we are an effect
+                // client), so the dump reports our pid/uid. Keep the real owner for display,
+                // but never hide a newer owner that took the session over.
+                int myPid = android.os.Process.myPid();
+                boolean ownerLooksLikeUs = s.pid == myPid || s.pid <= 0;
+                if (ownerLooksLikeUs) {
+                    if (st.pid > 0) {
+                        v.pid = st.pid;
+                    }
+                    if (st.uid >= 0) {
+                        v.uid = st.uid;
+                    }
+                    if (st.pkg != null && st.pkg.length() > 0) {
+                        v.pkg = st.pkg;
+                    }
+                }
             }
             v.policyMode = config.getPolicy(v.pkg);
             seen.add(Integer.valueOf(v.sessionId));
@@ -185,6 +212,27 @@ public final class CoreApi {
         return System.currentTimeMillis() - startedAt;
     }
 
+    public void setShutdownHook(ShutdownHook hook) {
+        this.shutdownHook = hook;
+    }
+
+    /** Single instance guard bookkeeping for stats. */
+    public void setInstanceInfo(String lockFile, long startedAt) {
+        this.instanceLockFile = lockFile == null ? "" : lockFile;
+        this.instanceStartedAt = startedAt;
+    }
+
+    /** Graceful stop requested over a transport (extra command, not part of the AIDL contract). */
+    public int requestShutdown(String reason) {
+        ShutdownHook hook = shutdownHook;
+        if (hook == null) {
+            return EffectManager.ERR_INTERNAL;
+        }
+        Log.i("shutdown requested over the control channel (" + reason + ")");
+        hook.requestShutdown("control channel: " + reason);
+        return 0;
+    }
+
     // ---- effect handles ------------------------------------------------------
 
     /** Creates or adopts a handle and replays the session's configured parameters. */
@@ -200,7 +248,7 @@ public final class CoreApi {
         SessionView v = getSession(sessionId);
         String pkg = v == null ? "" : v.pkg;
         int uid = v == null ? -1 : v.uid;
-        effects.setOwner(sessionId, uid, pkg);
+        effects.setOwner(sessionId, uid, pkg, v == null ? -1 : v.pid);
         int applied = bus.applyAll(sessionId, config.paramsFor(pkg));
         effects.setEnabled(sessionId, true);
         Log.i("attach(" + sessionId + ") pkg=" + pkg + " params=" + applied);
@@ -210,6 +258,7 @@ public final class CoreApi {
 
     public int detach(int sessionId) {
         int rc = effects.detach(sessionId);
+        bus.forgetSession(sessionId);
         watcher.poke();
         return rc;
     }
@@ -249,11 +298,21 @@ public final class CoreApi {
         }
         byte[] reply = new byte[n];
         int rc = bus.getParam(sessionId, paramId, reply);
-        if (rc != 0) {
-            Log.w("getParam session=" + sessionId + " param=" + paramId + " rc=" + rc);
-            return EMPTY;
+        if (rc == 0) {
+            return reply;
         }
-        return reply;
+        // Nothing from the engine (the clean engine has no GET_PARAM) and no cached write:
+        // fall back to the configured value of the session's package.
+        SessionView v = getSession(sessionId);
+        byte[] configured = v == null ? null : config.paramsFor(v.pkg).get(Integer.valueOf(paramId));
+        if (configured != null && configured.length > 0) {
+            int len = Math.min(n, configured.length);
+            byte[] out = new byte[len];
+            System.arraycopy(configured, 0, out, 0, len);
+            return out;
+        }
+        Log.w("getParam session=" + sessionId + " param=" + paramId + " rc=" + rc);
+        return EMPTY;
     }
 
     public int commit(int sessionId) {
@@ -332,15 +391,14 @@ public final class CoreApi {
             o.put("mode", config.getMode());
             o.put("enabled", config.isEnabled());
         } catch (Throwable t) {
-            try {
-                o = new JSONObject();
-                o.put("error", EffectManager.describe(t));
-                o.put("sessionId", sessionId);
-            } catch (Throwable ignored) {
-                return "{\"error\":\"internal\"}";
-            }
+            Log.e("dumpSession failed", t);
+            return "{\"error\":\"dumpSession failed\",\"sessionId\":" + sessionId + "}";
         }
-        return o.toString(2);
+        try {
+            return o.toString(2);
+        } catch (Throwable t) {
+            return "{\"error\":\"serialisation failed\"}";
+        }
     }
 
     public int loadPreset(String path) {
@@ -420,16 +478,22 @@ public final class CoreApi {
         return binderPublished;
     }
 
-    public void setSocketPath(String path) {
-        this.socketPath = path == null ? "" : path;
+    /** Transport bookkeeping for stats (called by {@link TcpService}). */
+    public void setTcpInfo(int port, int clients, String portFile, String tokenFile,
+                           String error) {
+        this.tcpPort = port;
+        this.tcpClients = clients;
+        this.tcpPortFile = portFile == null ? "" : portFile;
+        this.tcpTokenFile = tokenFile == null ? "" : tokenFile;
+        this.tcpError = error == null ? "" : error;
     }
 
-    public String getSocketPath() {
-        return socketPath;
+    public int getTcpPort() {
+        return tcpPort;
     }
 
-    public void setSocketError(String error) {
-        this.socketError = error == null ? "" : error;
+    public String getTcpPortFile() {
+        return tcpPortFile;
     }
 
     public ConfigStore config() {
@@ -471,6 +535,8 @@ public final class CoreApi {
             o.put("batchFlushes", ps.batchFlushes);
             o.put("batchMerged", ps.batchMerged);
             o.put("bulkApplied", ps.bulkApplied);
+            o.put("getParamCacheHits", ps.cacheHits);
+            o.put("getParamEngineHits", ps.engineHits);
             o.put("watcherTicks", watcher.ticks());
             o.put("watcherFailures", watcher.failures());
             o.put("watcherLastAgoMs", watcher.lastTickAt() == 0 ? -1
@@ -485,11 +551,19 @@ public final class CoreApi {
             o.put("packages", policy.packageCount());
             o.put("policyError", policy.lastError());
             o.put("configPath", config.getFile() == null ? "" : config.getFile().getPath());
+            o.put("lockFile", instanceLockFile);
+            o.put("instanceStartedAt", instanceStartedAt);
             o.put("effectReflection", EffectManager.reflectionStatus());
             JSONObject transport = new JSONObject();
             transport.put("binder", binderPublished);
-            transport.put("socket", socketPath);
-            transport.put("socketError", socketError);
+            JSONObject tcp = new JSONObject();
+            tcp.put("port", tcpPort);
+            tcp.put("clients", tcpClients);
+            tcp.put("listening", tcpPort > 0);
+            tcp.put("error", tcpError);
+            transport.put("tcp", tcp);
+            transport.put("portFile", tcpPortFile);
+            transport.put("tokenFile", tcpTokenFile);
             o.put("transport", transport);
         } catch (Throwable t) {
             try {

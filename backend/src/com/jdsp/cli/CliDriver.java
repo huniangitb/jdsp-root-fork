@@ -24,13 +24,12 @@ public final class CliDriver {
             return Exit.OK;
         }
         final TransportFactory selected = transports;
-        final String socketPath = cmd.socket()
-                ? (cmd.socketPath() != null ? cmd.socketPath() : TransportFactory.DEFAULT_SOCKET_PATH)
-                : null;
+        final String tcpEndpoint = cmd.tcp() ? cmd.tcpEndpoint() : null;
+        final boolean forceTcp = cmd.tcp();
         BackendFactory factory = new BackendFactory() {
             @Override
             public Backend open() throws CliException {
-                return selected.open(socketPath);
+                return selected.open(tcpEndpoint, forceTcp);
             }
         };
         return new CommandRunner(factory, out, err).run(cmd);

@@ -1,6 +1,6 @@
 package com.jdsp.cli;
 
-/** Transport selection: binder-first auto fallback, forced socket, failure mapping. */
+/** Transport selection: binder-first auto fallback, forced TCP, failure mapping. */
 public final class TransportTest {
     private TransportTest() {}
 
@@ -14,45 +14,44 @@ public final class TransportTest {
     }
 
     public static void run(Suite suite) {
-        suite.test("transport: auto falls back to the default socket", () -> {
-            final DriverTest.FakeBackend socketBackend = new DriverTest.FakeBackend();
-            final String[] seenPath = {null};
+        suite.test("transport: auto falls back to the default tcp endpoint", () -> {
+            final DriverTest.FakeBackend tcpBackend = new DriverTest.FakeBackend();
+            final String[] seenEndpoint = {"unset"};
             AutoTransport transport = new AutoTransport(
                     binderFailure(Exit.UNAVAILABLE,
                             "jdspd is not running (service jdsp.service not found)"),
-                    new AutoTransport.SocketOpener() {
+                    new AutoTransport.TcpOpener() {
                         @Override
-                        public Backend open(String path) {
-                            seenPath[0] = path;
-                            return socketBackend;
+                        public Backend open(String endpoint) {
+                            seenEndpoint[0] = endpoint;
+                            return tcpBackend;
                         }
                     });
-            Backend backend = transport.open(null);
-            Assert.eq(socketBackend, backend);
-            Assert.eq(TransportFactory.DEFAULT_SOCKET_PATH, seenPath[0]);
+            Backend backend = transport.open(null, false);
+            Assert.eq(tcpBackend, backend);
+            Assert.eq(null, seenEndpoint[0]);
         });
 
-        suite.test("transport: both transports missing reports both in exit 2", () -> {
+        suite.test("transport: both channels missing reports both in exit 2", () -> {
             AutoTransport transport = new AutoTransport(
                     binderFailure(Exit.UNAVAILABLE,
                             "jdspd is not running (service jdsp.service not found)"),
-                    new AutoTransport.SocketOpener() {
+                    new AutoTransport.TcpOpener() {
                         @Override
-                        public Backend open(String path) throws CliException {
+                        public Backend open(String endpoint) throws CliException {
                             throw new CliException(Exit.UNAVAILABLE,
-                                    "socket " + path + " unavailable: No such file or directory");
+                                    "tcp endpoint files missing (/data/data/james.dsp/files/jdsp.{port,token})");
                         }
                     });
-            CliException error = Assert.cliCode(Exit.UNAVAILABLE, () -> transport.open(null));
+            CliException error = Assert.cliCode(Exit.UNAVAILABLE,
+                    () -> transport.open(null, false));
             Assert.contains(error.getMessage(), "jdsp.service");
-            Assert.contains(error.getMessage(), "socket " + TransportFactory.DEFAULT_SOCKET_PATH
-                    + " unavailable");
-            Assert.contains(error.getMessage(), "No such file or directory");
+            Assert.contains(error.getMessage(), "tcp endpoint files missing");
         });
 
-        suite.test("transport: --socket path bypasses the binder", () -> {
+        suite.test("transport: force tcp bypasses the binder", () -> {
             final boolean[] binderCalled = {false};
-            final String[] seenPath = {null};
+            final String[] seenEndpoint = {"unset"};
             AutoTransport transport = new AutoTransport(
                     new AutoTransport.BinderOpener() {
                         @Override
@@ -61,96 +60,97 @@ public final class TransportTest {
                             return new DriverTest.FakeBackend();
                         }
                     },
-                    new AutoTransport.SocketOpener() {
+                    new AutoTransport.TcpOpener() {
                         @Override
-                        public Backend open(String path) {
-                            seenPath[0] = path;
+                        public Backend open(String endpoint) {
+                            seenEndpoint[0] = endpoint;
                             return new DriverTest.FakeBackend();
                         }
                     });
-            transport.open("/tmp/custom.sock");
-            Assert.isTrue(!binderCalled[0], "binder must not be touched when --socket is given");
-            Assert.eq("/tmp/custom.sock", seenPath[0]);
+            transport.open("127.0.0.1:4321", true);
+            Assert.isTrue(!binderCalled[0], "binder must not be touched with --tcp");
+            Assert.eq("127.0.0.1:4321", seenEndpoint[0]);
         });
 
         suite.test("transport: non-unavailable binder error propagates", () -> {
-            final boolean[] socketCalled = {false};
+            final boolean[] tcpCalled = {false};
             AutoTransport transport = new AutoTransport(
                     binderFailure(Exit.FAIL, "boom"),
-                    new AutoTransport.SocketOpener() {
+                    new AutoTransport.TcpOpener() {
                         @Override
-                        public Backend open(String path) {
-                            socketCalled[0] = true;
+                        public Backend open(String endpoint) {
+                            tcpCalled[0] = true;
                             return new DriverTest.FakeBackend();
                         }
                     });
-            Assert.cliCode(Exit.FAIL, () -> transport.open(null));
-            Assert.isTrue(!socketCalled[0], "socket must not be tried after a non-unavailable error");
+            Assert.cliCode(Exit.FAIL, () -> transport.open(null, false));
+            Assert.isTrue(!tcpCalled[0], "tcp must not be tried after a non-unavailable error");
         });
 
-        suite.test("transport: socket error propagates when it is not unavailable", () -> {
+        suite.test("transport: tcp error propagates when it is not unavailable", () -> {
             AutoTransport transport = new AutoTransport(
                     binderFailure(Exit.UNAVAILABLE,
                             "jdspd is not running (service jdsp.service not found)"),
-                    new AutoTransport.SocketOpener() {
+                    new AutoTransport.TcpOpener() {
                         @Override
-                        public Backend open(String path) throws CliException {
-                            throw new CliException(Exit.USAGE, "bad socket path");
+                        public Backend open(String endpoint) throws CliException {
+                            throw new CliException(Exit.USAGE, "bad tcp endpoint");
                         }
                     });
-            Assert.cliCode(Exit.USAGE, () -> transport.open(null));
+            Assert.cliCode(Exit.USAGE, () -> transport.open(null, false));
         });
 
-        suite.test("transport: cli --socket forces the default socket", () -> {
+        suite.test("transport: cli --tcp forces the default endpoint", () -> {
             final boolean[] binderCalled = {false};
-            final String[] seenPath = {null};
+            final String[] seenEndpoint = {"unset"};
             AutoTransport transport = new AutoTransport(
                     new AutoTransport.BinderOpener() {
                         @Override
                         public Backend open() {
                             binderCalled[0] = true;
-                            throw new AssertionError("binder must not be used with --socket");
+                            throw new AssertionError("binder must not be used with --tcp");
                         }
                     },
-                    new AutoTransport.SocketOpener() {
+                    new AutoTransport.TcpOpener() {
                         @Override
-                        public Backend open(String path) {
-                            seenPath[0] = path;
+                        public Backend open(String endpoint) {
+                            seenEndpoint[0] = endpoint;
                             return new DriverTest.FakeBackend();
                         }
                     });
-            DriverTest.Result result = DriverTest.run(transport, "--socket", "ping");
+            DriverTest.Result result = DriverTest.run(transport, "--tcp", "ping");
             Assert.eq(Exit.OK, result.code);
-            Assert.isTrue(!binderCalled[0], "binder must not be used with --socket");
-            Assert.eq(TransportFactory.DEFAULT_SOCKET_PATH, seenPath[0]);
+            Assert.isTrue(!binderCalled[0], "binder must not be used with --tcp");
+            Assert.eq(null, seenEndpoint[0]);
         });
 
-        suite.test("transport: cli --socket=/path passes the path", () -> {
-            final String[] seenPath = {null};
+        suite.test("transport: cli --tcp=host:port passes the endpoint", () -> {
+            final String[] seenEndpoint = {"unset"};
             AutoTransport transport = new AutoTransport(
                     binderFailure(Exit.UNAVAILABLE, "unused"),
-                    new AutoTransport.SocketOpener() {
+                    new AutoTransport.TcpOpener() {
                         @Override
-                        public Backend open(String path) {
-                            seenPath[0] = path;
+                        public Backend open(String endpoint) {
+                            seenEndpoint[0] = endpoint;
                             return new DriverTest.FakeBackend();
                         }
                     });
-            DriverTest.Result result = DriverTest.run(transport, "--socket=/tmp/custom.sock", "version");
+            DriverTest.Result result = DriverTest.run(transport,
+                    "--tcp=127.0.0.1:4321", "version");
             Assert.eq(Exit.OK, result.code);
-            Assert.eq("/tmp/custom.sock", seenPath[0]);
+            Assert.eq("127.0.0.1:4321", seenEndpoint[0]);
         });
 
         suite.test("transport: cli auto fallback serves a command", () -> {
-            DriverTest.FakeBackend socketBackend = new DriverTest.FakeBackend();
-            socketBackend.sessions.add(DriverTest.sampleRow());
+            DriverTest.FakeBackend tcpBackend = new DriverTest.FakeBackend();
+            tcpBackend.sessions.add(DriverTest.sampleRow());
             AutoTransport transport = new AutoTransport(
                     binderFailure(Exit.UNAVAILABLE,
                             "jdspd is not running (service jdsp.service not found)"),
-                    new AutoTransport.SocketOpener() {
+                    new AutoTransport.TcpOpener() {
                         @Override
-                        public Backend open(String path) {
-                            return socketBackend;
+                        public Backend open(String endpoint) {
+                            return tcpBackend;
                         }
                     });
             DriverTest.Result result = DriverTest.run(transport, "sessions");
@@ -158,15 +158,15 @@ public final class TransportTest {
             Assert.contains(result.out, "com.google.uid.shared");
         });
 
-        suite.test("transport: cli reports exit 2 when both are missing", () -> {
+        suite.test("transport: cli reports exit 2 when both channels are missing", () -> {
             AutoTransport transport = new AutoTransport(
                     binderFailure(Exit.UNAVAILABLE,
                             "jdspd is not running (service jdsp.service not found)"),
-                    new AutoTransport.SocketOpener() {
+                    new AutoTransport.TcpOpener() {
                         @Override
-                        public Backend open(String path) throws CliException {
+                        public Backend open(String endpoint) throws CliException {
                             throw new CliException(Exit.UNAVAILABLE,
-                                    "socket " + path + " unavailable: Connection refused");
+                                    "tcp endpoint unreachable (127.0.0.1:1234: Connection refused)");
                         }
                     });
             DriverTest.Result result = DriverTest.run(transport, "sessions");

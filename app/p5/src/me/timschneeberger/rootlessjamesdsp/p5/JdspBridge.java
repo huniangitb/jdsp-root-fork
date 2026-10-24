@@ -270,7 +270,7 @@ public final class JdspBridge {
             }
             chosen = null;
         } else if (forced == null) {
-            for (String kind : new String[] { "socket", "binder", "shell" }) {
+            for (String kind : new String[] { "tcp", "socket", "binder", "shell" }) {
                 JdspTransport candidate = create(kind);
                 if (candidate == null) continue;
                 if (candidate.connect()) { chosen = candidate; break; }
@@ -292,6 +292,18 @@ public final class JdspBridge {
     }
 
     private static JdspTransport create(String kind) {
+        if ("tcp".equals(kind)) {
+            Context ctx = appContext;
+            if (ctx == null) ctx = currentApplication();
+            if (ctx == null) return null;
+            appContext = ctx;
+            File dir = ctx.getFilesDir();
+            if (dir == null) return null;
+            int port = readInt(new File(dir, "jdsp.port"), 0);
+            String token = readLine(new File(dir, "jdsp.token"));
+            if (port <= 0 || token.isEmpty()) return null;
+            return new TcpTransport("127.0.0.1", port, token);
+        }
         if ("socket".equals(kind)) {
             String path = socketPathOverride;
             if (path == null) path = resolveSocketPath();
@@ -313,6 +325,28 @@ public final class JdspBridge {
             if (dir != null) return new File(dir, "jdsp.sock").getAbsolutePath();
         }
         return null;
+    }
+
+    /** 读取 jdspd 写下的端口/token 文件（不存在或读不到返回默认值）。 */
+    private static int readInt(File file, int def) {
+        try {
+            return Integer.parseInt(readLine(file).trim());
+        } catch (Throwable t) {
+            return def;
+        }
+    }
+
+    private static String readLine(File file) {
+        java.io.BufferedReader reader = null;
+        try {
+            reader = new java.io.BufferedReader(new java.io.FileReader(file));
+            String line = reader.readLine();
+            return line == null ? "" : line.trim();
+        } catch (Throwable t) {
+            return "";
+        } finally {
+            if (reader != null) { try { reader.close(); } catch (Throwable ignored) {} }
+        }
     }
 
     private static Context currentApplication() {
