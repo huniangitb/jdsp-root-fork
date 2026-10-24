@@ -1,3 +1,14 @@
+### v6.9.1-fork
+
+* 引擎新增全局开关参数 SET_PARAM cmd=400（int16，1=开 0=关）：走普通参数通道，
+  因此会被状态模块记录并在重启后重放，解决“框架每个会话都自动 ENABLE 导致关不掉”的问题。
+* 工具 tools/JdspMaster.java：JdspMaster <0|1> [sessionId]，用反射调用隐藏的 setParameter。
+
+### 已知：AAudio / OpenSL ES 覆盖依赖 CORD v0.6 的 policy 补丁
+
+必须把 policy 里的 FAST / RAW / COMPRESS_OFFLOAD 输出标志替换成 NONE（CORD v0.6 的 .aml.sh 做法）。
+实测四项全部生效：AudioTrack、OpenSL ES、AAudio normal、AAudio low-latency。
+
 ### v6.9.0-fork
 
 * 引擎：EFFECT_CMD_DISABLE 现在真正直通（按采样格式 memcpy 输入到输出）。
