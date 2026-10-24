@@ -1,0 +1,2184 @@
+diff -ruN '--exclude=*.o' src-baseline/Main/libjamesdsp/jni/jamesdsp/Android.mk src/Main/libjamesdsp/jni/jamesdsp/Android.mk
+--- src-baseline/Main/libjamesdsp/jni/jamesdsp/Android.mk	2026-10-06 06:41:18.000000000 +0800
++++ src/Main/libjamesdsp/jni/jamesdsp/Android.mk	2026-10-24 12:38:17.085133400 +0800
+@@ -1,3 +1,7 @@
++# NOTE: the authoritative build used for the packaged libjamesdsp.so is
++#       ../../../build/build.sh (it keeps the full symbol surface the shipped
++#       library exports).  This makefile works too but builds with
++#       -fvisibility=hidden, i.e. it exports only the effect entry point AELI.
+ LOCAL_PATH := $(call my-dir)
+ include $(CLEAR_VARS)
+ LOCAL_MODULE := libjamesdsp
+@@ -88,21 +92,29 @@
+ 	jdsp/binaryBlobs.c \
+ 	jdsp/jdspController.c \
+ 	peq_loudness.c \
++	jdsp_state.c \
+ 	jamesdsp.c \
++	jdsp/Effects/harmonicExpander.c \
++	jdsp/Effects/nosR2R.c \
++	jdsp/Effects/subHarmonicExpander.c \
+ # terminator
++# clang 20 (NDK r27+) errors on constructs that older clang only warned about
++LOCAL_CFLAGS += -Wno-incompatible-function-pointer-types -Wno-incompatible-pointer-types \
++	-Wno-error=incompatible-pointer-types -Wno-int-conversion -Wno-error=int-conversion
+ LOCAL_LDLIBS := -llog
+ ifeq ($(TARGET_ARCH_ABI), armeabi-v7a)
+-LOCAL_CPPFLAGS += -Wall -Wextra -ffunction-sections -fdata-sections -Ofast -march=armv7-a -mfpu=neon -ftree-vectorize -fvisibility=hidden -DJAMESDSP_REFERENCE_IMPL #-DDEBUG -g
+-LOCAL_CFLAGS += -Wall -Wextra -ffunction-sections -fdata-sections -Ofast -march=armv7-a -mfpu=neon -ftree-vectorize -fvisibility=hidden -DJAMESDSP_REFERENCE_IMPL #-DDEBUG -g
++LOCAL_CPPFLAGS += -Wall -Wextra -ffunction-sections -fdata-sections -O3 -ffast-math -march=armv7-a -mfpu=neon -ftree-vectorize -fvisibility=hidden -DJAMESDSP_REFERENCE_IMPL #-DDEBUG -g
++LOCAL_CFLAGS += -Wall -Wextra -ffunction-sections -fdata-sections -O3 -ffast-math -march=armv7-a -mfpu=neon -ftree-vectorize -fvisibility=hidden -DJAMESDSP_REFERENCE_IMPL #-DDEBUG -g
+ else ifeq ($(TARGET_ARCH_ABI), arm64-v8a)
+-LOCAL_CPPFLAGS += -Wall -Wextra -ffunction-sections -fdata-sections -Ofast -march=armv8-a -mfpu=neon -ftree-vectorize -fvisibility=hidden -DJAMESDSP_REFERENCE_IMPL #-DDEBUG -g
+-LOCAL_CFLAGS += -Wall -Wextra -ffunction-sections -fdata-sections -Ofast -march=armv8-a -mfpu=neon -ftree-vectorize -fvisibility=hidden -DJAMESDSP_REFERENCE_IMPL #-DDEBUG -g
++# AArch64 has no -mfpu option (NDK r30 rejects it); -march=armv8-a includes NEON
++LOCAL_CPPFLAGS += -Wall -Wextra -ffunction-sections -fdata-sections -O3 -ffast-math -march=armv8-a -ftree-vectorize -fvisibility=hidden -DJAMESDSP_REFERENCE_IMPL #-DDEBUG -g
++LOCAL_CFLAGS += -Wall -Wextra -ffunction-sections -fdata-sections -O3 -ffast-math -march=armv8-a -ftree-vectorize -fvisibility=hidden -DJAMESDSP_REFERENCE_IMPL #-DDEBUG -g
+ else ifeq ($(TARGET_ARCH_ABI), x86)
+-LOCAL_CPPFLAGS += -ffunction-sections -fdata-sections -Ofast -ftree-vectorize -fvisibility=hidden -DJAMESDSP_REFERENCE_IMPL #-DDEBUG -g
+-LOCAL_CFLAGS += -ffunction-sections -fdata-sections -Ofast -ftree-vectorize -fvisibility=hidden -DJAMESDSP_REFERENCE_IMPL #-DDEBUG -g
++LOCAL_CPPFLAGS += -ffunction-sections -fdata-sections -O3 -ffast-math -ftree-vectorize -fvisibility=hidden -DJAMESDSP_REFERENCE_IMPL #-DDEBUG -g
++LOCAL_CFLAGS += -ffunction-sections -fdata-sections -O3 -ffast-math -ftree-vectorize -fvisibility=hidden -DJAMESDSP_REFERENCE_IMPL #-DDEBUG -g
+ else ifeq ($(TARGET_ARCH_ABI), armeabi)
+-LOCAL_CPPFLAGS += -ffunction-sections -fdata-sections -Ofast -ftree-vectorize -fvisibility=hidden -DJAMESDSP_REFERENCE_IMPL #-DDEBUG -g
+-LOCAL_CFLAGS += -ffunction-sections -fdata-sections -Ofast -ftree-vectorize -fvisibility=hidden -DJAMESDSP_REFERENCE_IMPL #-DDEBUG -g
++LOCAL_CPPFLAGS += -ffunction-sections -fdata-sections -O3 -ffast-math -ftree-vectorize -fvisibility=hidden -DJAMESDSP_REFERENCE_IMPL #-DDEBUG -g
++LOCAL_CFLAGS += -ffunction-sections -fdata-sections -O3 -ffast-math -ftree-vectorize -fvisibility=hidden -DJAMESDSP_REFERENCE_IMPL #-DDEBUG -g
+ endif
+ LOCAL_LDFLAGS += -Wl,--gc-sections,--exclude-libs,ALL
+ include $(BUILD_SHARED_LIBRARY)
+\ 文件末尾没有换行符
+diff -ruN '--exclude=*.o' src-baseline/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c src/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c
+--- src-baseline/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c	2026-10-24 12:37:42.242653696 +0800
++++ src/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c	2026-10-24 15:03:01.721426369 +0800
+@@ -13,6 +13,7 @@
+ // Effect section
+ #include "jdsp/jdsp_header.h"
+ #include "peq_loudness.h"
++#include "jdsp_state.h"
+ typedef struct
+ {
+ 	unsigned long long initializeForFirst;
+@@ -34,6 +35,14 @@
+ 	// PEQ and loudness (root version extensions)
+ 	peq_cascade_t peq;
+ 	loudness_t loudness;
++	// Self recorded state persistence (see jdsp_state.c)
++	int stateReplaying;      // non-zero while a recorded sequence is replayed
++	int stateReplayed;       // recorded sequence was applied at least once
++	double stateReplayFs;    // sampling rate used by the last replay
++	int stringEqCapacity;    // bytes allocated for the chunked string buffer
++	int reloadTick;          // render callbacks since the last hot reload check
++	uint64_t stateGen;        // parameter set generation this engine has applied
++	void *retireNext;         // links retired engines while the builder frees them
+ } EffectDSPMain;
+ typedef struct
+ {
+@@ -43,6 +52,26 @@
+ 	int32_t cmd;
+ 	int32_t data;
+ } reply1x4_1x4_t;
++/* --- Persisted DSP state (jdsp_state.c) ----------------------------------- */
++/* jdsp_state.h mirrors these command codes; fail the build if the real enum
++ * ever changes. */
++typedef char jdsp_state_cmd_codes_match[
++	(EFFECT_CMD_ENABLE == JDSP_STATE_CMD_ENABLE &&
++	 EFFECT_CMD_DISABLE == JDSP_STATE_CMD_DISABLE &&
++	 EFFECT_CMD_SET_PARAM == JDSP_STATE_CMD_SET_PARAM) ? 1 : -1];
++int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t cmdSize,
++	void* pCmdData, uint32_t* replySize, void* pReplyData);
++static int32_t jdsp_state_dispatch(void *engine, uint32_t cmdCode, uint32_t cmdSize,
++	const void *cmdData)
++{
++	uint32_t replySize = (uint32_t)sizeof(int32_t);
++	int32_t reply = -1;
++	return EffectDSPMainCommand((EffectDSPMain *)engine, cmdCode, cmdSize, (void *)cmdData,
++		&replySize, &reply);
++}
++/* Note: the persisted state is applied by building a fresh engine (see
++ * jdsp_engine_new() and the builder thread below), never by replaying into the
++ * engine the render thread is currently using. */
+ void EffectDSPMainConstructor(EffectDSPMain *dspmain)
+ {
+ 	dspmain->initializeForFirst = 0;
+@@ -53,6 +82,12 @@
+ 	dspmain->numTime2Send = 0;
+ 	dspmain->samplesInc = 0;
+ 	dspmain->stringIndex = 0;
++	dspmain->stringEqCapacity = 0;
++	dspmain->stateReplaying = 0;
++	dspmain->stateReplayed = 0;
++	dspmain->stateReplayFs = 0.0;
++	dspmain->reloadTick = 0;
++	dspmain->stateGen = 0;
+ 	JamesDSPInit(&dspmain->jdsp, 128, 48000.0f);
+ 	peq_cascade_init(&dspmain->peq);
+ 	loudness_init(&dspmain->loudness);
+@@ -150,6 +185,15 @@
+ #ifdef DEBUG
+ //		LOGI("Memory used: %f Mb", (float)getCurrentRSS() / 1024.0 / 1024.0);
+ #endif
++	if (cmdCode == EFFECT_CMD_INIT)
++	{
++		/* The persisted parameter sequence was already applied to this engine when
++		 * it was constructed (EffectCreate / builder), so INIT has nothing to do. */
++		int32_t *replyData = (int32_t *)pReplyData;
++		if (replyData)
++			*replyData = 0;
++		return 0;
++	}
+ 	if (cmdCode == EFFECT_CMD_SET_CONFIG)
+ 	{
+ 		effect_buffer_access_e mAccessMode;
+@@ -188,11 +232,14 @@
+ 			/* Помечаем loudness для перерасчёта коэффициентов */
+ 			dspmain->loudness.coeffsDirty = true;
+ 			dspmain->loudness.lastComputedVolume = 1e30;
+-			/* PEQ требует полного reconfigure через Kotlin (syncWithPreferences).
+-			 * Сбрасываем bandCount, чтобы избежать работы со старыми
+-			 * коэффициентами до переотправки параметров. */
+-			dspmain->peq.bandCount = 0;
++			/* PEQ needs a full reconfigure at the new rate.  Do not zero bandCount:
++			 * the engine keeps running with the previous coefficients for the few
++			 * milliseconds until the builder publishes a rebuilt engine, which is
++			 * far less audible than a gap in the EQ. */
+ 		}
++		/* The new sampling rate invalidated the PEQ/loudness coefficients.  The
++		 * builder notices that this engine was built for a different rate
++		 * (built_fs) and publishes a replacement built at the new one. */
+ 		*replyData = 0;
+ 		return 0;
+ 	}
+@@ -512,6 +559,14 @@
+ 			else if (cmd == 10004)
+ 			{
+ 				// Load impulse
++				/* Hardening: without a complete chunked transfer there is nothing to
++				 * load (a replayed sequence may be truncated). */
++				if (!dspmain->tempImpulseIncoming || dspmain->impulseLengthActual <= 0)
++				{
++					dspmain->samplesInc = 0;
++					*replyData = 0;
++					return 0;
++				}
+ #ifdef DEBUG
+ 				if (dspmain->samplesInc == dspmain->numTime2Send)
+ 					LOGI("Buffer slices complete, chs: %d, impLen: %d", dspmain->impChannels, dspmain->impulseLengthActual);
+@@ -741,11 +796,24 @@
+ 			{
+ 				int32_t times = ((int32_t *)cep)[4];
+ 				int32_t sizePerBuffer = ((int32_t *)cep)[5];
+-				int stringLength = times * sizePerBuffer;
++				int64_t stringLength = (int64_t)times * (int64_t)sizePerBuffer;
++				/* Hardening: a corrupt or replayed transfer must not be able to request a
++				 * huge/negative buffer, a repeated allocation must not leak the previous
++				 * buffer, and the 256 byte chunk writes must stay inside the allocation. */
++				if (times <= 0 || sizePerBuffer <= 0 || stringLength <= 0 ||
++					stringLength > 4 * 1024 * 1024)
++				{
++					*replyData = 0;
++					return 0;
++				}
++				int stringCapacity = (int)((stringLength + 255) & ~(int64_t)255);
+ #ifdef DEBUG
+-				LOGI("Allocate %d string length", stringLength);
++				LOGI("Allocate %d string length", (int)stringLength);
+ #endif
+-				dspmain->stringEq = (char*)calloc(stringLength, sizeof(char));
++				if (dspmain->stringEq)
++					free(dspmain->stringEq);
++				dspmain->stringEq = (char*)calloc(stringCapacity, sizeof(char));
++				dspmain->stringEqCapacity = dspmain->stringEq ? stringCapacity : 0;
+ 				*replyData = 0;
+ 				return 0;
+ 			}
+@@ -755,12 +823,26 @@
+ 			int32_t cmd = ((int32_t *)cep)[3];
+ 			if (cmd == 9999) // Implemented
+ 			{
+-				dspmain->impChannels = ((int32_t *)cep)[5];
+-				dspmain->impulseLengthActual = ((int32_t *)cep)[4] / dspmain->impChannels;
++				int32_t impulseLength = ((int32_t *)cep)[4];
++				int32_t impChannels = ((int32_t *)cep)[5];
++				int32_t numTime = ((int32_t *)cep)[7];
++				/* Hardening: validate before dividing/allocating, otherwise a corrupt or
++				 * replayed transfer can divide by zero or exhaust memory. */
++				if (impChannels <= 0 || impChannels > 8 || impulseLength <= 0 ||
++					numTime <= 0 || numTime > 1024 ||
++					(int64_t)4096 * impChannels * numTime > 4 * 1024 * 1024)
++				{
++					*replyData = 0;
++					return 0;
++				}
++				dspmain->impChannels = (int16_t)impChannels;
++				dspmain->impulseLengthActual = impulseLength / impChannels;
+ 				float convGaindB = (float)((int32_t *)cep)[6] / 262144.0f;
+ 				if (convGaindB > 50.0f)
+ 					convGaindB = 50.0f;
+-				dspmain->numTime2Send = ((int32_t *)cep)[7];
++				dspmain->numTime2Send = numTime;
++				if (dspmain->tempImpulseIncoming)
++					free(dspmain->tempImpulseIncoming);
+ 				dspmain->tempImpulseIncoming = (float*)calloc(4096 * dspmain->impChannels * dspmain->numTime2Send, sizeof(float));
+ 				*replyData = 0;
+ 				return 0;
+@@ -771,6 +853,14 @@
+ 			int32_t cmd = ((int32_t *)cep)[3];
+ 			if (cmd == 12000) // Implemented
+ 			{
++				/* Hardening: never write into a buffer that was not (or too small)
++				 * allocated, e.g. when a replayed transfer is truncated. */
++				if (!dspmain->tempImpulseIncoming || dspmain->samplesInc < 0 ||
++					dspmain->samplesInc >= dspmain->numTime2Send)
++				{
++					*replyData = 0;
++					return 0;
++				}
+ 				memcpy(dspmain->tempImpulseIncoming + (dspmain->samplesInc++ * 4096), ((float*)cep) + 4, 4096 * sizeof(float));
+ 				*replyData = 0;
+ 				return 0;
+@@ -781,6 +871,14 @@
+ 			int32_t cmd = ((int32_t *)cep)[3];
+ 			if (cmd == 12001) // Implemented
+ 			{
++				/* Hardening: the 8888 allocation must exist and be large enough. */
++				if (!dspmain->stringEq || dspmain->stringEqCapacity <= 0 ||
++					dspmain->stringIndex < 0 ||
++					(dspmain->stringIndex + 1) * 256 > dspmain->stringEqCapacity)
++				{
++					*replyData = 0;
++					return 0;
++				}
+ 				memcpy(dspmain->stringEq + (dspmain->stringIndex++ * 256), ((char*)cep) + 16, 256 * sizeof(char));
+ 				*replyData = 0;
+ 				return 0;
+@@ -1048,6 +1146,10 @@
+ 			}
+ 		}
+ 	}
++	/* Nothing to do about parameter updates here: the builder thread prepares a
++	 * complete replacement engine and generic_process() swaps it in at the start
++	 * of a callback.  This callback therefore never applies parameters and never
++	 * touches the filesystem. */
+ 	return dspmain->mEnable ? 0 : -ENODATA;
+ }
+ // Effect section end
+@@ -1062,6 +1164,8 @@
+ 	"JamesDSP v4.01",
+ 	"James Fung"
+ };
++static void jdsp_builder_stop(void);
++
+ __attribute__((constructor)) static void initialize(void)
+ {
+ 	JamesDSPGlobalMemoryAllocation();
+@@ -1071,27 +1175,292 @@
+ }
+ __attribute__((destructor)) static void destruction(void)
+ {
++	jdsp_builder_stop();
++	jdsp_state_shutdown();
+ 	JamesDSPGlobalMemoryDeallocation();
+ #ifdef DEBUG
+ 	LOGI("Initialization: DLL unloaded");
+ #endif
+ }
+ // Library mandatory methods
++/* One live effect instance.
++ *
++ * The engine object is not mutated in place when the persisted parameters
++ * change: the builder thread (see below) constructs a *complete* second engine,
++ * applies every recorded command to it there, and only then publishes it in
++ * `pending`.  The render thread swaps `cur` for `pending` at a buffer boundary,
++ * which costs a pointer store.  Consequences:
++ *   - the render callback never applies parameters, so a big impulse/EEL upload
++ *     can no longer overrun a buffer;
++ *   - the engine is always in a fully applied state, never half updated;
++ *   - the previous engine is handed to the builder and destroyed there. */
+ struct effect_module_s
+ {
+ 	const struct effect_interface_s *itfe;
+-	EffectDSPMain effect;
++	EffectDSPMain *cur;       /* engine the render thread is using */
++	EffectDSPMain *pending;   /* fully prepared replacement (atomic) */
++	uint64_t cur_gen;         /* store generation cur was built from */
++	float built_fs;           /* sample rate cur was built for */
++	struct effect_module_s *next;
+ 	effect_descriptor_t *descriptor;
++	/* Crossfade scratch: on a swap the previous engine renders one buffer here so
++	 * the two engines can be mixed, which hides the filter/convolver history
++	 * reset.  Allocated once per instance, never on the render path. */
++	void *xscratch;
++	size_t xscratch_bytes;
+ };
++
++#define JDSP_XFADE_MAX_FRAMES 8192
++
++/* Engines retired by the render thread, destroyed by the builder.  The list is
++ * guarded by a plain mutex that is only ever held for a push or a splice, so a
++ * render thread can never wait on engine teardown. */
++static pthread_mutex_t g_retire_lock = PTHREAD_MUTEX_INITIALIZER;
++static EffectDSPMain *g_retired;
++
++/* Live instances, guarded by g_inst_lock.  The builder holds it while it builds,
++ * which is what keeps EffectRelease from freeing an instance mid-build. */
++static pthread_mutex_t g_inst_lock = PTHREAD_MUTEX_INITIALIZER;
++static struct effect_module_s *g_insts;
++static pthread_t g_builder_tid;
++static int g_builder_started;
++static int g_builder_stop;
++static uint64_t g_last_gen; /* last generation seen, for burst debouncing */
++
++static EffectDSPMain *jdsp_engine_new(const EffectDSPMain *like)
++{
++	EffectDSPMain *eng = (EffectDSPMain *)calloc(1, sizeof(*eng));
++	if (eng == NULL)
++		return NULL;
++	EffectDSPMainConstructor(eng);
++	/* Inherit the stream format the instance is currently running at, so the
++	 * recorded commands are applied with the right sample rate (PEQ/loudness
++	 * coefficients depend on it). */
++	if (like != NULL)
++	{
++		eng->mSamplingRate = like->mSamplingRate;
++		eng->formatFloatModeInt32Mode = like->formatFloatModeInt32Mode;
++		if (like->mSamplingRate > 0.0f)
++			JamesDSPSetSampleRate(&eng->jdsp, like->mSamplingRate, 0);
++	}
++	return eng;
++}
++
++static void jdsp_engine_free(EffectDSPMain *eng)
++{
++	if (eng == NULL)
++		return;
++	EffectDSPMainDestructor(eng);
++	free(eng);
++}
++
++/* Hand an engine that the render thread just replaced over to the builder.  The
++ * critical section is two pointer stores, so the audio thread can never wait on
++ * engine teardown (which happens outside the lock). */
++static void jdsp_retire_push(EffectDSPMain *eng)
++{
++	pthread_mutex_lock(&g_retire_lock);
++	eng->retireNext = g_retired;
++	g_retired = eng;
++	pthread_mutex_unlock(&g_retire_lock);
++}
++
++static void *jdsp_builder_thread(void *arg)
++{
++	(void)arg;
++	for (;;)
++	{
++		struct effect_module_s *inst;
++		EffectDSPMain *dead;
++		uint64_t gen;
++		int stop;
++
++		/* 20 ms: the poll itself is one atomic load, and the render thread only
++		 * swaps when a fully built engine shows up, so this interval bounds the
++		 * latency without ever touching audio timing. */
++		usleep(20000);
++
++		pthread_mutex_lock(&g_inst_lock);
++		stop = g_builder_stop;
++		pthread_mutex_unlock(&g_inst_lock);
++		if (stop)
++			break;
++
++		/* Destroy retired engines outside every lock. */
++		pthread_mutex_lock(&g_retire_lock);
++		dead = g_retired;
++		g_retired = NULL;
++		pthread_mutex_unlock(&g_retire_lock);
++		while (dead != NULL)
++		{
++			EffectDSPMain *next = (EffectDSPMain *)dead->retireNext;
++			jdsp_engine_free(dead);
++			dead = next;
++		}
++
++		gen = jdsp_state_generation();
++		/* Debounce: an App start pushes ~30 parameters in a burst, each of which
++		 * bumps the generation.  Rebuilding once per burst instead of once per
++		 * parameter keeps this thread cheap; the extra tick costs 20 ms. */
++		if (gen != g_last_gen)
++		{
++			g_last_gen = gen;
++			continue;
++		}
++
++		pthread_mutex_lock(&g_inst_lock);
++		for (inst = g_insts; inst != NULL; inst = inst->next)
++		{
++			EffectDSPMain *fresh;
++			int stale;
++
++			if (__atomic_load_n(&inst->pending, __ATOMIC_ACQUIRE) != NULL)
++				continue; /* the render thread has not picked the last one up yet */
++
++			stale = (inst->cur_gen != gen) ||
++			        (inst->cur != NULL && inst->cur->mSamplingRate != inst->built_fs);
++			if (!stale)
++				continue;
++
++			fresh = jdsp_engine_new(inst->cur);
++			if (fresh == NULL)
++				continue;
++			/* Full apply, on this thread: the render callback never sees a
++			 * partially configured engine. */
++			jdsp_state_replay(fresh, jdsp_state_dispatch);
++			inst->built_fs = fresh->mSamplingRate;
++			inst->cur_gen = gen;
++			__atomic_store_n(&inst->pending, fresh, __ATOMIC_RELEASE);
++		}
++		pthread_mutex_unlock(&g_inst_lock);
++	}
++	return NULL;
++}
++
++static void jdsp_builder_start(void)
++{
++	pthread_t tid;
++	if (g_builder_started)
++		return;
++	if (pthread_create(&tid, NULL, jdsp_builder_thread, NULL) != 0)
++		return;
++	g_builder_tid = tid;
++	g_builder_started = 1;
++}
++
++static void jdsp_builder_stop(void)
++{
++	if (!g_builder_started)
++		return;
++	g_builder_stop = 1;
++	(void)pthread_join(g_builder_tid, NULL);
++	g_builder_started = 0;
++}
++/* Linear crossfade from the previous engine's output (src) to the new engine's
++ * output (dst), over exactly one buffer.  Both buffers use the instance's current
++ * sample format.  Unknown/unsupported formats keep the new output unchanged. */
++static void jdsp_crossfade(audio_buffer_t *dst, const audio_buffer_t *src, size_t frames,
++                           int mode)
++{
++	size_t total = frames * 2u;
++	size_t i;
++	if (frames == 0u)
++		return;
++	switch (mode)
++	{
++	case 0: /* int16 */
++		for (i = 0; i < total; i++)
++		{
++			float t = (float)i / (float)(total - 1u ? total - 1u : 1u);
++			dst->s16[i] = (int16_t)((float)src->s16[i] * (1.0f - t) + (float)dst->s16[i] * t);
++		}
++		break;
++	case 1: /* float */
++		for (i = 0; i < total; i++)
++		{
++			float t = (float)i / (float)(total - 1u ? total - 1u : 1u);
++			dst->f32[i] = src->f32[i] * (1.0f - t) + dst->f32[i] * t;
++		}
++		break;
++	case 2: /* int32 */
++	case 4: /* int8_24 */
++		for (i = 0; i < total; i++)
++		{
++			float t = (float)i / (float)(total - 1u ? total - 1u : 1u);
++			dst->s32[i] = (int32_t)((float)src->s32[i] * (1.0f - t) + (float)dst->s32[i] * t);
++		}
++		break;
++	default:
++		break; /* packed 24 bit: leave the new output as is */
++	}
++}
++
+ static int32_t generic_process(effect_handle_t self, audio_buffer_t *in, audio_buffer_t *out)
+ {
+ 	struct effect_module_s *e = (struct effect_module_s *) self;
+-	return EffectDSPMainProcess(&e->effect, in, out);
++	EffectDSPMain *fresh = __atomic_exchange_n(&e->pending, NULL, __ATOMIC_ACQUIRE);
++	if (fresh != NULL)
++	{
++		/* The builder finished a complete engine: switch to it here, at a buffer
++		 * boundary.  The previous engine renders this one buffer into the scratch
++		 * buffer so the two can be crossfaded, which hides the fact that the new
++		 * engine starts with empty filter/convolver history.  Everything after
++		 * this buffer uses only the new engine, and the old one is destroyed on
++		 * the builder thread. */
++		EffectDSPMain *old = e->cur;
++		size_t frames = in->frameCount;
++		int mode = fresh->formatFloatModeInt32Mode;
++		size_t need = frames * 2u * sizeof(int32_t);
++
++		e->cur = fresh;
++		if (old != NULL && frames > 0u && need <= e->xscratch_bytes)
++		{
++			audio_buffer_t scratch = *in;
++			int32_t rc_new;
++
++			scratch.raw = e->xscratch;
++			scratch.frameCount = frames;
++			(void)EffectDSPMainProcess(old, in, &scratch);
++			rc_new = EffectDSPMainProcess(fresh, in, out);
++			jdsp_crossfade(out, &scratch, frames, mode);
++			jdsp_retire_push(old);
++			return rc_new;
++		}
++		if (old != NULL)
++			jdsp_retire_push(old);
++	}
++	return EffectDSPMainProcess(e->cur, in, out);
+ }
+ static int32_t generic_command(effect_handle_t self, uint32_t cmdCode, uint32_t cmdSize, void *pCmdData, uint32_t *replySize, void *pReplyData)
+ {
+ 	struct effect_module_s *e = (struct effect_module_s *) self;
+-	return EffectDSPMainCommand(&e->effect, cmdCode, cmdSize, pCmdData, replySize, pReplyData);
++	int32_t ret = EffectDSPMainCommand(e->cur, cmdCode, cmdSize, pCmdData, replySize, pReplyData);
++	/* Persist every state changing command that the engine accepted. Recording is
++	 * disabled while a recorded sequence is being replayed, otherwise a replay
++	 * would duplicate its own records. */
++	if (ret == 0 && !e->cur->stateReplaying)
++	{
++		if (cmdCode == EFFECT_CMD_SET_PARAM)
++		{
++			/* A parameter was applied only when the engine reported status 0. */
++			if (pReplyData != NULL && cmdSize >= sizeof(effect_param_t) &&
++				*(const int32_t *)pReplyData == 0)
++			{
++				jdsp_state_record(cmdCode, cmdSize, pCmdData);
++				/* This instance applied it to its own engine already: mark the
++				 * generation as current so the builder does not rebuild it for a
++				 * change it has just made itself.  Other instances still see the
++				 * new generation and get a rebuilt engine. */
++				e->cur_gen = jdsp_state_generation();
++			}
++		}
++		else if (cmdCode == EFFECT_CMD_ENABLE || cmdCode == EFFECT_CMD_DISABLE)
++		{
++			jdsp_state_record(cmdCode, 0, NULL);
++			e->cur_gen = jdsp_state_generation();
++		}
++	}
++	return ret;
+ }
+ static int32_t generic_getDescriptor(effect_handle_t self, effect_descriptor_t *pDescriptor)
+ {
+@@ -1111,11 +1480,36 @@
+ 	(void)uuid;
+ 	(void)ioId;
+ 	struct effect_module_s *e = (struct effect_module_s *) calloc(1, sizeof(struct effect_module_s));
++	if (e == NULL)
++		return -ENOMEM;
+ 	e->itfe = &generic_interface;
+ #ifdef DEBUG
+ 	LOGI("JamesDSP: Creating effect with %d sessionId", sessionId);
+ #endif
+-	EffectDSPMainConstructor(&e->effect);
++	/* Build the first engine with the persisted state already applied.  This runs
++	 * on the creating thread (never the render thread), and the instance is not
++	 * published to the builder until it is complete. */
++	e->cur = jdsp_engine_new(NULL);
++	if (e->cur == NULL)
++	{
++		free(e);
++		return -ENOMEM;
++	}
++	jdsp_state_replay(e->cur, jdsp_state_dispatch);
++	e->cur_gen = jdsp_state_generation();
++	e->built_fs = e->cur->mSamplingRate;
++	/* One buffer of stereo int32 is enough for every supported format. */
++	e->xscratch_bytes = (size_t)JDSP_XFADE_MAX_FRAMES * 2u * sizeof(int32_t);
++	e->xscratch = malloc(e->xscratch_bytes);
++	if (e->xscratch == NULL)
++		e->xscratch_bytes = 0; /* swaps still work, just without the crossfade */
++
++	pthread_mutex_lock(&g_inst_lock);
++	e->next = g_insts;
++	g_insts = e;
++	pthread_mutex_unlock(&g_inst_lock);
++	jdsp_builder_start();
++
+ 	e->descriptor = &jamesdsp_descriptor;
+ 	*pEffect = (effect_handle_t)e;
+ #ifdef DEBUG
+@@ -1126,8 +1520,30 @@
+ int32_t EffectRelease(effect_handle_t ei)
+ {
+ 	struct effect_module_s *e = (struct effect_module_s *) ei;
+-	EffectDSPMainDestructor(&e->effect);
++	struct effect_module_s **link;
++	EffectDSPMain *pending;
++	int swapped;
++
++	/* Unlink first: g_inst_lock also excludes the builder, so no build can be in
++	 * flight for this instance once the lock is released. */
++	pthread_mutex_lock(&g_inst_lock);
++	for (link = &g_insts; *link != NULL; link = &(*link)->next)
++	{
++		if (*link == e)
++		{
++			*link = e->next;
++			break;
++		}
++	}
++	pthread_mutex_unlock(&g_inst_lock);
++
++	pending = __atomic_exchange_n(&e->pending, NULL, __ATOMIC_ACQUIRE);
++	jdsp_engine_free(pending);
++	jdsp_engine_free(e->cur);
++	e->cur = NULL;
++	free(e->xscratch);
+ 	free(e);
++	(void)swapped;
+ 	return 0;
+ }
+ int32_t EffectGetDescriptor(const effect_uuid_t *uuid, effect_descriptor_t *pDescriptor)
+diff -ruN '--exclude=*.o' src-baseline/Main/libjamesdsp/jni/jamesdsp/jdsp_state.c src/Main/libjamesdsp/jni/jamesdsp/jdsp_state.c
+--- src-baseline/Main/libjamesdsp/jni/jamesdsp/jdsp_state.c	1970-01-01 08:00:00.000000000 +0800
++++ src/Main/libjamesdsp/jni/jamesdsp/jdsp_state.c	2026-10-24 15:03:41.013440381 +0800
+@@ -0,0 +1,1387 @@
++/*
++ * jdsp_state.c - persistent DSP state for the JamesDSP effect library.
++ *
++ * Rationale: audioserver instantiates this effect from audio_effects.xml as a
++ * postprocess device effect.  That instance has no client handle, so the
++ * Android app can never call setParameter() on it.  The library therefore
++ * records every state changing command it successfully applies and replays the
++ * recorded sequence from EFFECT_CMD_INIT (and again whenever the sampling rate
++ * changes, because PEQ/loudness coefficients depend on it).  Result: the user's
++ * last settings keep working even when the app is gone.
++ *
++ * Design constraints:
++ *   - never crash, never block the audio thread: every failure path falls back
++ *     to the compiled in defaults;
++ *   - atomic persistence: the whole file is rewritten to <path>.tmp.<pid>,
++ *     fsync()ed (rate limited) and rename()d over the old file;
++ *   - bounded: per record 1 MiB, per chunked transfer group 2 MiB, 8 MiB total;
++ *   - replay reuses the existing command handler, no second parser.
++ *
++ * See jdsp_state.h for the file format and the environment switches.
++ */
++
++#include "jdsp_state.h"
++
++#include <errno.h>
++#include <fcntl.h>
++#include <poll.h>
++#include <pthread.h>
++#include <stdint.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/inotify.h>
++#include <sys/stat.h>
++#include <sys/types.h>
++#include <time.h>
++#include <unistd.h>
++
++#if JDSP_STATE_ENABLE
++
++/* ------------------------------------------------------------------------- */
++/* logging                                                                   */
++/* ------------------------------------------------------------------------- */
++
++#if defined(__ANDROID__)
++#include <android/log.h>
++#define JDSP_STATE_TAG "JamesDSPState"
++#define STATE_LOGV(...) __android_log_print(ANDROID_LOG_DEBUG, JDSP_STATE_TAG, __VA_ARGS__)
++#define STATE_LOGI(...) __android_log_print(ANDROID_LOG_INFO, JDSP_STATE_TAG, __VA_ARGS__)
++#define STATE_LOGW(...) __android_log_print(ANDROID_LOG_WARN, JDSP_STATE_TAG, __VA_ARGS__)
++#else /* host build: used by the off-device unit test */
++static int state_debug_enabled(void);
++#define STATE_LOGV(...)                                                       \
++    do {                                                                      \
++        if (state_debug_enabled()) {                                          \
++            fprintf(stderr, "[jdsp-state] " __VA_ARGS__);                     \
++            fputc('\n', stderr);                                              \
++        }                                                                     \
++    } while (0)
++#define STATE_LOGI(...) STATE_LOGV(__VA_ARGS__)
++#define STATE_LOGW(...)                                                       \
++    do {                                                                      \
++        fprintf(stderr, "[jdsp-state] WARN: " __VA_ARGS__);                   \
++        fputc('\n', stderr);                                                  \
++    } while (0)
++#endif
++
++/* ------------------------------------------------------------------------- */
++/* tunables                                                                  */
++/* ------------------------------------------------------------------------- */
++
++#define JDSP_STATE_VERSION 1u
++#define JDSP_STATE_HEADER_BYTES 16u
++#define JDSP_STATE_TRAILER_BYTES 4u
++#define JDSP_STATE_MIN_FILE_BYTES (JDSP_STATE_HEADER_BYTES + JDSP_STATE_TRAILER_BYTES)
++
++/* Hard limits.  The file is a cache of user settings, not a database: staying
++ * small keeps the atomic rewrite cheap.  All of them can be overridden at build
++ * time, which the off-device unit test uses to reach the eviction paths. */
++#ifndef JDSP_STATE_MAX_TOTAL_BYTES
++#define JDSP_STATE_MAX_TOTAL_BYTES (8u * 1024u * 1024u)
++#endif
++#ifndef JDSP_STATE_MAX_FILE_BYTES
++#define JDSP_STATE_MAX_FILE_BYTES (JDSP_STATE_MAX_TOTAL_BYTES + (1024u * 1024u))
++#endif
++#ifndef JDSP_STATE_MAX_RECORDS
++#define JDSP_STATE_MAX_RECORDS 8192u
++#endif
++/* A chunked transfer (convolver impulse, EEL/DDC/ArbEQ string) is persisted as
++ * a group; groups larger than this are skipped as a whole so a replay can never
++ * produce a half loaded impulse. */
++#ifndef JDSP_STATE_MAX_GROUP_BYTES
++#define JDSP_STATE_MAX_GROUP_BYTES (2u * 1024u * 1024u)
++#endif
++#define JDSP_STATE_PATH_MAX 512
++#define JDSP_STATE_FSYNC_INTERVAL_MS 500u
++
++#define JDSP_STATE_PCMD_NONE 0xFFFFFFFFu
++#define JDSP_STATE_HASH_BASIS 0xCBF29CE484222325ull
++#define JDSP_STATE_HASH_PRIME 0x100000001B3ull
++
++/* Chunked transfer commands (parameter command codes seen in jamesdsp.c). */
++#define JDSP_PCMD_STRING_ALLOC 8888
++#define JDSP_PCMD_IMPULSE_ALLOC 9999
++#define JDSP_PCMD_IMPULSE_CHUNK 12000
++#define JDSP_PCMD_STRING_CHUNK 12001
++#define JDSP_PCMD_IMPULSE_DONE 10004
++#define JDSP_PCMD_STRING_EQ_DONE 10006
++#define JDSP_PCMD_STRING_DDC_DONE 10009
++#define JDSP_PCMD_STRING_EEL_DONE 10010
++
++/* ------------------------------------------------------------------------- */
++/* internal store                                                            */
++/* ------------------------------------------------------------------------- */
++
++typedef struct {
++    uint32_t cmd;   /* effect command code */
++    uint32_t size;  /* payload bytes (0 for ENABLE/DISABLE) */
++    uint32_t pcmd;  /* SET_PARAM parameter command, else PCMD_NONE */
++    uint64_t hash;  /* FNV-1a over (cmd, size, payload) for cheap dedupe */
++    uint8_t *data;  /* owned payload or NULL */
++} jdsp_state_rec_t;
++
++static pthread_once_t g_once = PTHREAD_ONCE_INIT;
++static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
++
++/* Identity of the state file as we last read or wrote it.  The hot reload path
++ * compares this against a fresh stat() to notice that somebody else (the app, a
++ * CLI tool) replaced the file.  mtime alone is not enough: two rewrites can land
++ * in the same second, and a rename based save keeps the size identical, so the
++ * nanosecond timestamp and the inode are part of the stamp as well. */
++typedef struct {
++    int valid;
++    int64_t size;
++    int64_t mtime_sec;
++    int64_t mtime_nsec;
++    unsigned long inode;
++} state_stamp_t;
++
++static struct {
++    int initialized;
++    int disabled;     /* JDSP_STATE_DISABLE=1 */
++    int readonly;     /* JDSP_STATE_READONLY=1 */
++    int debug;        /* JDSP_STATE_DEBUG=1 */
++    int skip_stream;  /* current chunked transfer is too big to persist */
++    int write_warned;
++    int fsync_warned;
++    char path[JDSP_STATE_PATH_MAX];
++    jdsp_state_rec_t *recs;
++    size_t count;
++    size_t cap;
++    uint64_t bytes;
++    int dirty;
++    uint64_t last_fsync_ms;
++    state_stamp_t stamp; /* identity of the file we last loaded/saved */
++    /* Content generation: bumped whenever the stored parameter set changes,
++     * either by recording a new parameter or by reparsing the file.  The render
++     * path compares it with applied_gen to notice changes that never showed up
++     * as a *file* change because the writer lived in this very process (the HAL
++     * hosts both the postprocess instance and instances created by a CLI/App
++     * through the effects factory). */
++    uint64_t store_gen;
++    /* Where the last store change came from, so the render thread can log the
++     * right message (and not claim "in-process" for a file reload). */
++    int change_source;
++} g = {
++    .initialized = 0,
++    .path = JDSP_STATE_DEFAULT_PATH,
++};
++
++/* JDSP_STATE_SRC_* (last change source) comes from jdsp_state.h. */
++
++/* ------------------------------------------------------------------------- */
++/* file watcher                                                              */
++/* ------------------------------------------------------------------------- */
++/* One inotify instance plus a single poll() loop is enough here: we watch
++ * exactly one directory and one file name, so epoll would add a syscall per
++ * event and buy nothing.  The watcher exists for two reasons:
++ *   - latency: a change is noticed in milliseconds instead of at the next
++ *     render-side poll tick;
++ *   - isolation: the file read + parse happen on this thread, never on the
++ *     audio render thread.
++ * When anything about it fails (no inotify, watch refused, thread creation
++ * refused) the library keeps working exactly as before and the render thread
++ * falls back to stat() polling. */
++static struct {
++    int started;   /* thread was created successfully */
++    int ready;     /* the watch is established: the watcher owns detection */
++    int stop;      /* shutdown requested */
++    int fd;        /* inotify fd, -1 when unavailable */
++    pthread_t tid;
++    char dir[JDSP_STATE_PATH_MAX];
++    char name[JDSP_STATE_PATH_MAX];
++} w = {
++    .started = 0,
++    .ready = 0,
++    .stop = 0,
++    .fd = -1,
++};
++
++static uint32_t g_crc_table[256];
++
++/* ------------------------------------------------------------------------- */
++/* small helpers                                                             */
++/* ------------------------------------------------------------------------- */
++
++static void state_crc32_init(void)
++{
++    uint32_t i;
++    for (i = 0; i < 256; i++) {
++        uint32_t c = i;
++        int k;
++        for (k = 0; k < 8; k++)
++            c = (c & 1u) ? (0xEDB88320u ^ (c >> 1)) : (c >> 1);
++        g_crc_table[i] = c;
++    }
++}
++
++static uint32_t state_crc32(const void *buf, size_t len)
++{
++    const uint8_t *p = (const uint8_t *)buf;
++    uint32_t c = 0xFFFFFFFFu;
++    size_t i;
++    for (i = 0; i < len; i++)
++        c = g_crc_table[(c ^ p[i]) & 0xFFu] ^ (c >> 8);
++    return c ^ 0xFFFFFFFFu;
++}
++
++static void state_put_u32(uint8_t *p, uint32_t v)
++{
++    p[0] = (uint8_t)(v & 0xFFu);
++    p[1] = (uint8_t)((v >> 8) & 0xFFu);
++    p[2] = (uint8_t)((v >> 16) & 0xFFu);
++    p[3] = (uint8_t)((v >> 24) & 0xFFu);
++}
++
++static uint32_t state_get_u32(const uint8_t *p)
++{
++    return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
++           ((uint32_t)p[3] << 24);
++}
++
++static uint64_t state_now_ms(void)
++{
++    struct timespec ts;
++    if (clock_gettime(CLOCK_MONOTONIC, &ts) != 0)
++        return 0;
++    return (uint64_t)ts.tv_sec * 1000ull + (uint64_t)(ts.tv_nsec / 1000000);
++}
++
++static int state_env_flag(const char *name)
++{
++    const char *v = getenv(name);
++    if (v == NULL || v[0] == '\0')
++        return 0;
++    if (strcmp(v, "0") == 0 || strcmp(v, "false") == 0 || strcmp(v, "no") == 0)
++        return 0;
++    return 1;
++}
++
++#if !defined(__ANDROID__)
++static int state_debug_enabled(void)
++{
++    return g.debug;
++}
++#endif
++
++static uint64_t state_hash(uint32_t cmd, uint32_t size, const uint8_t *data)
++{
++    uint64_t h = JDSP_STATE_HASH_BASIS;
++    uint32_t i;
++    for (i = 0; i < 4; i++) {
++        h ^= (uint64_t)((cmd >> (i * 8)) & 0xFFu);
++        h *= JDSP_STATE_HASH_PRIME;
++    }
++    for (i = 0; i < 4; i++) {
++        h ^= (uint64_t)((size >> (i * 8)) & 0xFFu);
++        h *= JDSP_STATE_HASH_PRIME;
++    }
++    for (i = 0; i < size; i++) {
++        h ^= (uint64_t)data[i];
++        h *= JDSP_STATE_HASH_PRIME;
++    }
++    return h;
++}
++
++/* ------------------------------------------------------------------------- */
++/* record validation                                                         */
++/* ------------------------------------------------------------------------- */
++
++/* Returns non-zero when (cmd, size, data) is a shape that the command handler
++ * can consume without reading out of bounds. */
++static int state_record_valid(uint32_t cmd, uint32_t size, const uint8_t *data)
++{
++    if (cmd == JDSP_STATE_CMD_SET_PARAM) {
++        uint32_t psize, vsize, need;
++        if (data == NULL || size < 12u)
++            return 0;
++        psize = state_get_u32(data + 4);
++        vsize = state_get_u32(data + 8);
++        if (psize != 4u || vsize == 0u)
++            return 0;
++        if (vsize > JDSP_STATE_MAX_RECORD_BYTES - 16u)
++            return 0;
++        need = 12u + psize + vsize;
++        if (size != need)
++            return 0;
++        return 1;
++    }
++#if JDSP_STATE_RECORD_ENABLE
++    if (cmd == JDSP_STATE_CMD_ENABLE || cmd == JDSP_STATE_CMD_DISABLE)
++        return size == 0u;
++#else
++    if (cmd == JDSP_STATE_CMD_ENABLE || cmd == JDSP_STATE_CMD_DISABLE)
++        return 0;
++#endif
++    return 0;
++}
++
++static uint32_t state_param_cmd(uint32_t cmd, const uint8_t *data, uint32_t size)
++{
++    if (cmd != JDSP_STATE_CMD_SET_PARAM || data == NULL || size < 16u)
++        return JDSP_STATE_PCMD_NONE;
++    return state_get_u32(data + 12);
++}
++
++/* Commands that replace the whole value of one setting: an identical older
++ * record is redundant, so it can be dropped when the same bytes show up again
++ * (the app re-sends its complete state every time it starts).  Everything not
++ * listed here - in particular the chunked transfers and unknown future
++ * commands - keeps every record, because dropping a duplicate chunk would
++ * corrupt the replayed sequence. */
++static int state_record_dedupable(uint32_t cmd, uint32_t pcmd)
++{
++    if (cmd == JDSP_STATE_CMD_ENABLE || cmd == JDSP_STATE_CMD_DISABLE)
++        return 1;
++    if (cmd != JDSP_STATE_CMD_SET_PARAM)
++        return 0;
++    switch (pcmd) {
++    case 112:   /* bass boost max gain */
++    case 115:   /* compander shape */
++    case 116:   /* multiband equalizer axis */
++    case 128:   /* reverb mode */
++    case 137:   /* stereo enhancement */
++    case 150:   /* vacuum tube drive */
++    case 188:   /* crossfeed mode */
++    case 1200: case 1201: case 1202: case 1203: case 1204: case 1205:
++    case 1206: case 1208: case 1210: case 1212: case 1213: case 1214:
++    case 1215: case 1216: case 1217: case 1218: /* effect enables */
++    case 1300:  /* PEQ cascade */
++    case 1301:  /* loudness config */
++    case 1302:  /* loudness volume */
++    case 1305:  /* harmonic expander */
++    case 1306:  /* sub harmonic expander */
++    case 1307:  /* NOS R2R */
++    case 1500:  /* limiter */
++    case 1150:  /* reserved / unused, kept for symmetry */
++    case 25000: case 25001: case 25002: case 25003: /* app side hashes */
++        return 1;
++    default:
++        return 0;
++    }
++}
++
++static int state_is_stream_chunk(uint32_t pcmd)
++{
++    switch (pcmd) {
++    case JDSP_PCMD_IMPULSE_CHUNK:
++    case JDSP_PCMD_STRING_CHUNK:
++    case JDSP_PCMD_IMPULSE_DONE:
++    case JDSP_PCMD_STRING_EQ_DONE:
++    case JDSP_PCMD_STRING_DDC_DONE:
++    case JDSP_PCMD_STRING_EEL_DONE:
++        return 1;
++    default:
++        return 0;
++    }
++}
++
++/* Expected on-disk size of the chunked transfer started by an ALLOC record.
++ * Returning 0 means "unknown, treat as too big". */
++static uint64_t state_expected_group_bytes(uint32_t pcmd, const uint8_t *data)
++{
++    if (data == NULL)
++        return 0;
++    if (pcmd == JDSP_PCMD_IMPULSE_ALLOC) {
++        /* cmd == 9999: total floats (data+16), channels (data+20),
++         * chunk count (data+28); each chunk record is 8 + 16384 bytes. */
++        uint32_t chunks = state_get_u32(data + 28);
++        if (chunks == 0u || chunks > 65536u)
++            return 0;
++        return (uint64_t)chunks * (8u + 16384u) + 8u + 16u;
++    }
++    if (pcmd == JDSP_PCMD_STRING_ALLOC) {
++        /* cmd == 8888: times (data+16), sizePerBuffer (data+20);
++         * each chunk record is 8 + 256 bytes. */
++        uint32_t times = state_get_u32(data + 16);
++        uint32_t per = state_get_u32(data + 20);
++        uint64_t total = (uint64_t)times * (uint64_t)per;
++        uint64_t chunks;
++        if (times == 0u || per == 0u || total > (4ull * 1024ull * 1024ull))
++            return 0;
++        chunks = (total + 255ull) / 256ull;
++        return chunks * (8u + 256u) + 8u + 8u;
++    }
++    return 0;
++}
++
++/* ------------------------------------------------------------------------- */
++/* in-memory store                                                           */
++/* ------------------------------------------------------------------------- */
++
++static void state_free_records(void)
++{
++    size_t i;
++    for (i = 0; i < g.count; i++)
++        free(g.recs[i].data);
++    free(g.recs);
++    g.recs = NULL;
++    g.count = 0;
++    g.cap = 0;
++    g.bytes = 0;
++    g.dirty = 0;
++    g.skip_stream = 0;
++}
++
++static int state_reserve(size_t need)
++{
++    jdsp_state_rec_t *p;
++    size_t cap;
++    if (need <= g.cap)
++        return 1;
++    cap = g.cap ? g.cap : 32;
++    while (cap < need) {
++        if (cap > (SIZE_MAX / 2))
++            return 0;
++        cap *= 2;
++    }
++    p = (jdsp_state_rec_t *)realloc(g.recs, cap * sizeof(*p));
++    if (p == NULL)
++        return 0;
++    g.recs = p;
++    g.cap = cap;
++    return 1;
++}
++
++static int state_rec_matches(const jdsp_state_rec_t *r, uint32_t cmd, uint32_t size,
++                             uint64_t hash, const uint8_t *data)
++{
++    if (r->cmd != cmd || r->size != size || r->hash != hash)
++        return 0;
++    if (size == 0)
++        return 1;
++    return memcmp(r->data, data, size) == 0;
++}
++
++static void state_evict_prefix(size_t n)
++{
++    size_t i;
++    if (n == 0)
++        return;
++    if (n > g.count)
++        n = g.count;
++    for (i = 0; i < n; i++) {
++        free(g.recs[i].data);
++        g.bytes -= g.recs[i].size;
++    }
++    memmove(g.recs, g.recs + n, (g.count - n) * sizeof(*g.recs));
++    g.count -= n;
++}
++
++/* Drop exactly one record, keeping every other record (and its order) intact.
++ * Used by the dedupe path: a re-sent ENABLE/DISABLE or a re-sent parameter
++ * replaces the older record with the same bytes, and must never take unrelated
++ * records with it. */
++static void state_evict_at(size_t idx)
++{
++    if (idx >= g.count)
++        return;
++    free(g.recs[idx].data);
++    g.bytes -= g.recs[idx].size;
++    memmove(&g.recs[idx], &g.recs[idx + 1u],
++            (g.count - idx - 1u) * sizeof(*g.recs));
++    g.count--;
++}
++
++static int state_is_group_start(const jdsp_state_rec_t *r)
++{
++    if (r->cmd != JDSP_STATE_CMD_SET_PARAM)
++        return 0;
++    return r->pcmd == JDSP_PCMD_STRING_ALLOC || r->pcmd == JDSP_PCMD_IMPULSE_ALLOC;
++}
++
++/* Keep the store inside its byte/record budget.  Eviction always drops whole
++ * chunked transfer groups: the record that allocated the chunk buffer and the
++ * chunks that fill it must not be separated, otherwise a replay would write
++ * into a buffer that was never allocated. */
++static void state_trim(void)
++{
++    while (g.count > 0u &&
++           (g.bytes > JDSP_STATE_MAX_TOTAL_BYTES || g.count > JDSP_STATE_MAX_RECORDS)) {
++        size_t drop = 1;
++        if (state_is_group_start(&g.recs[0])) {
++            while (drop < g.count && !state_is_group_start(&g.recs[drop]))
++                drop++;
++        }
++        state_evict_prefix(drop);
++        STATE_LOGV("evicted %zu old record(s), %zu left", drop, g.count);
++    }
++}
++
++static void state_dedupe(uint32_t cmd, uint32_t size, uint64_t hash, const uint8_t *data)
++{
++    size_t i;
++    for (i = 0; i < g.count; i++) {
++        if (state_rec_matches(&g.recs[i], cmd, size, hash, data)) {
++            /* Only the duplicate goes away; the new record is appended by the
++             * caller, so it is still applied last during a replay.  Dropping a
++             * prefix here would silently discard every unrelated parameter that
++             * happened to sit before the duplicate - which is exactly what
++             * happens when the framework re-sends ENABLE/DISABLE around an
++             * effect teardown. */
++            state_evict_at(i);
++            return;
++        }
++    }
++}
++
++static int state_append(uint32_t cmd, uint32_t size, uint32_t pcmd, uint8_t *data,
++                        uint64_t hash)
++{
++    jdsp_state_rec_t *r;
++    if (!state_reserve(g.count + 1u))
++        return 0;
++    r = &g.recs[g.count];
++    r->cmd = cmd;
++    r->size = size;
++    r->pcmd = pcmd;
++    r->hash = hash;
++    r->data = data;
++    g.count++;
++    g.bytes += size;
++    return 1;
++}
++
++/* ------------------------------------------------------------------------- */
++/* file IO                                                                   */
++/* ------------------------------------------------------------------------- */
++
++static int state_write_all(int fd, const uint8_t *buf, size_t len)
++{
++    size_t off = 0;
++    while (off < len) {
++        ssize_t n = write(fd, buf + off, len - off);
++        if (n < 0) {
++            if (errno == EINTR)
++                continue;
++            return -1;
++        }
++        if (n == 0)
++            return -1;
++        off += (size_t)n;
++    }
++    return 0;
++}
++
++static int state_read_all(int fd, uint8_t *buf, size_t len)
++{
++    size_t off = 0;
++    while (off < len) {
++        ssize_t n = read(fd, buf + off, len - off);
++        if (n < 0) {
++            if (errno == EINTR)
++                continue;
++            return -1;
++        }
++        if (n == 0)
++            return -1;
++        off += (size_t)n;
++    }
++    return 0;
++}
++
++static void state_fsync_dir(void)
++{
++    char dir[JDSP_STATE_PATH_MAX];
++    char *slash;
++    int fd;
++    strncpy(dir, g.path, sizeof(dir) - 1u);
++    dir[sizeof(dir) - 1u] = '\0';
++    slash = strrchr(dir, '/');
++    if (slash == NULL)
++        return;
++    if (slash == dir)
++        slash[1] = '\0';
++    else
++        *slash = '\0';
++    fd = open(dir, O_RDONLY | O_CLOEXEC);
++    if (fd < 0)
++        return;
++    (void)fsync(fd);
++    close(fd);
++}
++
++/* Fill *out with the current identity of the state file.  Returns 0 when the
++ * file is absent or unreadable; callers treat that as "nothing to reload". */
++static int state_stat_stamp(state_stamp_t *out)
++{
++    struct stat st;
++    if (stat(g.path, &st) != 0 || !S_ISREG(st.st_mode))
++        return 0;
++    out->valid = 1;
++    out->size = (int64_t)st.st_size;
++    out->mtime_sec = (int64_t)st.st_mtim.tv_sec;
++    out->mtime_nsec = (int64_t)st.st_mtim.tv_nsec;
++    out->inode = (unsigned long)st.st_ino;
++    return 1;
++}
++
++static int state_stamp_equal(const state_stamp_t *a, const state_stamp_t *b)
++{
++    return a->valid && b->valid && a->size == b->size && a->mtime_sec == b->mtime_sec &&
++           a->mtime_nsec == b->mtime_nsec && a->inode == b->inode;
++}
++
++/* Remember the current file identity: called after every load and after every
++ * successful save so that our own IO never looks like a foreign change. */
++static void state_stamp_refresh(void)
++{
++    state_stamp_t now;
++    if (state_stat_stamp(&now))
++        g.stamp = now;
++    else
++        g.stamp.valid = 0;
++}
++
++/* Serialise the whole store and replace the state file atomically. */
++static int state_save(int force_fsync)
++{
++    size_t need = JDSP_STATE_HEADER_BYTES + JDSP_STATE_TRAILER_BYTES;
++    size_t i;
++    size_t off;
++    uint8_t *buf;
++    char tmp[JDSP_STATE_PATH_MAX + 32];
++    int fd;
++    int rc = -1;
++    uint64_t now;
++
++    if (g.disabled || g.readonly)
++        return 0;
++    for (i = 0; i < g.count; i++)
++        need += 8u + g.recs[i].size;
++    if (need > JDSP_STATE_MAX_FILE_BYTES)
++        return -1;
++
++    buf = (uint8_t *)malloc(need);
++    if (buf == NULL) {
++        if (!g.write_warned) {
++            g.write_warned = 1;
++            STATE_LOGW("out of memory, state file not updated");
++        }
++        return -1;
++    }
++
++    buf[0] = 'J';
++    buf[1] = 'D';
++    buf[2] = 'S';
++    buf[3] = 'P';
++    state_put_u32(buf + 4, JDSP_STATE_VERSION);
++    state_put_u32(buf + 8, 0u);
++    state_put_u32(buf + 12, (uint32_t)g.count);
++    off = JDSP_STATE_HEADER_BYTES;
++    for (i = 0; i < g.count; i++) {
++        state_put_u32(buf + off, g.recs[i].cmd);
++        state_put_u32(buf + off + 4, g.recs[i].size);
++        off += 8;
++        if (g.recs[i].size > 0u) {
++            memcpy(buf + off, g.recs[i].data, g.recs[i].size);
++            off += g.recs[i].size;
++        }
++    }
++    state_put_u32(buf + off, state_crc32(buf, off));
++    off += JDSP_STATE_TRAILER_BYTES;
++    if (off != need) {
++        free(buf);
++        return -1;
++    }
++
++    snprintf(tmp, sizeof(tmp), "%s.tmp.%d", g.path, (int)getpid());
++    fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0660);
++    if (fd < 0) {
++        if (!g.write_warned) {
++            g.write_warned = 1;
++            STATE_LOGW("cannot create %s (%s), state is kept in memory only", tmp,
++                       strerror(errno));
++        }
++        free(buf);
++        return -1;
++    }
++    if (state_write_all(fd, buf, off) != 0) {
++        if (!g.write_warned) {
++            g.write_warned = 1;
++            STATE_LOGW("cannot write %s (%s)", tmp, strerror(errno));
++        }
++        close(fd);
++        unlink(tmp);
++        free(buf);
++        return -1;
++    }
++    now = state_now_ms();
++    if (force_fsync || now == 0u || now - g.last_fsync_ms >= JDSP_STATE_FSYNC_INTERVAL_MS) {
++        if (fsync(fd) != 0 && !g.fsync_warned) {
++            g.fsync_warned = 1;
++            STATE_LOGW("fsync(%s) failed (%s)", tmp, strerror(errno));
++        }
++        g.last_fsync_ms = now;
++    }
++    if (close(fd) != 0) {
++        if (!g.write_warned) {
++            g.write_warned = 1;
++            STATE_LOGW("close(%s) failed (%s)", tmp, strerror(errno));
++        }
++        unlink(tmp);
++        free(buf);
++        return -1;
++    }
++    if (rename(tmp, g.path) != 0) {
++        if (!g.write_warned) {
++            g.write_warned = 1;
++            STATE_LOGW("cannot rename %s -> %s (%s)", tmp, g.path, strerror(errno));
++        }
++        unlink(tmp);
++        free(buf);
++        return -1;
++    }
++    if (force_fsync)
++        state_fsync_dir();
++    g.dirty = 0;
++    g.write_warned = 0;
++    rc = 0;
++    free(buf);
++    /* Our own write must not look like a foreign change to the reload check. */
++    state_stamp_refresh();
++    STATE_LOGI("state file updated: %zu record(s), %zu byte(s)", g.count, need);
++    return rc;
++}
++
++/* Parse the state file into the in-memory store.  Any problem discards the
++ * file completely: defaults are always safe, a half applied state is not. */
++static void state_load_records(void)
++{
++    struct stat st;
++    uint8_t *buf = NULL;
++    uint32_t count;
++    uint32_t crc;
++    size_t off;
++    size_t end;
++    size_t i;
++    int fd;
++
++    state_free_records();
++
++    fd = open(g.path, O_RDONLY | O_CLOEXEC);
++    if (fd < 0) {
++        if (errno != ENOENT)
++            STATE_LOGW("cannot open %s (%s), using defaults", g.path, strerror(errno));
++        return;
++    }
++    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || st.st_size <= 0) {
++        STATE_LOGW("cannot stat %s, using defaults", g.path);
++        close(fd);
++        return;
++    }
++    if ((uint64_t)st.st_size < (uint64_t)JDSP_STATE_MIN_FILE_BYTES ||
++        (uint64_t)st.st_size > (uint64_t)JDSP_STATE_MAX_FILE_BYTES) {
++        STATE_LOGW("ignoring %s: implausible size %lld", g.path, (long long)st.st_size);
++        close(fd);
++        return;
++    }
++    buf = (uint8_t *)malloc((size_t)st.st_size);
++    if (buf == NULL) {
++        close(fd);
++        return;
++    }
++    if (state_read_all(fd, buf, (size_t)st.st_size) != 0) {
++        STATE_LOGW("cannot read %s, using defaults", g.path);
++        goto fail;
++    }
++    close(fd);
++    fd = -1;
++
++    end = (size_t)st.st_size - JDSP_STATE_TRAILER_BYTES;
++    if (buf[0] != 'J' || buf[1] != 'D' || buf[2] != 'S' || buf[3] != 'P') {
++        STATE_LOGW("ignoring %s: bad magic", g.path);
++        goto fail;
++    }
++    if (state_get_u32(buf + 4) != JDSP_STATE_VERSION) {
++        STATE_LOGW("ignoring %s: unsupported version %u", g.path,
++                   (unsigned)state_get_u32(buf + 4));
++        goto fail;
++    }
++    crc = state_get_u32(buf + end);
++    if (crc != state_crc32(buf, end)) {
++        STATE_LOGW("ignoring %s: checksum mismatch", g.path);
++        goto fail;
++    }
++    count = state_get_u32(buf + 12);
++    if (count > JDSP_STATE_MAX_RECORDS) {
++        STATE_LOGW("ignoring %s: %u records is too many", g.path, (unsigned)count);
++        goto fail;
++    }
++    off = JDSP_STATE_HEADER_BYTES;
++    for (i = 0; i < count; i++) {
++        uint32_t cmd, size, pcmd;
++        uint64_t hash;
++        uint8_t *copy = NULL;
++        if (off + 8u > end)
++            goto malformed;
++        cmd = state_get_u32(buf + off);
++        size = state_get_u32(buf + off + 4);
++        off += 8;
++        if (size > JDSP_STATE_MAX_RECORD_BYTES || off + size > end)
++            goto malformed;
++        if (!state_record_valid(cmd, size, size ? buf + off : NULL)) {
++            STATE_LOGW("skipping invalid record %zu (cmd %u, %u bytes)", i, (unsigned)cmd,
++                       (unsigned)size);
++            off += size;
++            continue;
++        }
++        if (size > 0u) {
++            copy = (uint8_t *)malloc(size);
++            if (copy == NULL)
++                goto fail;
++            memcpy(copy, buf + off, size);
++        }
++        pcmd = state_param_cmd(cmd, copy, size);
++        hash = state_hash(cmd, size, copy);
++        if (!state_append(cmd, size, pcmd, copy, hash)) {
++            free(copy);
++            goto fail;
++        }
++        off += size;
++    }
++    if (off != end)
++        goto malformed;
++
++    free(buf);
++    STATE_LOGV("loaded %zu recorded command(s) from %s", g.count, g.path);
++    return;
++
++malformed:
++    STATE_LOGW("ignoring %s: malformed record data", g.path);
++fail:
++    if (fd >= 0)
++        close(fd);
++    free(buf);
++    state_free_records();
++}
++
++/* Load + remember what we just read (also on failure: a corrupt file must not be
++ * re-parsed on every reload attempt). */
++static void state_load(void)
++{
++    state_load_records();
++    state_stamp_refresh();
++    g.change_source = JDSP_STATE_SRC_FILE;
++    /* Released order: a render thread that sees the new generation must also
++     * see the records that go with it. */
++    __atomic_add_fetch(&g.store_gen, 1, __ATOMIC_RELEASE);
++}
++
++/* Split g.path into the watched directory and the watched file name. */
++static void state_watch_split_path(void)
++{
++    const char *slash = strrchr(g.path, '/');
++    size_t dirlen;
++    if (slash == NULL || slash == g.path) {
++        strncpy(w.dir, "/", sizeof(w.dir) - 1u);
++        w.dir[sizeof(w.dir) - 1u] = '\0';
++        strncpy(w.name, g.path, sizeof(w.name) - 1u);
++    } else {
++        dirlen = (size_t)(slash - g.path);
++        if (dirlen >= sizeof(w.dir))
++            dirlen = sizeof(w.dir) - 1u;
++        memcpy(w.dir, g.path, dirlen);
++        w.dir[dirlen] = '\0';
++        strncpy(w.name, slash + 1, sizeof(w.name) - 1u);
++    }
++    w.name[sizeof(w.name) - 1u] = '\0';
++}
++
++/* Re-read the file into the store, then report how many commands are held.
++ * Caller must not hold g_lock; this takes it. */
++static size_t state_watch_reload(const char *source)
++{
++    size_t n;
++    pthread_mutex_lock(&g_lock);
++    state_load(); /* reparse + refresh stamp + bump the generation */
++    n = g.count;
++    pthread_mutex_unlock(&g_lock);
++    STATE_LOGI("state reloaded: %zu record(s) [%s]", n, source);
++    return n;
++}
++
++static void *state_watch_thread(void *arg)
++{
++    char buf[4096] __attribute__((aligned(__alignof__(struct inotify_event))));
++    int attempts = 0;
++    (void)arg;
++
++    state_watch_split_path();
++
++    /* The directory may not exist yet on a very early start; retry a bounded
++     * number of times and then give up for good (polling still covers us). */
++    while (!w.stop) {
++        w.fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
++        if (w.fd < 0)
++            break;
++        if (inotify_add_watch(w.fd, w.dir,
++                              IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE | IN_ONLYDIR) >= 0)
++            break;
++        close(w.fd);
++        w.fd = -1;
++        if (++attempts >= 20) {
++            STATE_LOGW("cannot watch %s, falling back to polling", w.dir);
++            return NULL;
++        }
++        usleep(250000);
++    }
++    if (w.fd < 0)
++        return NULL;
++    __atomic_store_n(&w.ready, 1, __ATOMIC_RELEASE);
++    STATE_LOGV("watching %s for %s", w.dir, w.name);
++
++    while (!w.stop) {
++        struct pollfd pfd;
++        ssize_t got;
++        int hit = 0;
++        char *p;
++        state_stamp_t now;
++
++        pfd.fd = w.fd;
++        pfd.events = POLLIN;
++        pfd.revents = 0;
++        /* The timeout only bounds how long a shutdown request can take; events
++         * wake this up immediately. */
++        if (poll(&pfd, 1, 200) <= 0)
++            continue;
++        if (!(pfd.revents & POLLIN))
++            continue;
++        got = read(w.fd, buf, sizeof(buf));
++        if (got <= 0)
++            continue;
++        for (p = buf; p < buf + got;) {
++            const struct inotify_event *ev = (const struct inotify_event *)p;
++            if (ev->len > 0 && strcmp(ev->name, w.name) == 0 &&
++                (ev->mask & (IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE)))
++                hit = 1;
++            p += sizeof(struct inotify_event) + ev->len;
++        }
++        if (!hit)
++            continue;
++        /* Our own state_save() also produces these events; the stamp says
++         * whether the file is really different from what we hold.  The stat has
++         * to happen under g_lock: state_save() holds it across its rename and
++         * the following stamp refresh, so a stat taken outside the lock can
++         * describe a file that has already been replaced again and would turn
++         * our own write into a spurious reload. */
++        pthread_mutex_lock(&g_lock);
++        hit = state_stat_stamp(&now) && !state_stamp_equal(&g.stamp, &now);
++        pthread_mutex_unlock(&g_lock);
++        if (!hit)
++            continue;
++        (void)state_watch_reload("inotify");
++    }
++
++    __atomic_store_n(&w.ready, 0, __ATOMIC_RELEASE);
++    if (w.fd >= 0) {
++        close(w.fd);
++        w.fd = -1;
++    }
++    return NULL;
++}
++
++/* Best effort: any failure leaves the watcher off and the caller on the poll
++ * fallback.  Never fatal. */
++static void state_watch_start(void)
++{
++    pthread_t tid;
++    if (w.started || w.fd >= 0 || w.stop)
++        return;
++    if (state_env_flag("JDSP_STATE_NO_INOTIFY"))
++        return;
++    if (pthread_create(&tid, NULL, state_watch_thread, NULL) != 0)
++        return;
++    w.tid = tid;
++    w.started = 1;
++}
++
++static void state_watch_stop(void)
++{
++    if (!w.started)
++        return;
++    w.stop = 1;
++    /* The poll() timeout above is short, so this join returns promptly. */
++    (void)pthread_join(w.tid, NULL);
++    w.started = 0;
++    __atomic_store_n(&w.ready, 0, __ATOMIC_RELEASE);
++    w.stop = 0; /* clear the request so the watcher can be started again */
++}
++
++/* Does the file watcher own the change detection right now?  When it does, the
++ * render thread must not stat() the file at all. */
++int jdsp_state_watcher_active(void)
++{
++    /* ready, not started: a thread that is still retrying the watch (or that
++     * gave up) must leave the render thread on the polling fallback, otherwise
++     * nothing would ever notice a change. */
++    return w.started && __atomic_load_n(&w.ready, __ATOMIC_ACQUIRE) && !w.stop;
++}
++
++/* Which mechanism produced the current store generation.  The render thread
++ * uses this to log an in-process update exactly once and to stay quiet for file
++ * reloads (the watcher/poller already logged those). */
++int jdsp_state_last_change_source(void)
++{
++    int src;
++    pthread_mutex_lock(&g_lock);
++    src = g.change_source;
++    pthread_mutex_unlock(&g_lock);
++    return src;
++}
++
++static void state_init_once(void)
++{
++    const char *path;
++
++    /* A plain (non recursive) mutex is enough: no public entry point of this
++     * file calls another one while holding the lock, and the replay callback in
++     * jamesdsp.c only reaches back into the DSP command handler. */
++    state_crc32_init();
++
++    g.disabled = state_env_flag("JDSP_STATE_DISABLE");
++    g.readonly = state_env_flag("JDSP_STATE_READONLY");
++    g.debug = state_env_flag("JDSP_STATE_DEBUG");
++    path = getenv("JDSP_STATE_PATH");
++    if (path != NULL && path[0] != '\0') {
++        strncpy(g.path, path, sizeof(g.path) - 1u);
++        g.path[sizeof(g.path) - 1u] = '\0';
++    }
++
++    pthread_mutex_lock(&g_lock);
++    if (!g.disabled) {
++        state_load();
++        if (g.count > 0u)
++            STATE_LOGI("restored %zu recorded command(s) from %s", g.count, g.path);
++    }
++    g.initialized = 1;
++    pthread_mutex_unlock(&g_lock);
++
++    STATE_LOGV("persistence %s, path %s", g.disabled ? "disabled" : "enabled", g.path);
++
++    /* Only now: the watcher takes g_lock and must see a fully initialised
++     * store.  A read-only deployment still watches, because following an
++     * externally updated file is exactly how a live parameter change is
++     * delivered. */
++    if (!g.disabled)
++        state_watch_start();
++}
++
++/* ------------------------------------------------------------------------- */
++/* public API                                                                */
++/* ------------------------------------------------------------------------- */
++
++void jdsp_state_init(void)
++{
++    pthread_once(&g_once, state_init_once);
++}
++
++int jdsp_state_enabled(void)
++{
++    pthread_once(&g_once, state_init_once);
++    return !g.disabled;
++}
++
++void jdsp_state_record(uint32_t cmd_code, uint32_t cmd_size, const void *cmd_data)
++{
++    const uint8_t *data = (const uint8_t *)cmd_data;
++    uint8_t *copy = NULL;
++    uint32_t size = 0;
++    uint32_t pcmd = JDSP_STATE_PCMD_NONE;
++    uint64_t hash;
++
++    pthread_once(&g_once, state_init_once);
++    if (g.disabled || g.readonly)
++        return;
++
++    pthread_mutex_lock(&g_lock);
++    if (!g.initialized)
++        goto out;
++
++    if (cmd_code == JDSP_STATE_CMD_SET_PARAM) {
++        uint32_t psize, vsize, need;
++        if (data == NULL || cmd_size < 12u)
++            goto out;
++        psize = state_get_u32(data + 4);
++        vsize = state_get_u32(data + 8);
++        if (psize != 4u || vsize == 0u)
++            goto out;
++        if (vsize > JDSP_STATE_MAX_RECORD_BYTES - 16u) {
++            STATE_LOGW("dropping %u byte parameter (limit %u bytes)",
++                       (unsigned)vsize, (unsigned)(JDSP_STATE_MAX_RECORD_BYTES - 16u));
++            goto out;
++        }
++        need = 12u + psize + vsize; /* 16 + vsize for psize == 4 */
++        if (cmd_size < need)
++            goto out;
++        size = need;
++        pcmd = state_get_u32(data + 12);
++
++        /* Chunked transfers: persist a group only when the complete group fits
++         * in the budget, otherwise skip the whole transfer (replaying a partial
++         * impulse/string would load bogus data). */
++        if (pcmd == JDSP_PCMD_STRING_ALLOC || pcmd == JDSP_PCMD_IMPULSE_ALLOC) {
++            uint64_t expected = state_expected_group_bytes(pcmd, data);
++            g.skip_stream = (expected == 0u || expected > JDSP_STATE_MAX_GROUP_BYTES);
++            if (g.skip_stream) {
++                STATE_LOGW("chunked transfer of %llu byte(s) not persisted (limit %u)",
++                           (unsigned long long)expected,
++                           (unsigned)JDSP_STATE_MAX_GROUP_BYTES);
++                goto out;
++            }
++        } else if (g.skip_stream && state_is_stream_chunk(pcmd)) {
++            goto out;
++        }
++
++        copy = (uint8_t *)malloc(size);
++        if (copy == NULL)
++            goto out;
++        memcpy(copy, data, size);
++    } else if (cmd_code == JDSP_STATE_CMD_ENABLE || cmd_code == JDSP_STATE_CMD_DISABLE) {
++#if !JDSP_STATE_RECORD_ENABLE
++        goto out;
++#else
++        size = 0u;
++        pcmd = JDSP_STATE_PCMD_NONE;
++#endif
++    } else {
++        goto out;
++    }
++
++    hash = state_hash(cmd_code, size, copy);
++    /* Re-sending the value that is already last changes nothing: skip the IO.
++     * This shortcut is only valid for records that replace a complete value -
++     * two identical chunks of a convolver/string transfer are both meaningful
++     * and must both be kept. */
++    if (state_record_dedupable(cmd_code, pcmd)) {
++        if (g.count > 0u &&
++            state_rec_matches(&g.recs[g.count - 1u], cmd_code, size, hash, copy)) {
++            free(copy);
++            goto out;
++        }
++        state_dedupe(cmd_code, size, hash, copy);
++    }
++    if (!state_append(cmd_code, size, pcmd, copy, hash)) {
++        STATE_LOGW("out of memory, parameter not persisted");
++        free(copy);
++        goto out;
++    }
++    g.change_source = JDSP_STATE_SRC_RECORD;
++    /* content changed: running instances should replay */
++    __atomic_add_fetch(&g.store_gen, 1, __ATOMIC_RELEASE);
++    state_trim();
++    g.dirty = 1;
++    (void)state_save(0);
++
++out:
++    pthread_mutex_unlock(&g_lock);
++}
++
++int jdsp_state_replay(void *engine,
++                      int32_t (*dispatch)(void *engine, uint32_t cmd_code, uint32_t cmd_size,
++                                          const void *cmd_data))
++{
++    size_t i;
++    int replayed = 0;
++
++    pthread_once(&g_once, state_init_once);
++    if (dispatch == NULL || g.disabled)
++        return 0;
++
++    pthread_mutex_lock(&g_lock);
++    for (i = 0; i < g.count; i++) {
++        const jdsp_state_rec_t *r = &g.recs[i];
++        if (!state_record_valid(r->cmd, r->size, r->data))
++            continue;
++        (void)dispatch(engine, r->cmd, r->size, r->data);
++        replayed++;
++    }
++    pthread_mutex_unlock(&g_lock);
++    if (replayed > 0)
++        STATE_LOGI("replayed %d persisted command(s)", replayed);
++    return replayed;
++}
++
++/* Hot reload: pick up a state file that was replaced by somebody else while
++ * this effect instance kept running.  Returns the number of commands now in
++ * memory when the file changed, 0 when it did not (or when there is nothing to
++ * load), so callers can replay exactly when needed.
++ *
++ * Deliberately not gated on g.readonly: a read-only deployment must still follow
++ * an externally updated file (that is how the on-device CLI test drives a live
++ * update).  A disabled build/instance returns 0 because state_load_records()
++ * leaves the store empty.  Every failure path is silent, and an unchanged file
++ * costs one stat() - no read, no allocation. */
++int jdsp_state_reload_if_changed(void)
++{
++    state_stamp_t now;
++    int reloaded;
++
++    pthread_once(&g_once, state_init_once);
++    /* The stat is taken under g_lock so that it cannot observe a file that a
++     * concurrent state_save() is in the middle of replacing. */
++    pthread_mutex_lock(&g_lock);
++    if (!state_stat_stamp(&now)) {
++        pthread_mutex_unlock(&g_lock);
++        return 0; /* no file (yet) - nothing to reload */
++    }
++    if (g.initialized && state_stamp_equal(&g.stamp, &now)) {
++        pthread_mutex_unlock(&g_lock);
++        return 0; /* unchanged: one stat(), no read, no allocation */
++    }
++    state_load(); /* reparse + refresh the stamp + bump the generation */
++    reloaded = (int)g.count;
++    pthread_mutex_unlock(&g_lock);
++    STATE_LOGI("state reloaded: %d record(s) [poll]", reloaded);
++    return reloaded;
++}
++
++/* Monotonic counter of the stored parameter set.  Callers that own an engine
++ * instance remember the value they have applied; when it differs they replay.
++ * This also catches changes that never show up as a *file* change because the
++ * writer lives in the same process (the audio HAL hosts both the postprocess
++ * instance and instances created through the effects factory, e.g. by a CLI). */
++uint64_t jdsp_state_generation(void)
++{
++    /* Deliberately lock free: the render thread calls this once per buffer, so
++     * it has to cost a single relaxed load.  All writers use a release RMW, so
++     * a reader that observes a new value also observes the records behind it
++     * (jdsp_state_replay() then takes the lock and reads them). */
++    pthread_once(&g_once, state_init_once);
++    return __atomic_load_n(&g.store_gen, __ATOMIC_ACQUIRE);
++}
++
++/* One INFO line per pickup of an in-process parameter change, so operators see
++ * the same "state reloaded" message whether the new state came from the file or
++ * from another instance of this library in the same process. */
++void jdsp_state_report_inprocess_change(void)
++{
++    size_t n;
++    pthread_once(&g_once, state_init_once);
++    pthread_mutex_lock(&g_lock);
++    n = g.count;
++    pthread_mutex_unlock(&g_lock);
++    STATE_LOGI("state reloaded: %zu record(s) (in-process update)", n);
++}
++
++void jdsp_state_flush(void)
++{
++    pthread_once(&g_once, state_init_once);
++    pthread_mutex_lock(&g_lock);
++    if (g.initialized && g.dirty && !g.disabled && !g.readonly)
++        (void)state_save(1);
++    pthread_mutex_unlock(&g_lock);
++}
++
++void jdsp_state_shutdown(void)
++{
++    pthread_once(&g_once, state_init_once);
++    /* Stop the watcher before tearing the store down: it takes g_lock and reads
++     * g.recs.  A no-op when the watcher never started. */
++    state_watch_stop();
++    pthread_mutex_lock(&g_lock);
++    if (g.initialized && g.dirty && !g.disabled && !g.readonly)
++        (void)state_save(1);
++    state_free_records();
++    g.initialized = 0;
++    pthread_mutex_unlock(&g_lock);
++}
++
++size_t jdsp_state_record_count(void)
++{
++    size_t n;
++    pthread_once(&g_once, state_init_once);
++    pthread_mutex_lock(&g_lock);
++    n = g.count;
++    pthread_mutex_unlock(&g_lock);
++    return n;
++}
++
++void jdsp_state_set_path(const char *path)
++{
++    pthread_once(&g_once, state_init_once);
++    if (path == NULL || path[0] == '\0')
++        return;
++    /* The watcher is bound to one directory, so it has to move with the path. */
++    state_watch_stop();
++    pthread_mutex_lock(&g_lock);
++    strncpy(g.path, path, sizeof(g.path) - 1u);
++    g.path[sizeof(g.path) - 1u] = '\0';
++    state_load();
++    pthread_mutex_unlock(&g_lock);
++    state_watch_start();
++}
++#else /* !JDSP_STATE_ENABLE ---------------------------------------------------- */
++
++/* Persistence compiled out: every entry point is a no-op, so jamesdsp.c can
++ * call them unconditionally and the linker drops the whole feature (no strings,
++ * no file IO, no globals). */
++void jdsp_state_init(void)
++{
++}
++
++int jdsp_state_enabled(void)
++{
++    return 0;
++}
++
++void jdsp_state_record(uint32_t cmd_code, uint32_t cmd_size, const void *cmd_data)
++{
++    (void)cmd_code;
++    (void)cmd_size;
++    (void)cmd_data;
++}
++
++int jdsp_state_replay(void *engine,
++                      int32_t (*dispatch)(void *engine, uint32_t cmd_code, uint32_t cmd_size,
++                                          const void *cmd_data))
++{
++    (void)engine;
++    (void)dispatch;
++    return 0;
++}
++
++int jdsp_state_reload_if_changed(void)
++{
++    return 0;
++}
++
++uint64_t jdsp_state_generation(void)
++{
++    return 0;
++}
++
++void jdsp_state_report_inprocess_change(void)
++{
++}
++
++int jdsp_state_watcher_active(void)
++{
++    return 0;
++}
++
++int jdsp_state_last_change_source(void)
++{
++    return 0;
++}
++
++void jdsp_state_flush(void)
++{
++}
++
++void jdsp_state_shutdown(void)
++{
++}
++
++size_t jdsp_state_record_count(void)
++{
++    return 0;
++}
++
++void jdsp_state_set_path(const char *path)
++{
++    (void)path;
++}
++
++#endif /* JDSP_STATE_ENABLE */
+diff -ruN '--exclude=*.o' src-baseline/Main/libjamesdsp/jni/jamesdsp/jdsp_state.h src/Main/libjamesdsp/jni/jamesdsp/jdsp_state.h
+--- src-baseline/Main/libjamesdsp/jni/jamesdsp/jdsp_state.h	1970-01-01 08:00:00.000000000 +0800
++++ src/Main/libjamesdsp/jni/jamesdsp/jdsp_state.h	2026-10-24 14:45:06.121956546 +0800
+@@ -0,0 +1,149 @@
++/*
++ * jdsp_state.h - persistent DSP state for the JamesDSP effect library.
++ *
++ * The effect library is instantiated by audioserver from audio_effects.xml as a
++ * postprocess device effect.  Such an instance has no client handle, so the
++ * Android app cannot call setParameter() on it.  To let the DSP state survive
++ * without the app (or without the app ever being installed again) the library
++ * records every state changing command it receives into a file and replays the
++ * recorded sequence from its own initialisation path.
++ *
++ * Format (little endian):
++ *     char  magic[4]  "JDSP"
++ *     u32   version   1
++ *     u32   flags     0 (reserved)
++ *     u32   count     number of records
++ *     { u32 cmd; u32 size; u8 payload[size]; } * count
++ *     u32   crc32     CRC-32/IEEE over every preceding byte
++ *
++ * A record stores the exact (cmdCode, cmdSize, pCmdData) triple that was handed
++ * to the effect command handler, so replay simply feeds the recorded bytes back
++ * into EffectDSPMainCommand().  Any structural or checksum problem discards the
++ * whole file and the engine starts from its compiled-in defaults: persistence is
++ * strictly best effort and must never break audio.
++ *
++ * Environment overrides (only useful for tests; audioserver does not inherit the
++ * caller's environment):
++ *     JDSP_STATE_PATH=/some/file    use another state file
++ *     JDSP_STATE_DISABLE=1          load nothing, record nothing
++ *     JDSP_STATE_READONLY=1         replay an existing file but never write
++ *     JDSP_STATE_DEBUG=1            verbose logging
++ *
++ * Compile time switches:
++ *     -DJDSP_STATE_ENABLE=0         compile the whole feature out (no-ops)
++ *     -DJDSP_STATE_RECORD_ENABLE=0  do not persist ENABLE/DISABLE commands
++ */
++
++#ifndef JDSP_STATE_H
++#define JDSP_STATE_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++#ifndef JDSP_STATE_ENABLE
++#define JDSP_STATE_ENABLE 1
++#endif
++
++#ifndef JDSP_STATE_RECORD_ENABLE
++#define JDSP_STATE_RECORD_ENABLE 1
++#endif
++
++/* Default state file.  /data/misc/audio is owned by audio:audio (AID 1041:1005)
++ * and is writable by audioserver, which is the process that loads the effect
++ * library.  The Magisk module creates/chowns the file for us. */
++/* The effect instance is served by the audio HAL (hal_audio_default), not by
++ * audioserver: /proc/<hal>/maps carries libjamesdsp.so and the framework only
++ * proxies commands to it. /data/misc/audio is not writable from that domain,
++ * while /data/vendor/audio is (vendor_audio_data_file, audio:audio 0770). */
++#define JDSP_STATE_DEFAULT_PATH "/data/vendor/audio/jamesdsp_state.bin"
++
++/* Largest single command (payload included) that is accepted or recorded.
++ * Bigger commands are dropped and logged instead of filling up the file. */
++#define JDSP_STATE_MAX_RECORD_BYTES (1024u * 1024u)
++
++#if defined(__GNUC__)
++#define JDSP_STATE_HIDDEN __attribute__((visibility("hidden")))
++#else
++#define JDSP_STATE_HIDDEN
++#endif
++
++/* Effect command codes that are persisted.  These mirror the values of
++ * effect_command_e (audio_effect.h); jamesdsp.c contains a compile time check
++ * that the mirrored values still match the real enum. */
++#define JDSP_STATE_CMD_ENABLE    3u
++#define JDSP_STATE_CMD_DISABLE   4u
++#define JDSP_STATE_CMD_SET_PARAM 5u
++
++/* Load the state file into the process wide in-memory store (idempotent and
++ * cheap after the first call).  Never fails; IO errors are only logged. */
++JDSP_STATE_HIDDEN void jdsp_state_init(void);
++
++/* Non-zero when persistence is compiled in and not disabled at run time. */
++JDSP_STATE_HIDDEN int jdsp_state_enabled(void);
++
++/* Record one successfully applied state changing command.  a cmd_code is the
++ * effect command code, a cmd_size / a cmd_data are exactly what set_parameter
++ * delivered.  Invalid or oversized commands are dropped.  No-op while disabled
++ * or read-only. */
++JDSP_STATE_HIDDEN void jdsp_state_record(uint32_t cmd_code, uint32_t cmd_size,
++                                         const void *cmd_data);
++
++/* Feed every stored command to a dispatch(engine, cmd, size, data), in the
++ * order it was recorded.  Returns the number of commands replayed.  The
++ * dispatch callback is normally EffectDSPMainCommand() wrapped by jamesdsp.c. */
++JDSP_STATE_HIDDEN int jdsp_state_replay(void *engine,
++                                        int32_t (*dispatch)(void *engine, uint32_t cmd_code,
++                                                            uint32_t cmd_size,
++                                                            const void *cmd_data));
++
++/* Hot reload: compare the identity (size + mtime + inode) of the state file
++ * with the version this process last loaded/saved and, when it changed, reparse
++ * the file in place.  Returns the number of commands now in memory when the file
++ * changed, 0 otherwise.  Cheap enough to be polled from the render path: an
++ * unchanged file costs a single stat() and no allocation.  Never blocks for long
++ * and never fails visibly; a corrupt replacement simply leaves the store empty,
++ * so the caller replays nothing and the engine keeps its current settings. */
++JDSP_STATE_HIDDEN int jdsp_state_reload_if_changed(void);
++
++/* Monotonic counter of the stored parameter set (bumped by every accepted
++ * record and by every reload).  An engine instance remembers the value it has
++ * applied; a difference means "replay me".  This is what makes a parameter
++ * change visible to a *running* instance when the writer lives in the same
++ * process (the audio HAL hosts both the postprocess instance and instances
++ * created by the App or a CLI tool through the effects factory). */
++JDSP_STATE_HIDDEN uint64_t jdsp_state_generation(void);
++
++/* Log one INFO line ("state reloaded: N record(s) (in-process update)") for the
++ * generation based path; no state is touched. */
++JDSP_STATE_HIDDEN void jdsp_state_report_inprocess_change(void);
++
++/* True while the inotify watcher owns change detection.  When it does, the file
++ * is read and parsed on the watcher thread and the render path must not stat()
++ * the file at all; when it does not (no inotify, watch refused, thread refused,
++ * or JDSP_STATE_NO_INOTIFY=1) the render path keeps polling with
++ * jdsp_state_reload_if_changed().  Either way the observable behaviour is the
++ * same, only the latency and the thread that does the IO differ. */
++JDSP_STATE_HIDDEN int jdsp_state_watcher_active(void);
++
++/* Source of the current store generation: 0 none, 1 re-parsed from the file,
++ * 2 recorded by another instance in this process.  Lets the render thread log an
++ * in-process update once instead of claiming it for a file reload too. */
++JDSP_STATE_HIDDEN int jdsp_state_last_change_source(void);
++
++#define JDSP_STATE_SRC_NONE 0
++#define JDSP_STATE_SRC_FILE 1
++#define JDSP_STATE_SRC_RECORD 2
++
++/* Write pending state to disk now (best effort, fsync included). */
++JDSP_STATE_HIDDEN void jdsp_state_flush(void);
++
++/* Flush and release every resource (library destructor). */
++JDSP_STATE_HIDDEN void jdsp_state_shutdown(void);
++
++/* Number of commands currently held in memory (diagnostics / tests). */
++JDSP_STATE_HIDDEN size_t jdsp_state_record_count(void);
++
++/* Override the state file path and reload.  Tests only. */
++JDSP_STATE_HIDDEN void jdsp_state_set_path(const char *path);
++
++#endif /* JDSP_STATE_H */
