@@ -1,0 +1,263 @@
+package com.jdsp.backend;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.ScheduledFuture;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.TimeUnit;
+
+/**
+ * Parameter path between the transports and {@link EffectManager}.
+ *
+ * <ul>
+ *   <li>{@link #setParam} writes straight through to the effect handle (measured round trip
+ *       ~3 ms on the device, no queueing) and returns the engine status.</li>
+ *   <li>{@link #setParamDeferred} + {@link #commit} coalesce repeated writes of the same
+ *       (session, paramId) inside a 2 ms window (last value wins) before touching the handle.
+ *       Parameters that carry chunked transfers are never coalesced, so the App's ordered
+ *       impulse/string chunks reach the engine unchanged.</li>
+ * </ul>
+ */
+public final class ParamBus {
+    /** Coalescing window. */
+    public static final long BATCH_MS = 2L;
+    /** Parameter ids that must never be merged or reordered. */
+    private static final int[] NO_COALESCE = {
+            8888, 9999, 12000, 12001, 10004, 10006, 10009, 10010, 25000, 25001, 25002, 25003
+    };
+
+    /** Runtime counters exposed through stats. */
+    public static final class Stats {
+        public long setCalls;
+        public long getCalls;
+        public long errors;
+        public long batchFlushes;
+        public long batchMerged;
+        public long lastLatencyUs;
+        public long totalLatencyUs;
+        public long maxLatencyUs;
+        public long bulkApplied;
+    }
+
+    private static final class Pending {
+        final int sessionId;
+        final int paramId;
+        final byte[] value;
+
+        Pending(int sessionId, int paramId, byte[] value) {
+            this.sessionId = sessionId;
+            this.paramId = paramId;
+            this.value = value;
+        }
+    }
+
+    private final EffectManager effects;
+    private final ScheduledExecutorService scheduler;
+    private final Map<String, Pending> pending = new LinkedHashMap<String, Pending>();
+    private final Stats stats = new Stats();
+    private ScheduledFuture<?> flushTask;
+
+    public ParamBus(EffectManager effects) {
+        this.effects = effects;
+        this.scheduler = Executors.newSingleThreadScheduledExecutor(new ThreadFactory() {
+            @Override
+            public Thread newThread(Runnable r) {
+                Thread t = new Thread(r, "jdspd-parambus");
+                t.setDaemon(true);
+                return t;
+            }
+        });
+    }
+
+    /** Synchronous write, returns the engine status (0 = applied). */
+    public int setParam(int sessionId, int paramId, byte[] value) {
+        if (value == null || value.length == 0) {
+            return EffectManager.ERR_BAD_ARG;
+        }
+        long t0 = System.nanoTime();
+        int rc = effects.setParam(sessionId, paramId, value);
+        long us = (System.nanoTime() - t0) / 1000L;
+        synchronized (stats) {
+            stats.setCalls++;
+            stats.lastLatencyUs = us;
+            stats.totalLatencyUs += us;
+            if (us > stats.maxLatencyUs) {
+                stats.maxLatencyUs = us;
+            }
+            if (rc != 0) {
+                stats.errors++;
+            }
+        }
+        return rc;
+    }
+
+    /** One GET_PARAM; the value is written into {@code reply}. Returns the engine status. */
+    public int getParam(int sessionId, int paramId, byte[] reply) {
+        long t0 = System.nanoTime();
+        int rc = effects.getParam(sessionId, paramId, reply);
+        long us = (System.nanoTime() - t0) / 1000L;
+        synchronized (stats) {
+            stats.getCalls++;
+            stats.lastLatencyUs = us;
+            stats.totalLatencyUs += us;
+            if (us > stats.maxLatencyUs) {
+                stats.maxLatencyUs = us;
+            }
+            if (rc != 0) {
+                stats.errors++;
+            }
+        }
+        return rc;
+    }
+
+    /** Applies a whole parameter set to one session (used when a handle is created). */
+    public int applyAll(int sessionId, Map<Integer, byte[]> params) {
+        if (params == null || params.isEmpty()) {
+            return 0;
+        }
+        int ok = 0;
+        int failed = 0;
+        for (Map.Entry<Integer, byte[]> e : params.entrySet()) {
+            int rc = setParam(sessionId, e.getKey().intValue(), e.getValue());
+            if (rc == 0) {
+                ok++;
+            } else {
+                failed++;
+            }
+        }
+        synchronized (stats) {
+            stats.bulkApplied += ok;
+        }
+        if (failed > 0) {
+            Log.w("applyAll session=" + sessionId + ": " + ok + " ok, " + failed + " failed");
+        } else {
+            Log.i("applyAll session=" + sessionId + ": " + ok + " parameter(s) applied");
+        }
+        return ok;
+    }
+
+    /**
+     * Queues a write that is flushed after the {@link #BATCH_MS} window. Repeated writes of the
+     * same (session, paramId) inside the window keep only the last value. Chunked parameters are
+     * written straight through. Returns 0 when the write was accepted.
+     */
+    public int setParamDeferred(int sessionId, int paramId, byte[] value) {
+        if (value == null || value.length == 0) {
+            return EffectManager.ERR_BAD_ARG;
+        }
+        if (isNoCoalesce(paramId)) {
+            return setParam(sessionId, paramId, value);
+        }
+        String key = sessionId + ":" + paramId;
+        synchronized (pending) {
+            if (pending.containsKey(key)) {
+                synchronized (stats) {
+                    stats.batchMerged++;
+                }
+            }
+            pending.put(key, new Pending(sessionId, paramId, value));
+            if (flushTask == null) {
+                flushTask = scheduler.schedule(new Runnable() {
+                    @Override
+                    public void run() {
+                        flushAll();
+                    }
+                }, BATCH_MS, TimeUnit.MILLISECONDS);
+            }
+        }
+        return 0;
+    }
+
+    /** Flushes queued writes of one session (or everything when {@code sessionId <= 0}). */
+    public int commit(int sessionId) {
+        flush(sessionId);
+        return 0;
+    }
+
+    /** Flushes every queued write; returns the number of engine writes performed. */
+    public int flushAll() {
+        return flush(0);
+    }
+
+    private int flush(int sessionId) {
+        List<Pending> batch = new ArrayList<Pending>();
+        synchronized (pending) {
+            if (pending.isEmpty()) {
+                flushTask = null;
+                return 0;
+            }
+            if (sessionId <= 0) {
+                batch.addAll(pending.values());
+                pending.clear();
+                flushTask = null;
+            } else {
+                String prefix = sessionId + ":";
+                List<String> keys = new ArrayList<String>(pending.keySet());
+                for (int i = 0; i < keys.size(); i++) {
+                    String key = keys.get(i);
+                    if (key.startsWith(prefix)) {
+                        batch.add(pending.remove(key));
+                    }
+                }
+                if (pending.isEmpty()) {
+                    flushTask = null;
+                }
+            }
+        }
+        int n = 0;
+        for (int i = 0; i < batch.size(); i++) {
+            Pending p = batch.get(i);
+            setParam(p.sessionId, p.paramId, p.value);
+            n++;
+        }
+        synchronized (stats) {
+            stats.batchFlushes++;
+        }
+        return n;
+    }
+
+    /** Current counters (a copy). */
+    public Stats stats() {
+        Stats copy = new Stats();
+        synchronized (stats) {
+            copy.setCalls = stats.setCalls;
+            copy.getCalls = stats.getCalls;
+            copy.errors = stats.errors;
+            copy.batchFlushes = stats.batchFlushes;
+            copy.batchMerged = stats.batchMerged;
+            copy.lastLatencyUs = stats.lastLatencyUs;
+            copy.totalLatencyUs = stats.totalLatencyUs;
+            copy.maxLatencyUs = stats.maxLatencyUs;
+            copy.bulkApplied = stats.bulkApplied;
+        }
+        return copy;
+    }
+
+    public long averageLatencyUs() {
+        synchronized (stats) {
+            long calls = stats.setCalls + stats.getCalls;
+            return calls == 0 ? 0 : stats.totalLatencyUs / calls;
+        }
+    }
+
+    public void shutdown() {
+        try {
+            scheduler.shutdownNow();
+        } catch (Throwable ignored) {
+            // nothing to do
+        }
+    }
+
+    private static boolean isNoCoalesce(int paramId) {
+        for (int i = 0; i < NO_COALESCE.length; i++) {
+            if (NO_COALESCE[i] == paramId) {
+                return true;
+            }
+        }
+        return false;
+    }
+}

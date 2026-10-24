@@ -16,6 +16,12 @@ AIDL=${AIDL:-$(pick "$SDK/build-tools" aidl)}
 D8=${D8:-$SDK/cmdline-tools/latest/bin/d8}
 ANDROID_JAR=${ANDROID_JAR:-$(ls "$SDK"/platforms/android-*/android.jar 2>/dev/null | sort -V | tail -1)}
 
+# Serialise concurrent builds (daemon-core / cli-harness run this at the same time).
+if command -v flock >/dev/null; then
+    exec 9>"$HERE/.build.lock"
+    flock 9
+fi
+
 OUT="$HERE/out"
 GEN="$OUT/gen"
 CLASSES="$OUT/classes"
@@ -45,8 +51,10 @@ mapfile -t AIDL_FILES < <(find "$HERE/aidl" -name '*.aidl' | sort)
 
 # 2) javac (Java 8 bytecode, Android boot classpath)
 mapfile -t SRC_FILES < <(find "$HERE/src" "$GEN" -name '*.java' | sort)
-javac -source 8 -target 8 -nowarn -Xlint:-options \
-      -bootclasspath "$ANDROID_JAR" -d "$CLASSES" "${SRC_FILES[@]}" 2>&1 | grep -vE '^警告|^warning|已过时' || true
+# --release 8 + -classpath (not -bootclasspath): java.* comes from the JDK, android.* from
+# android.jar.  This also lets javac emit invokedynamic for lambdas (d8 desugars them);
+# with -bootclasspath android.jar javac cannot find LambdaMetafactory at all.
+javac --release 8 -nowarn -classpath "$ANDROID_JAR" -d "$CLASSES" "${SRC_FILES[@]}" 2>&1 | grep -vE '^警告|^warning|已过时' || true
 if [ ! -d "$CLASSES/com/jdsp" ]; then
     echo "javac produced no classes" >&2
     exit 1

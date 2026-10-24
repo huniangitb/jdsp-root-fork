@@ -168,6 +168,35 @@ App 是预编译 APK（Kotlin 源码在 `../loundess_git`，Gradle 全量构建�
 
 ---
 
+## 8.1 传输层决策（2026-10-24 追加）
+
+三条通道，运行时按顺序降级：
+
+| 通道 | 路径 | 谁能用 | 状态 |
+|---|---|---|---|
+| A binder | service `jdsp.service` | root/su 域（CLI、jdspd 自身） | 已验证可用（跨进程 AIDL 实测通过） |
+| **C unix socket** | `/data/data/james.dsp/files/jdsp.sock`（app_data_file） | 本 App + root | **主用**，App 走这条 |
+| B root shell | `su -c jdspcli ...` | App（root flavor 自带 libsu） | 兜底 |
+
+为什么 App 不走 binder：AOSP servicemanager 对 `service_contexts` 里**没有登记**的服务名，
+按注册进程的域给 SID；jdspd 跑在 ksu/su 域 → 服务标签即 su 域。要让 untrusted_app 连上就得
+`allow untrusted_app su:binder { call transfer }` + `service_manager find`，等于把 su 域对普通
+App 敞开，**不采纳**。socket 放在 App 自己的数据目录里：只有本 App（app_data_file）与 root 能连，
+不需要任何 SELinux 放行，且是长连接，滑条拖动也扛得住。
+
+socket 协议（JSON lines，一行请求一行响应）：
+
+    {"cmd":"ping"}                                    -> {"ok":true,"version":"jdspd 2.0.0"}
+    {"cmd":"sessions"}                                -> {"ok":true,"sessions":[{sessionId,uid,pkg,attached,enabled,paramCount,effectId,policyMode,pid}]}
+    {"cmd":"setParam","session":145,"param":1500,"value":"cdccccbd..."} -> {"ok":true,"status":0}
+    {"cmd":"getParam","session":145,"param":1500,"vsize":64}            -> {"ok":true,"value":"..."}
+    {"cmd":"attach"|"detach","session":145}
+    {"cmd":"mode","mode":"auto"|"backend"}
+    {"cmd":"policy","pkg":"com.x","mode":2} / {"cmd":"policies"}
+    {"cmd":"dumpConfig"} / {"cmd":"stats"}
+
+服务端 handler 与 AIDL 共用同一份实现，`jdspcli --socket` 也走这条通道。
+
 ## 9. 风险与回退
 
 | 风险 | 对策 |
