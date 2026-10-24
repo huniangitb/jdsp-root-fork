@@ -71,8 +71,13 @@ public final class JdspBridge {
     private static volatile int consecutiveFailures;
     private static volatile long droppedParams;
     private static volatile long sentParams;
+    private static volatile long broadcastedParams;
+    /** 上次刷新会话列表的时刻。 */
+    private static volatile long lastSessionRefresh;
 
     private static final ConcurrentHashMap<Long, Pending> COALESCE = new ConcurrentHashMap<Long, Pending>();
+    /** session<=0 的全局参数暂存区（等有真实会话时重放）。 */
+    private static final ConcurrentHashMap<Long, Pending> pendingBroadcast = new ConcurrentHashMap<Long, Pending>();
     private static final LinkedBlockingQueue<Pending> ORDERED_QUEUE = new LinkedBlockingQueue<Pending>();
     private static final Set<Integer> ATTACHED = java.util.Collections.synchronizedSet(new HashSet<Integer>());
 
@@ -128,6 +133,8 @@ public final class JdspBridge {
                 + " disabled=" + disabled
                 + " queued=" + (COALESCE.size() + ORDERED_QUEUE.size())
                 + " sent=" + sentParams
+                + " broadcasted=" + broadcastedParams
+                + " pendingGlobal=" + pendingBroadcast.size()
                 + " dropped=" + droppedParams
                 + " lastError=" + lastError;
     }
@@ -200,6 +207,12 @@ public final class JdspBridge {
                 }
                 JdspTransport t = ensureTransport();
                 if (t == null) { Thread.sleep(500); continue; }
+                // 每秒刷新一次会话列表，把暂存的全局参数补给新出现的会话
+                long now = System.currentTimeMillis();
+                if (now - lastSessionRefresh > 1000L) {
+                    lastSessionRefresh = now;
+                    try { replayPendingBroadcast(t); } catch (Throwable ignored) { }
+                }
                 for (Pending p : batch) {
                     if (disabled) break;
                     boolean ok = push(t, p);
@@ -216,29 +229,88 @@ public final class JdspBridge {
         }
     }
 
+    /**
+     * 下发一个参数。
+     *
+     * 关键点：App 的 legacy 模式只持有"全局实例"（AudioEffect 的 sessionId = 0），
+     * 而 jdspd 只接受真实 AudioFlinger session（>0）。因此 session<=0 的写入
+     * 会被**广播**到 jdspd 当前所有已挂载的会话——这正是"一份配置作用于所有播放会话"
+     * 的目标语义。
+     */
     private static boolean push(JdspTransport t, Pending p) {
         try {
-            if (ATTACHED.add(p.session)) {
-                t.attach(p.session);
+            if (p.session > 0) {
+                if (ATTACHED.add(p.session)) {
+                    t.attach(p.session);
+                }
+                int rc = t.setParam(p.session, p.param, p.value);
+                if (rc >= 0) {
+                    sentParams++;
+                    consecutiveFailures = 0;
+                    return true;
+                }
+                lastError = "setParam rc=" + rc + " via " + t.name();
+                consecutiveFailures++;
+                if (consecutiveFailures >= 5) {
+                    Log.w(TAG, "transport failing, re-select: " + lastError);
+                    dropTransport();
+                }
+                return false;
             }
-            int rc = t.setParam(p.session, p.param, p.value);
-            if (rc >= 0) {
-                sentParams++;
-                consecutiveFailures = 0;
+
+            // session <= 0：广播到所有已挂载会话
+            int[] sessions = broadcastTargets(t);
+            if (sessions == null || sessions.length == 0) {
+                // 还没有任何播放会话：参数暂存，等有会话时再重放
+                pendingBroadcast.put(Long.valueOf(p.key()), p);
                 return true;
             }
-            lastError = "setParam rc=" + rc + " via " + t.name();
-            consecutiveFailures++;
-            if (consecutiveFailures >= 5) {
-                Log.w(TAG, "transport failing, re-select: " + lastError);
-                dropTransport();
+            int ok = 0;
+            for (int s : sessions) {
+                if (ATTACHED.add(s)) {
+                    t.attach(s);
+                }
+                int rc = t.setParam(s, p.param, p.value);
+                if (rc >= 0) ok++;
+                else lastError = "broadcast setParam rc=" + rc + " session=" + s;
             }
+            sentParams += ok;
+            if (ok > 0) {
+                consecutiveFailures = 0;
+                broadcastedParams += ok;
+                return true;
+            }
+            consecutiveFailures++;
             return false;
         } catch (Throwable th) {
             lastError = th.getClass().getSimpleName() + ": " + th.getMessage();
             consecutiveFailures++;
             return false;
         }
+    }
+
+    /** 取 jdspd 已挂载的会话列表；失败时返回 null（调用方按"暂存"处理）。 */
+    private static int[] broadcastTargets(JdspTransport t) {
+        int[] sessions = t.listAttachedSessions();
+        if (sessions != null) return sessions;
+        return null;
+    }
+
+    /** 有新会话出现时，把暂存的全局参数重放给它们。 */
+    private static void replayPendingBroadcast(JdspTransport t) {
+        if (pendingBroadcast.isEmpty()) return;
+        int[] sessions = broadcastTargets(t);
+        if (sessions == null || sessions.length == 0) return;
+        java.util.List<Pending> list = new java.util.ArrayList<Pending>(pendingBroadcast.values());
+        pendingBroadcast.clear();
+        for (Pending p : list) {
+            for (int s : sessions) {
+                if (ATTACHED.add(s)) t.attach(s);
+                t.setParam(s, p.param, p.value);
+            }
+            sentParams += sessions.length;
+        }
+        Log.i(TAG, "replayed " + list.size() + " global param(s) to " + sessions.length + " session(s)");
     }
 
     private static synchronized void dropTransport() {

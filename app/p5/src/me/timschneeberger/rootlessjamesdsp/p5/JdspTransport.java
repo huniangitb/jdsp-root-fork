@@ -35,4 +35,11 @@ public interface JdspTransport {
 
     /** 让 jdspd 为会话创建/保持一个效果句柄；0 = ok。 */
     int attach(int sessionId);
+
+    /**
+     * 列出 jdspd 当前已挂载（attached=true）的会话 id。
+     * 用于把 App 的"全局实例"参数广播到所有真实播放会话。
+     * 失败返回 null。
+     */
+    int[] listAttachedSessions();
 }

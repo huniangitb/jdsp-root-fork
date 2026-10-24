@@ -157,6 +157,33 @@ public final class TcpTransport implements JdspTransport {
     }
 
     @Override
+    public int[] listAttachedSessions() {
+        try {
+            JSONObject req = new JSONObject();
+            req.put("op", "sessions");
+            String reply = roundTrip(req);
+            if (reply == null) return null;
+            JSONObject o = new JSONObject(reply);
+            if (!o.optBoolean("ok", false)) return null;
+            org.json.JSONArray arr = o.optJSONArray("sessions");
+            if (arr == null) return new int[0];
+            java.util.List<Integer> ids = new java.util.ArrayList<Integer>();
+            for (int i = 0; i < arr.length(); i++) {
+                JSONObject s = arr.optJSONObject(i);
+                if (s == null) continue;
+                if (!s.optBoolean("attached", false)) continue;
+                int id = s.optInt("sessionId", 0);
+                if (id > 0) ids.add(Integer.valueOf(id));
+            }
+            int[] out = new int[ids.size()];
+            for (int i = 0; i < out.length; i++) out[i] = ids.get(i).intValue();
+            return out;
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    @Override
     public int commit(int sessionId) {
         try {
             JSONObject req = new JSONObject();

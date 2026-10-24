@@ -32,8 +32,10 @@ module/package.sh                # 拷 dex → 打 zip → 结构/内容自检 �
 | 项 | 值 |
 |---|---|
 | 文件 | `dist/JDSP-fork-v2.0.0.zip` |
-| 大小 | 33,703,634 B |
-| sha256 | `25fd539c92f1df17f4da14c2e39b21179c5807b4429c38a97d3a88de3ff5aed8` |
+| 大小 | 33,704,660 B |
+| 内置 jdspd.dex | 99,872 B / sha256 `8e0188d29f81fb0da2a68c80332e7a5f3f1e6c7d8fa9cfa1f1182862514fb73f` |
+| 内置 jdspcli.dex | 62,208 B / sha256 `4f0f5a708b1a99bb31d3729b5805627a9f10bb677b649588d92cf1f742423432` |
+| sha256 | `533c813cf70956c4fa05e3f6afd0728db36291672112e763f27b7e0a42f84c31` |
 | `backend/jdspd.dex` | 99,200 B / `d43d1d0441c349032609f0a0e7eeda5dc098be6fc93edb29c060c750b9a8b498` |
 | `backend/jdspcli.dex` | 62,208 B / `4f0f5a708b1a99bb31d3729b5805627a9f10bb677b649588d92cf1f742423432` |
 | 构建时间 / 环境 | 2026-10-25 00:27 CST（重新打包：含日志轮转 + 挂载归属检测）/ xaga A15 SDK35 / build-tools 37.0.0 + cmdline-tools d8 / JDK 21 |

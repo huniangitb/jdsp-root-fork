@@ -152,6 +152,11 @@ public final class BinderTransport implements JdspTransport {
     }
 
     @Override
+    public int[] listAttachedSessions() {
+        return null;  // A 通道不实现会话列表（本机不可用，保留占位）
+    }
+
+    @Override
     public int commit(final int sessionId) {
         return transactInt(T_COMMIT, new Call() {
             @Override public void run(Parcel data, Parcel reply) {

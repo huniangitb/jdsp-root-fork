@@ -161,6 +161,11 @@ public final class ShellTransport implements JdspTransport {
     }
 
     @Override
+    public int[] listAttachedSessions() {
+        return null;  // B 通道不实现会话列表（低频兜底，保留占位）
+    }
+
+    @Override
     public int commit(int sessionId) {
         int[] r = exec(java.util.Collections.singletonList("commit"), null);
         return r == null ? -1 : (r[0] == 0 ? 0 : -2);

@@ -2,7 +2,7 @@
 
 - 日期：2026-10-25 00:16 – 00:40（CST）
 - 设备：Xiaomi xaga / Android 15 / SDK 35 / KernelSU + hybrid_mount（metamodule），serial `LNNZXG8TPFHU69AI`
-- 产物：`dist/JDSP-fork-v2.0.0.zip` 33,703,634 B / sha256 `25fd539c92f1df17f4da14c2e39b21179c5807b4429c38a97d3a88de3ff5aed8`
+- 产物：`dist/JDSP-fork-v2.0.0.zip` 33,704,660 B / sha256 `533c813cf70956c4fa05e3f6afd0728db36291672112e763f27b7e0a42f84c31`
 - 被测：`backend/out/jdspd.dex`（99,200 B，sha `d43d1d04…`）、`backend/out/jdspcli.dex`（62,208 B，sha `4f0f5a70…`）
 - 关联：`docs/ACCEPTANCE-P0.md`（v6.7.2 基线）、`docs/MODE-SWITCH.md`（mode 方案 + §6 共存约束）、
   `docs/BUILD-v2.md`（打包）、`docs/ACCEPTANCE-P2-P4-LEAD.md`（Lead 的 P2/P3/P4 实测）
@@ -52,7 +52,7 @@ Service jdsp.service: not found
 $ adb push dist/JDSP-fork-v2.0.0.zip /data/local/tmp/
 dist/JDSP-fork-v2.0.0.zip: 1 file pushed, 0 skipped. 37.3 MB/s (33703460 bytes in 0.861s)
 $ adb shell 'sha256sum /data/local/tmp/JDSP-fork-v2.0.0.zip'
-25fd539c92f1df17f4da14c2e39b21179c5807b4429c38a97d3a88de3ff5aed8
+533c813cf70956c4fa05e3f6afd0728db36291672112e763f27b7e0a42f84c31
 
 $ adb shell 'su -c "/data/adb/ksud module install /data/local/tmp/JDSP-fork-v2.0.0.zip"'
 ...

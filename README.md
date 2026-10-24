@@ -29,6 +29,21 @@
 App 只用于调参，**完全离线、甚至卸载都不影响音效**——参数由引擎自己持久化到
 `/data/vendor/audio/jamesdsp_state.bin` 并在每个新实例上重放。
 
+### v2.0.0：后端派发（`jdspd`）
+
+v6.7.2 的框架实例**没有客户端句柄**，所以参数只能靠状态文件异步重放。v2.0.0 增加一个常驻的
+root 守护进程 `jdspd`：它自己对每条播放会话持有 `AudioEffect` 句柄，参数**实时**下发（实测 1.1 ms），
+并对外暴露 binder 服务 `jdsp.service` 与 loopback TCP 控制通道。两种模式：
+
+| mode | 谁创建效果实例 | 适用 |
+|---|---|---|
+| `auto`（默认） | 框架 `<postprocess>` 创建，jdspd 接管该实例的句柄 | 与其它音效模块共存 |
+| `backend` | **jdspd 自己** `createEffect`，框架完全不参与 | 想彻底摆脱 postprocess |
+
+切换 mode 需要重启（挂载是 ro 镜像快照 + audioserver 只在启动时读一次 XML），
+`sh /data/adb/modules/ainur_jamesdsp/jdsp_mode.sh set auto|backend`。
+详见 `docs/PLAN-v2.md`（设计）、`docs/PLAN-v2-IMPL.md`（实施）、`docs/ACCEPTANCE-V2.md`（验收）。
+
 ---
 
 ## 目录
@@ -41,7 +56,9 @@ App 只用于调参，**完全离线、甚至卸载都不影响音效**——参
 | `native/test/` | 主机单元测试（状态文件格式、热加载、watcher、回退路径） |
 | `app/` | App 侧改动：中文翻译表 + 补丁说明（资源与 smali） |
 | `tools/` | 命令行调试工具 `JdspCtl`（免开 App 调参）与测试音生成器 |
-| `docs/` | 真机验收记录 |
+| `backend/` | **v2 后端派发**：`jdspd` 守护进程 + `jdspcli`（Java/app_process，AIDL 契约 + 单测） |
+| `scripts/` | `verify-v2.sh`：重启后一键验证（基线 / daemon / mode / 实例 / 参数） |
+| `docs/` | 真机验收记录（P0 基线、v2 验收、mode 方案、打包方法学、P5 App 接入） |
 
 ---
 
@@ -91,6 +108,15 @@ adb shell su -c 'CLASSPATH=/data/local/tmp/jdspctl.dex app_process /system/bin J
 
 # 状态文件（引擎自录自放）
 adb shell su -c 'ls -l /data/vendor/audio/jamesdsp_state.bin'
+```
+
+## v2 构建
+
+```sh
+cd backend && ./build.sh          # AIDL -> javac -> d8，产出 out/jdspd.dex / out/jdspcli.dex
+cd .. && bash module/package.sh   # 打包 dist/JDSP-fork-v2.0.0.zip（内置两个 dex）
+bash module/accept-v2.sh --tone   # 装机后验收（12-13 项）
+bash scripts/verify-v2.sh         # 交叉验证（10 项）
 ```
 
 ## 分支说明
