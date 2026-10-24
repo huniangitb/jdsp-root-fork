@@ -1,3 +1,10 @@
+### v6.7.2-fork
+
+* 安装器新增 AIDL 版本校验：只有当设备同时具备 `android.hardware.audio.effect.IFactory`
+  服务 **且** 存在 effect-V3 / common.types-V5 / common-V2 / common.fmq-V1 这四个 NDK 库时
+  才安装 AIDL 变体；否则回退 legacy 并提示重新构建。
+* 避免在 Android 13/14 的 AIDL 设备（effect V2）上装到无法加载的 .so 导致完全无声。
+
 ### v6.6.5-fork（内置 APK 换成汉化版：按设备配置默认开启 + 界面汉化）
 
 * 内置 APK 更新为 `JamesDSP-root-full-v1.6.15-59-zh.apk`（versionCode 59 / 1.6.15-zh）：

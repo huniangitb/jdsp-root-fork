@@ -51,10 +51,33 @@ LIB=$(lshal debug $(lshal | grep -oE "android.hardware.audio.effect@[0-9]+\.[0-9
 
 LIB2=$(file /*/bin/hw/android.hardware.audio.service* 2>/dev/null | grep -oE "32-bit|64-bit" | head -n 1)
 
-if service list | grep -q "android.hardware.audio.effect.IFactory"; then
-AIDL=true
-else
+# The AIDL variant is built against one specific pair of platform AIDL
+# libraries (effect V3 + common.types V5) and only exists for arm64.  An AIDL
+# effects HAL alone is not enough: Android 13/14 devices usually ship
+# effect V2 / types V2, and the bundled library would fail to load there.
+# Require both the service *and* the exact NDK libraries it links against.
+jdsp_has_ndk_lib() {
+  for _d in /system/lib64 /system_ext/lib64 /vendor/lib64 /odm/lib64 /apex/*/lib64; do
+    [ -f "$_d/$1" ] && return 0
+  done
+  return 1
+}
+
 AIDL=false
+if service list 2>/dev/null | grep -q "android.hardware.audio.effect.IFactory"; then
+  if [ -f "$MODPATH/common/files/aidl/libjamesdsp.so" ] && \
+     jdsp_has_ndk_lib android.hardware.audio.effect-V3-ndk.so && \
+     jdsp_has_ndk_lib android.media.audio.common.types-V5-ndk.so && \
+     jdsp_has_ndk_lib android.hardware.common-V2-ndk.so && \
+     jdsp_has_ndk_lib android.hardware.common.fmq-V1-ndk.so; then
+    AIDL=true
+  else
+    ui_print " "
+    ui_print "   ! AIDL effects HAL detected, but this device ships a"
+    ui_print "   ! different AIDL version than the bundled library"
+    ui_print "   ! (effect V3 / common.types V5). Using the legacy library."
+    ui_print "   ! Rebuild native/aidl with the versions this device has."
+  fi
 fi
 
 ui_print " "
