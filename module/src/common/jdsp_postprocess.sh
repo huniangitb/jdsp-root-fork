@@ -18,7 +18,9 @@ jdsp_apply_music() {
 	grep -q '<audio_effects_conf' "$f" 2>/dev/null || return 0
 	# Normalise: keep exactly one <apply effect="jamesdsp"/> so that a
 	# file patched by an older module run does not end up with duplicates.
-	sed -i '/<apply effect="jamesdsp"\/>/d' "$f" 2>/dev/null
+	# Strip the token in place (not the whole line) so a <stream> wrapper that we
+	# added earlier survives and can be reused instead of accumulating blocks.
+	sed -i 's|<apply effect="jamesdsp"/>||g' "$f" 2>/dev/null
 
 
 	awk '

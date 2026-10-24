@@ -122,21 +122,10 @@ fi
 cp_ch $MODPATH/common/files/$QARCH/libjamesdsp.so $MODPATH/system/lib/soundfx/libjamesdsp.so
 
 
-# Another module (e.g. a vendor audio boost patch) can ship its own copy of
-# audio_effects.xml and win the mount.  We deliberately do NOT edit those
-# files: enabling post processing on a device whose vendor left the block
-# commented out changes effect routing and has been observed to break
-# vendor effects (Dolby/DAP on MediaTek).  Just report the situation.
-jdsp_report_foreign_config() {
-	for f in $(find /data/adb/modules /data/adb/modules_update -name 'audio_effects.xml' 2>/dev/null); do
-		case "$f" in */ainur_jamesdsp/*) continue;; esac
-		grep -q 'jamesdsp' "$f" 2>/dev/null && continue
-		ui_print "   ! another module owns $f"
-		ui_print "   ! JamesDSP will not be applied globally while it wins the mount;"
-		ui_print "   ! use the app, or disable that module to hand the config back"
-	done
-}
-jdsp_report_foreign_config
+# Cross-module merging is done by aml.sh at boot: it scans every module's
+# audio_effects.xml/.conf, adds the library/effect declarations and exactly
+# one <apply> for the music stream.  Keep install-time work limited to our
+# own copies so a failed install cannot leave another module half patched.
 
 set +x
 # App only works when installed normally to data in oreo+

@@ -14,21 +14,64 @@ NAME=jamesdsp
 UUID=f27317f4-c984-4de6-9a90-545759495bf2
 TYPE=f98765f4-c321-5de6-9a45-123459495ab2
 
+# <postprocess> 自动挂载条目与 <library>/<effect> 声明分开维护：
+# 声明已存在时下面的循环会跳过声明部分，但 <apply> 仍必须单独补齐，
+# 否则库虽然注册了却不会被挂到 music 流。
+# 幂等实现：先删掉所有旧条目，再插入恰好一条。重复条目会让 AudioFlinger
+# 建链失败，并连带把厂商的全局效果（例如杜比 DAP）一起带掉。
+aml_apply_music() {
+	XML="$1"
+	[ -f "$XML" ] || return 0
+	grep -q "<audio_effects_conf" "$XML" 2>/dev/null || return 0
+	sed -i 's|<apply effect="jamesdsp"/>||g' "$XML"
+	awk '
+		{ L[NR] = $0 }
+		END {
+			n = NR; inc = 0
+			for (i = 1; i <= n; i++) {
+				C[i] = inc
+				s = L[i]; k = 1
+				while (k <= length(s)) {
+					if (!inc && substr(s, k, 4) == "<!--") { inc = 1; k += 4; continue }
+					if (inc && substr(s, k, 3) == "-->") { inc = 0; k += 3; continue }
+					k++
+				}
+			}
+			APPLY = "<apply effect=\"jamesdsp\"/>"
+			OPEN  = "<stream type=\"music\">"
+			for (i = 1; i <= n; i++)
+				if (C[i] == 0 && index(L[i], OPEN) > 0) {
+					p = index(L[i], OPEN) + length(OPEN)
+					L[i] = substr(L[i], 1, p - 1) APPLY substr(L[i], p)
+					for (j = 1; j <= n; j++) print L[j]
+					exit
+				}
+			for (i = 1; i <= n; i++) {
+				if (C[i] == 0 && index(L[i], "</audio_effects_conf>") > 0) {
+					print "    <postprocess>"
+					print "        " OPEN APPLY "</stream>"
+					print "    </postprocess>"
+				}
+				print L[i]
+			}
+		}
+	' "$XML" > "$XML.aml" && mv -f "$XML.aml" "$XML"
+}
+
 patchxml() {
 if [ ! -z "$AUDEFXML" ]; then
-	if [ $AIDL == "true" ]; then
-		for XML in $AUDEFXML; do
-			grep -q "$LIBNAME" "$XML" && continue
-			sed -i "/<libraries>/a\        <library name=\"$LIBNAME\" path=\"$LIB\"\/>" "$XML"
-			sed -i "/<effects>/a\        <effect name=\"$NAME\" library=\"$LIBNAME\" uuid=\"$UUID\"\ type=\"$TYPE\"\/>" "$XML"
-		done
-	else
-		for XML in $AUDEFXML; do
-			grep -q "$LIBNAME" "$XML" && continue
-			sed -i "/<libraries>/a\        <library name=\"$LIBNAME\" path=\"$LIB\"\/>" "$XML"
-			sed -i "/<effects>/a\        <effect name=\"$NAME\" library=\"$LIBNAME\" uuid=\"$UUID\"\/>" "$XML"
-		done
-	fi
+	for XML in $AUDEFXML; do
+		if ! grep -q "$LIBNAME" "$XML"; then
+			if [ $AIDL == "true" ]; then
+				sed -i "/<libraries>/a\        <library name=\"$LIBNAME\" path=\"$LIB\"\/>" "$XML"
+				sed -i "/<effects>/a\        <effect name=\"$NAME\" library=\"$LIBNAME\" uuid=\"$UUID\"\ type=\"$TYPE\"\/>" "$XML"
+			else
+				sed -i "/<libraries>/a\        <library name=\"$LIBNAME\" path=\"$LIB\"\/>" "$XML"
+				sed -i "/<effects>/a\        <effect name=\"$NAME\" library=\"$LIBNAME\" uuid=\"$UUID\"\/>" "$XML"
+			fi
+		fi
+		aml_apply_music "$XML"
+	done
 fi
 }
 
