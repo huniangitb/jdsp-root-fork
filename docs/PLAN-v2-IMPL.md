@@ -1,6 +1,7 @@
 # JamesDSP 后端派发架构 (v2) —— 实施计划与执行记录
 
-状态：**实施中**（本文件是 PLAN-v2 的落地版：把设计稿拆成可执行任务、记录真机验证结论）
+状态：**P0–P6 全部落地，v2.0.0 已装机验收**（本文件是 PLAN-v2 的落地版：把设计稿拆成可执行任务、记录真机验证结论）
+验收证据：`docs/ACCEPTANCE-P0.md`、`docs/ACCEPTANCE-V2.md`、`docs/ACCEPTANCE-P2-P4-LEAD.md`、`docs/ACCEPTANCE-v2-P1-P4.md`、`docs/P5-APP-INTEGRATION.md`
 基线：v6.7.2-fork（versionCode 112）
 关联：`docs/PLAN-v2.md`（设计稿，不动）
 
@@ -221,3 +222,33 @@ App 敞开，**不采纳**。
 | SELinux：App 直连 `jdsp.service` | 先给 su 域打通（CLI 可用），App 走 root shell 兜底；需要时 `ksud sepolicy apply` 加规则 |
 | 守护进程被杀 | `service.sh` 看护循环自动重启；`stats` 里暴露启动时间/重启次数 |
 | 回退 | 模块保留 postprocess 链路；`mode=auto` + 禁用 jdspd 即回到 v6.7.2 行为 |
+
+---
+
+## 10. 交付结果（2026-10-25 01:00）
+
+| 阶段 | 状态 | 证据 |
+|---|---|---|
+| P0 干净基线 | ✅ | 设备 lib sha = 仓库基线 `b6e1fc1f…`；实验 socket 代码消失；**发现并修复** MTK HAL 域（`mtk_hal_audio`）缺 sepolicy 导致状态持久化静默失效 |
+| P1 jdspd + AIDL + jdspcli | ✅ | 15 个 daemon 类 + 19 个 CLI 类；`jdsp.service` binder 与 loopback TCP 双通道；主机单测 146 项全绿 |
+| P2 后端主动挂载 | ✅ | **正式判据通过**：postprocess 关掉（apply=0）后 music 会话由 jdspd 自建 `effectId=43`，underrun 0/0 |
+| P3 实时调参 | ✅ | setParam 端到端 avg 1.1–2.3 ms（目标 <20 ms）；引擎侧 state.bin 同步落盘；getParam 三层兜底（引擎不支持 GET_PARAM） |
+| P4 按应用策略 | ✅ | uid→pkg（341 uid）+ follow/on/exclude；排除后实例实时摘除，其它会话不受影响 |
+| P5 前端改造 | ⚠️ 部分 | 传输链对真 jdspd 打通（App 改参数 → 引擎，实测）；补丁 APK 已装机冒烟；**未做**：杀/卸载前端完整验收、UI 层去掉 AudioEffect（第二阶段） |
+| P6 多设备 + 打包 | ⚠️ 部分 | `dist/JDSP-fork-v2.0.0.zip` 已出并装机验收 13/13；**只有 xaga/Android 15 一台**，c16/c17 未验 |
+
+### 关键数字
+
+- `accept-v2.sh --tone`：**13/13 PASS**（最终包 sha256 `533c813c…`）
+- `scripts/verify-v2.sh`：**10/10 PASS**
+- `backend/test/run_tests.sh`：**146/146 PASS**
+- setParam 端到端：p50 ≈ 1.6 ms / p95 ≈ 2.7 ms / 0 失败（200 次）
+- 短时稳定：454 次下发 / 406 次 watcher / 0 失败 / 0 underrun / audioserver 未重启
+
+### 已知未完成项（不要当成已完成）
+
+1. **72 h 长稳**未跑（只有 7 分钟观察 + 脚本就绪）。
+2. **c16 / c17 多设备**未验（PLAN-v2 P6 要求三台）。
+3. **P5 第二阶段**（App 彻底不再持有 AudioEffect、配置只从 jdspd 读）未做；当前是"镜像"形态。
+4. App 卸载重装后 token 文件重建（daemon 侧低频自愈）待补。
+5. 引擎 v6.7.2 没有全局启停命令（cmd 400）与响度调音（1303），App 的 setEnabled 镜像暂无法落地。
