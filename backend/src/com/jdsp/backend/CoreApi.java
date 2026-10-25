@@ -27,7 +27,7 @@ import org.json.JSONObject;
  */
 public final class CoreApi {
     /** Reported by getVersion / ping. */
-    public static final String VERSION = "jdspd 2.1.0";
+    public static final String VERSION = "jdspd 2.1.1";
     /** Returned by ping(). */
     public static final int PING_OK = 1;
     /**
@@ -479,6 +479,26 @@ public final class CoreApi {
 
     public int savePreset(String path) {
         return config.savePreset(path);
+    }
+
+    /**
+     * Restores the canonical parameter baseline (see {@link com.jdsp.common.ParamBaseline}):
+     * replaces globalParams with the known-good set, optionally clears every perAppParams
+     * scope, persists immediately and broadcasts the new values to every currently mounted
+     * session (the same replay path a preset load uses).
+     *
+     * @param clearPerApp true = also clear perAppParams (all scopes)
+     * @return the number of engine writes applied to mounted sessions (0 when none are
+     *         attached or the master switch is off - the stored configuration is restored
+     *         either way)
+     */
+    public int applyBaseline(boolean clearPerApp) {
+        config.applyBaseline(clearPerApp);
+        config.save();
+        int applied = watcher.reapplyAll();
+        watcher.poke();
+        Log.i("baseline broadcast: " + applied + " write(s) to mounted session(s)");
+        return applied;
     }
 
     // ---- policy --------------------------------------------------------------

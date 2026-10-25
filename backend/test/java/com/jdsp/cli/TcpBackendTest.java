@@ -361,6 +361,22 @@ public final class TcpBackendTest {
             Assert.eq("a\"b\\c", rows.get(0).pkg());
         });
 
+        suite.test("tcp: applyBaseline sends the all flag and parses applied", () -> {
+            Exchange plain = new Exchange("{\"ok\":true,\"applied\":0,\"clearPerApp\":false}");
+            Assert.eq(0, plain.backend.applyBaseline(false));
+            Assert.eq("{\"cmd\":\"applyBaseline\",\"all\":false}\n", plain.requests());
+            Exchange all = new Exchange("{\"ok\":true,\"applied\":52,\"clearPerApp\":true}");
+            Assert.eq(52, all.backend.applyBaseline(true));
+            Assert.eq("{\"cmd\":\"applyBaseline\",\"all\":true}\n", all.requests());
+        });
+
+        suite.test("tcp: applyBaseline failure is exit 4", () -> {
+            Exchange ex = new Exchange(
+                    "{\"ok\":false,\"error\":\"internal\",\"code\":-1004}");
+            CliException error = Assert.cliCode(Exit.REMOTE, () -> ex.backend.applyBaseline(false));
+            Assert.contains(error.getMessage(), "internal");
+        });
+
         // ---- loopback TCP handshake and endpoint files -------------------
         suite.test("tcp: connects, handshakes and serves commands", () -> {
             FakeServer server = new FakeServer("{\"ok\":true,\"op\":\"hello\",\"version\":\"jdspd 2.0.0\"}",

@@ -19,7 +19,7 @@ public final class CommandParser {
 
     static final Set<String> COMMANDS = Collections.unmodifiableSet(new HashSet<String>(Arrays.asList(
             "sessions", "get", "set", "attach", "detach", "commit", "dump-config", "dump-session",
-            "stats", "ping", "version", "mode", "policy", "bench", "help", "enabled")));
+            "stats", "ping", "version", "mode", "policy", "bench", "help", "enabled", "baseline")));
 
     public static ParsedCommand parse(String[] argv) throws CliException {
         if (argv == null || argv.length == 0) {
@@ -33,6 +33,7 @@ public final class CommandParser {
         boolean tcp = false;
         String tcpEndpoint = null;
         boolean endOfOptions = false;
+        boolean all = false;
         String hex = null;
         String intValue = null;
         String shortValue = null;
@@ -62,6 +63,9 @@ public final class CommandParser {
             if ("--json".equals(name)) {
                 requireNoInline(name, inline);
                 json = true;
+            } else if ("--all".equals(name)) {
+                requireNoInline(name, inline);
+                all = true;
             } else if ("--help".equals(name) || "-h".equals(name)) {
                 requireNoInline(name, inline);
                 help = true;
@@ -123,7 +127,7 @@ public final class CommandParser {
         if (positional.isEmpty()) {
             if (help) {
                 return new ParsedCommand("help", positional, json, true, raw, tcp, tcpEndpoint,
-                        hex, intValue, shortValue, iters);
+                        hex, intValue, shortValue, iters, all);
             }
             throw new CliException(Exit.USAGE, "missing command (try 'jdspcli help')");
         }
@@ -133,7 +137,7 @@ public final class CommandParser {
                     "unknown command: " + command + " (try 'jdspcli help')");
         }
         return new ParsedCommand(command, positional, json, help, raw, tcp, tcpEndpoint, hex,
-                intValue, shortValue, iters);
+                intValue, shortValue, iters, all);
     }
 
     private static boolean isOption(String token) {

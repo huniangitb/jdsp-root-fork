@@ -13,6 +13,7 @@ public final class AllTests {
         com.jdsp.common.BypassRuleTest.run(suite);
         com.jdsp.common.EnableSwitchTest.run(suite);
         com.jdsp.common.EngineWriteLockTest.run(suite);
+        com.jdsp.common.ParamBaselineTest.run(suite);
         com.jdsp.backend.EffectManagerDetachTest.run(suite);
         com.jdsp.backend.AttachDebounceTest.run(suite);
         com.jdsp.backend.EffectManagerParallelTest.run(suite);

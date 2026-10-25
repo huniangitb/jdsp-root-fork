@@ -51,5 +51,11 @@ public interface Backend {
     /** Current state of the global master switch. */
     boolean getEnabled() throws CliException;
 
+    /**
+     * Restores the canonical parameter baseline and broadcasts it to mounted sessions.
+     * @return the number of engine writes applied (>= 0), negative on error
+     */
+    int applyBaseline(boolean clearPerApp) throws CliException;
+
     String stats() throws CliException;
 }

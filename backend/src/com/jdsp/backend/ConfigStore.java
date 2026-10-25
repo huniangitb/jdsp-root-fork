@@ -246,6 +246,23 @@ public final class ConfigStore {
         dirty = true;
     }
 
+    /**
+     * Replaces the global parameters with the canonical baseline and (optionally) clears
+     * every perAppParams scope. Used by {@code jdspcli baseline [--all]} to restore a
+     * known-good configuration after test runs or garbage pushes; see {@link ParamBaseline}
+     * (com.jdsp.common) for the value set and its history.
+     */
+    public synchronized void applyBaseline(boolean clearPerApp) {
+        globalParams.clear();
+        globalParams.putAll(com.jdsp.common.ParamBaseline.params());
+        if (clearPerApp) {
+            perAppParams.clear();
+        }
+        dirty = true;
+        Log.i("baseline applied: " + globalParams.size() + " global param(s)"
+                + (clearPerApp ? ", perAppParams cleared" : ", perAppParams kept"));
+    }
+
     /** Global parameters overlaid with the per app overrides of {@code pkg}. */
     public synchronized Map<Integer, byte[]> paramsFor(String pkg) {
         Map<Integer, byte[]> out = new LinkedHashMap<Integer, byte[]>();

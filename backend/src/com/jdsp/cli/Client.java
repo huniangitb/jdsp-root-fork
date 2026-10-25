@@ -280,6 +280,15 @@ public final class Client implements Backend {
     }
 
     @Override
+    public int applyBaseline(boolean clearPerApp) throws CliException {
+        try {
+            return service.applyBaseline(clearPerApp);
+        } catch (RemoteException e) {
+            throw unavailable("applyBaseline", e);
+        }
+    }
+
+    @Override
     public String stats() throws CliException {
         try {
             return service.stats();

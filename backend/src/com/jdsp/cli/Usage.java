@@ -29,6 +29,10 @@ public final class Usage {
             + "  mode [auto|backend]            Show or set the architecture mode\n"
             + "  enabled [on|off]               Show or set the global master switch\n"
             + "                                 (off = every session's effect is bypassed)\n"
+            + "  baseline [--all]               Restore the canonical parameter baseline\n"
+            + "                                 (known-good globalParams) and broadcast it to\n"
+            + "                                 every mounted session; --all also clears every\n"
+            + "                                 perAppParams scope. Run before/after tests.\n"
             + "  policy list                    All per-app policies (JSON)\n"
             + "  policy get <pkg>               Show one app policy\n"
             + "  policy set <pkg> <follow|on|exclude>\n"
@@ -94,6 +98,9 @@ public final class Usage {
         }
         if ("enabled".equals(command)) {
             return "jdspcli enabled [on|off]";
+        }
+        if ("baseline".equals(command)) {
+            return "jdspcli baseline [--all]";
         }
         if ("policy".equals(command)) {
             return "jdspcli policy list|get <pkg>|set <pkg> <follow|on|exclude>";

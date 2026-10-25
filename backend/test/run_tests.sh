@@ -69,7 +69,8 @@ fi
 #    have no Android dependency
 echo
 UNIT_RC=0
-java -cp "$BUILD/test-classes:$BUILD/classes" com.jdsp.cli.AllTests || UNIT_RC=$?
+java -Djdsp.baseline.json="$BACKEND/../scripts/baseline.json" \
+        -cp "$BUILD/test-classes:$BUILD/classes" com.jdsp.cli.AllTests || UNIT_RC=$?
 
 # 5) shell-level self-test of the shared device-selection library
 #    (used by scripts/verify-v2.sh, module/accept-v2.sh and this script)

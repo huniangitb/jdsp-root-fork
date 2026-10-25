@@ -43,6 +43,12 @@ TOMB_MARK=$(date +%s)
 PID0=$($ADB shell su -c 'pidof audioserver' | tr -d '\r')
 log "baseline audioserver pid=$PID0, marker=$TOMB_MARK"
 cli "enabled on" >/dev/null
+# Restore the canonical parameter baseline (jdspcli baseline --all) before and after
+# the probe (incl. the abnormal-exit paths): stress residue must not leak into the
+# next configuration (2026-10-25 regression class). Best effort with an old jdspcli.
+cli_baseline() { cli "baseline --all" >/dev/null 2>&1 || log "warn: baseline failed (old jdspcli?)"; }
+trap cli_baseline EXIT
+cli_baseline
 
 new_tombstones() {
     $ADB shell su -c "ls /data/system/dropbox/ 2>/dev/null" \

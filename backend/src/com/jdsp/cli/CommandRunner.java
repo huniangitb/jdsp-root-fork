@@ -94,6 +94,9 @@ public final class CommandRunner {
         if ("enabled".equals(command)) {
             return enabled(cmd);
         }
+        if ("baseline".equals(command)) {
+            return baseline(cmd);
+        }
         if ("policy".equals(command)) {
             return policy(cmd);
         }
@@ -280,6 +283,29 @@ public final class CommandRunner {
             out.println("{\"ok\":true,\"enabled\":" + requested + "}");
         } else {
             out.println("enabled=" + (requested ? "on" : "off"));
+        }
+        return Exit.OK;
+    }
+
+    /**
+     * Restores the canonical parameter baseline embedded in jdspd (globalParams), broadcasts
+     * it to every mounted session and persists it. "baseline --all" additionally clears every
+     * perAppParams scope. Used by the test drivers before/after each run so test residue can
+     * never leak into the next configuration (see com.jdsp.common.ParamBaseline).
+     */
+    private int baseline(ParsedCommand cmd) throws CliException {
+        requireArgs(cmd, 0, 0);
+        rejectValueOptions(cmd);
+        int applied = backend().applyBaseline(cmd.all());
+        if (applied < 0) {
+            throw new CliException(Exit.REMOTE, "applyBaseline failed: remote status " + applied);
+        }
+        if (cmd.json()) {
+            out.println("{\"ok\":true,\"clearPerApp\":" + cmd.all()
+                    + ",\"applied\":" + applied + "}");
+        } else {
+            out.println("ok baseline applied=" + applied
+                    + (cmd.all() ? " perAppParams=cleared" : ""));
         }
         return Exit.OK;
     }

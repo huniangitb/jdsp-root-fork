@@ -281,6 +281,14 @@ public final class TcpBackend implements Backend {
     }
 
     @Override
+    public int applyBaseline(boolean clearPerApp) throws CliException {
+        Map<String, Object> response = call(request("applyBaseline", "all",
+                Boolean.valueOf(clearPerApp)));
+        requireOk(response);
+        return Json.intValue(response, "applied", 0);
+    }
+
+    @Override
     public String stats() throws CliException {
         Map<String, Object> response = call(request("stats"));
         requireOk(response);

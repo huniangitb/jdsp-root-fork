@@ -34,6 +34,10 @@ public final class DriverTest {
         int setPolicyStatus;
         byte[] getReply;
 
+        int baselineCalls;
+        boolean lastBaselineClearPerApp;
+        int baselineApplied = 26;
+
         int lastSession = -1;
         int lastParam = -1;
         int lastVsize = -1;
@@ -167,6 +171,13 @@ public final class DriverTest {
         @Override
         public boolean getEnabled() {
             return enabledValue;
+        }
+
+        @Override
+        public int applyBaseline(boolean clearPerApp) {
+            lastBaselineClearPerApp = clearPerApp;
+            baselineCalls++;
+            return baselineApplied;
         }
 
         @Override
@@ -501,6 +512,45 @@ public final class DriverTest {
             Result r = run(of(backend), "bench", "161", "1500", "0.5", "--iters", "3");
             Assert.eq(Exit.REMOTE, r.code);
             Assert.contains(r.err, "did not match");
+        });
+
+        suite.test("driver: baseline broadcasts and reports the applied count", () -> {
+            FakeBackend backend = new FakeBackend();
+            Result r = run(of(backend), "baseline");
+            Assert.eq(Exit.OK, r.code);
+            Assert.eq(1, backend.baselineCalls);
+            Assert.isTrue(!backend.lastBaselineClearPerApp, "plain baseline keeps perAppParams");
+            Assert.eq("ok baseline applied=26\n", r.out);
+        });
+
+        suite.test("driver: baseline --all clears perAppParams", () -> {
+            FakeBackend backend = new FakeBackend();
+            Result r = run(of(backend), "baseline", "--all");
+            Assert.eq(Exit.OK, r.code);
+            Assert.isTrue(backend.lastBaselineClearPerApp, "--all must clear perAppParams");
+            Assert.contains(r.out, "perAppParams=cleared");
+        });
+
+        suite.test("driver: baseline json output", () -> {
+            FakeBackend backend = new FakeBackend();
+            Result r = run(of(backend), "--json", "baseline", "--all");
+            Assert.eq(Exit.OK, r.code);
+            Assert.contains(r.out, "\"ok\":true");
+            Assert.contains(r.out, "\"clearPerApp\":true");
+            Assert.contains(r.out, "\"applied\":26");
+        });
+
+        suite.test("driver: baseline rejects arguments and value options", () -> {
+            Assert.eq(Exit.USAGE, run(of(new FakeBackend()), "baseline", "extra").code);
+            Assert.eq(Exit.USAGE, run(of(new FakeBackend()), "baseline", "--hex", "00").code);
+        });
+
+        suite.test("driver: baseline remote failure exits 4", () -> {
+            FakeBackend backend = new FakeBackend();
+            backend.baselineApplied = -1004;
+            Result r = run(of(backend), "baseline");
+            Assert.eq(Exit.REMOTE, r.code);
+            Assert.contains(r.err, "remote status -1004");
         });
 
         suite.test("driver: unknown command is a usage error", () -> {

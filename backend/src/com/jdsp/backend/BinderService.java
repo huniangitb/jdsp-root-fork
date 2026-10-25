@@ -308,6 +308,16 @@ public final class BinderService extends IJdspService.Stub {
         }
     }
 
+    @Override
+    public int applyBaseline(boolean clearPerApp) {
+        try {
+            return api.applyBaseline(clearPerApp);
+        } catch (Throwable t) {
+            Log.e("applyBaseline failed", t);
+            return EffectManager.ERR_INTERNAL;
+        }
+    }
+
     // ---- helpers -------------------------------------------------------------
 
     private static JdspSession toParcel(CoreApi.SessionView v) {

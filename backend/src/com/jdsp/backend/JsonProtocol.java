@@ -354,6 +354,12 @@ public final class JsonProtocol {
             int rc = "loadpreset".equals(cmd) ? api.loadPreset(path) : api.savePreset(path);
             return rc == 0 ? Reply.status(0) : Reply.error(cmd + " failed", rc);
         }
+        if ("applybaseline".equals(cmd) || "baseline".equals(cmd)) {
+            // "all" (jdspcli baseline --all) additionally clears every perAppParams scope.
+            boolean all = req.optBoolean("all", false) || req.optBoolean("clearPerApp", false);
+            int applied = api.applyBaseline(all);
+            return Reply.ok().with("applied", applied).with("clearPerApp", all);
+        }
         if ("shutdown".equals(cmd) || "stop".equals(cmd)) {
             // Extra command (not in the AIDL contract): graceful stop used by "Daemon --stop"
             // and by the module's supervisor, because ART does not run shutdown hooks on SIGTERM.

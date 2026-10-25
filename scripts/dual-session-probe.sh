@@ -16,6 +16,16 @@ CLI="/data/adb/modules/ainur_jamesdsp/backend/jdspcli.dex app_process /system/bi
 name=$1; A=$2; B=$3; both=$4; solo=$5; en=${6:-keep}
 out=/tmp/p0/$name; mkdir -p "$out"
 
+# Restore the canonical parameter baseline (jdspcli baseline --all): wipes test
+# residue in globalParams/perAppParams before AND after the run, so this probe can
+# never leak values into the next test session (2026-10-25 regression class).
+cli_baseline() {
+  $ADBX shell su -c "CLASSPATH=$CLI baseline --all" >/dev/null 2>&1 || \
+    echo "warn: baseline unsupported (old jdspcli?) or failed" >&2
+}
+trap cli_baseline EXIT
+cli_baseline
+
 if [ "$en" != "keep" ]; then
   $ADBX shell su -c "CLASSPATH=$CLI $en" > "$out/enabled_set.txt" 2>&1
 fi

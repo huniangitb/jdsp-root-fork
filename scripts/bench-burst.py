@@ -13,14 +13,39 @@ setParam，值每条都变（postGain 在 ±12 dB 正弦扫动，模拟实时拖
 
 用法：adb forward 已由调用方设置好。
   bench-burst.py --port 14271 --token <hex> [--seconds 30] [--rate 100] [--session 289]
+
+开始前与结束后（含异常退出）都会执行一次 `jdspcli baseline --all`（经 adb + su），
+恢复 canonical 参数基线：burst 残留（例如 postGain 扫动留下的值）不得污染下一轮
+配置（2026-10-25 回归类）。旧 jdspcli 不认识 baseline 时按告警跳过。
 """
 import argparse
 import json
 import math
 import socket
 import struct
+import subprocess
 import sys
 import time
+
+DEFAULT_CLI = "/data/adb/modules/ainur_jamesdsp/backend/jdspcli.dex app_process /system/bin com.jdsp.cli.Main"
+
+
+def adb_baseline(serial, cli):
+    """One best-effort `jdspcli baseline --all` over adb; never raises."""
+    try:
+        cmd = ["adb"]
+        if serial:
+            cmd += ["-s", serial]
+        cmd += ["shell", "su", "-c", "CLASSPATH=%s baseline --all" % cli]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        out = (r.stdout or "").strip()
+        if "ok baseline" not in out:
+            print("warn: baseline failed or unsupported: %s %s"
+                  % (out, (r.stderr or "").strip()))
+        else:
+            print("baseline: %s" % out)
+    except Exception as e:
+        print("warn: baseline adb call failed: %s" % e)
 
 
 def float3le(a, b, c):
@@ -34,8 +59,24 @@ def main():
     ap.add_argument("--seconds", type=float, default=30.0)
     ap.add_argument("--rate", type=float, default=100.0)
     ap.add_argument("--session", type=int, required=True)
+    ap.add_argument("--serial", default="LNNZXG8TPFHU69AI",
+                    help="adb serial for the baseline restore (empty string = skip)")
+    ap.add_argument("--cli", default=DEFAULT_CLI,
+                    help="device-side jdspcli invocation used for the baseline restore")
     args = ap.parse_args()
 
+    if args.serial:
+        adb_baseline(args.serial, args.cli)
+
+    try:
+        return run_burst(args)
+    finally:
+        # Restore the baseline on every exit path, exceptions included.
+        if args.serial:
+            adb_baseline(args.serial, args.cli)
+
+
+def run_burst(args):
     s = socket.create_connection(("127.0.0.1", args.port), timeout=5)
     s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     f = s.makefile("rwb")

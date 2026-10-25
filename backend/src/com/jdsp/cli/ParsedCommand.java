@@ -17,10 +17,11 @@ public final class ParsedCommand {
     private final String intValue;
     private final String shortValue;
     private final String iters;
+    private final boolean all;
 
     ParsedCommand(String command, List<String> args, boolean json, boolean help, boolean raw,
                   boolean tcp, String tcpEndpoint, String hex, String intValue,
-                  String shortValue, String iters) {
+                  String shortValue, String iters, boolean all) {
         this.command = command;
         this.args = Collections.unmodifiableList(new ArrayList<String>(args));
         this.json = json;
@@ -32,6 +33,7 @@ public final class ParsedCommand {
         this.intValue = intValue;
         this.shortValue = shortValue;
         this.iters = iters;
+        this.all = all;
     }
 
     public String command() {
@@ -86,6 +88,11 @@ public final class ParsedCommand {
 
     public String iters() {
         return iters;
+    }
+
+    /** True when --all was given (e.g. "baseline --all": also clear perAppParams). */
+    public boolean all() {
+        return all;
     }
 
     public String option(String name) {
