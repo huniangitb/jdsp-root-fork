@@ -109,6 +109,11 @@ public final class TcpService {
      * (or reinstalled) later can still be served once the files show up.
      */
     public boolean start() {
+        if (!new File(dirPath).isDirectory()) {
+            // The App may be installed without ever having been launched (fresh install or
+            // reinstall): create files/ ourselves so the endpoint files land right away.
+            ensureAppFilesDir();
+        }
         File dir = new File(dirPath);
         if (!dir.isDirectory()) {
             // The App is not installed (yet). Keep listening: the token file is what actually
@@ -316,6 +321,12 @@ public final class TcpService {
         if (port <= 0) {
             return false;
         }
+        if (!new File(dirPath).isDirectory()) {
+            // App reinstalled but never launched: Android does not create files/ on install,
+            // only on the App's first getFilesDir() call. Create it ourselves so the endpoint
+            // files are ready before the App's very first connection attempt.
+            ensureAppFilesDir();
+        }
         File dir = new File(dirPath);
         if (!dir.isDirectory()) {
             // App not installed: nothing to do, and nothing to complain about.
@@ -352,6 +363,44 @@ public final class TcpService {
             Log.i("tcp: endpoint files (re)written: " + portFile + " port=" + port);
         }
         return ok;
+    }
+
+    /**
+     * Creates the App's {@code files/} directory when the App data root exists without it.
+     *
+     * <p>Why: after a reinstall {@code /data/data/<pkg>} exists (owned by the new App uid) but
+     * {@code files/} does not — Android only creates it on the App's first {@code getFilesDir()}.
+     * Waiting for the App to be launched means its first connection attempt always fails;
+     * creating the directory as root with the App's ownership removes that window
+     * ({@code getFilesDir()} reuses an existing directory without complaints).
+     *
+     * <p>The uid >= 10000 guard keeps us out of system-owned directories.
+     *
+     * @return true when dirPath exists afterwards
+     */
+    private boolean ensureAppFilesDir() {
+        File dir = new File(dirPath);
+        if (dir.isDirectory()) {
+            return true;
+        }
+        File parent = dir.getParentFile();
+        if (parent == null || !parent.isDirectory()) {
+            return false;
+        }
+        try {
+            android.system.StructStat st = android.system.Os.stat(parent.getPath());
+            if (st.st_uid < 10000) {
+                return false;
+            }
+            android.system.Os.mkdir(dir.getPath(), 0771);
+            android.system.Os.chown(dir.getPath(), st.st_uid, st.st_gid);
+            Log.i("tcp: created missing app files dir " + dirPath
+                    + " (app reinstalled, not yet started)");
+            return true;
+        } catch (Throwable t) {
+            Log.w("tcp: cannot create " + dirPath + ": " + EffectManager.describe(t));
+            return false;
+        }
     }
 
     /** Writes port + token files (chown to the dir owner, mode 0400). */
