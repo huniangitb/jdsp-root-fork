@@ -34,6 +34,19 @@ public final class EnableSwitchTest {
             }
         });
 
+        suite.test("switch: turning off is immediate even inside the rate limit window",
+                new com.jdsp.cli.Body() {
+                    public void run() {
+                        // Unload must be instantaneous: an explicit off is never deferred,
+                        // not even 50 ms after the switch was turned on.
+                        EnableSwitch s = new EnableSwitch(1000L);
+                        s.transitionApplied(true, 1000L);
+                        Assert.eq(EnableSwitch.APPLY_NOW, s.request(false, 1050L));
+                        s.transitionApplied(false, 1050L);
+                        Assert.isTrue(!s.applied(), "the state is off now");
+                    }
+                });
+
         suite.test("switch: turning on right after off is rate limited", new com.jdsp.cli.Body() {
             public void run() {
                 EnableSwitch s = new EnableSwitch(1000L);
@@ -88,31 +101,88 @@ public final class EnableSwitchTest {
                     }
                 });
 
-        suite.test("switch: a burst of alternating requests collapses into one transition",
+        suite.test("switch: an alternating echo storm cannot mount the instances",
                 new com.jdsp.cli.Body() {
                     public void run() {
+                        // A client that mirrors the state back and forth every 20 ms: the
+                        // storm starts on (echo), the first off unloads at once, and from
+                        // then on every off is an echo while every on is deferred and the
+                        // deadline keeps being pushed. Not a single on-mount gets through.
                         EnableSwitch s = new EnableSwitch(1000L);
                         int applied = 0;
+                        int appliedOn = 0;
                         long now = 1000L;
                         for (int i = 0; i < 50; i++) {
                             boolean target = (i % 2 == 0);
                             int d = s.request(target, now);
                             if (d == EnableSwitch.APPLY_NOW) {
                                 applied++;
+                                if (target) {
+                                    appliedOn++;
+                                }
                                 s.transitionApplied(target, now);
                             } else if (d == EnableSwitch.DEFER) {
-                                // The watcher applies the deferred transition.
                                 Boolean v = s.poll(now);
                                 if (v != null) {
                                     applied++;
+                                    if (v.booleanValue()) {
+                                        appliedOn++;
+                                    }
                                     s.transitionApplied(v.booleanValue(), now);
                                 }
                             }
                             now += 20L;
                         }
-                        // 50 alternating requests must not cause 50 transitions: the rate limit
-                        // collapses them into one per interval.
-                        Assert.isTrue(applied <= 3, "at most three transitions, was " + applied);
+                        Assert.eq(1, applied, "exactly one transition: the first off");
+                        Assert.eq(0, appliedOn,
+                                "no on transition may be applied inside the storm");
+                        Assert.isTrue(!s.applied(), "the storm leaves the switch off");
+                        Assert.isTrue(s.pending(),
+                                "the user's last intent (on) is still pending");
+                        Boolean v = s.poll(now + 2000L);
+                        Assert.eq(Boolean.TRUE, v, "the pending on is applied when quiet");
+                    }
+                });
+
+        suite.test("switch: an alternating storm still mounts at most once per interval",
+                new com.jdsp.cli.Body() {
+                    public void run() {
+                        // A longer storm (6 s): every off is immediate, but a mount ("on")
+                        // can happen at most once per rate limit interval.
+                        EnableSwitch s = new EnableSwitch(1000L);
+                        int appliedOn = 0;
+                        long lastOnAt = -1L;
+                        long now = 10000L;
+                        for (int i = 0; i < 300; i++) {
+                            boolean target = (i % 2 == 0);
+                            int d = s.request(target, now);
+                            boolean doApply = false;
+                            boolean value = target;
+                            if (d == EnableSwitch.APPLY_NOW) {
+                                doApply = true;
+                            } else if (d == EnableSwitch.DEFER) {
+                                Boolean v = s.poll(now);
+                                if (v != null) {
+                                    doApply = true;
+                                    value = v.booleanValue();
+                                }
+                            }
+                            if (doApply) {
+                                if (value) {
+                                    if (lastOnAt >= 0L) {
+                                        Assert.isTrue(now - lastOnAt >= 1000L,
+                                                "two mounts only " + (now - lastOnAt)
+                                                        + " ms apart");
+                                    }
+                                    appliedOn++;
+                                    lastOnAt = now;
+                                }
+                                s.transitionApplied(value, now);
+                            }
+                            now += 20L;
+                        }
+                        Assert.isTrue(appliedOn <= 7, "6 s of alternating requests mounted "
+                                + appliedOn + " times (at most once per interval allowed)");
                     }
                 });
 
@@ -142,8 +212,10 @@ public final class EnableSwitchTest {
         suite.test("switch: an alternating client cannot make the daemon flip every time",
                 new com.jdsp.cli.Body() {
                     public void run() {
-                        // The old App mirrored the state back and forth every 20 ms. Without
-                        // the rate limit that was ~50 transitions; with it, one per interval.
+                        // The old App mirrored the state back and forth every 20 ms. Offs are
+                        // immediate (unload must be), but the on direction stays rate limited:
+                        // over 6 s the daemon can flip at most twice per interval (one mount +
+                        // the immediate unload that follows it).
                         EnableSwitch s = new EnableSwitch(1000L);
                         int transitions = 0;
                         long now = 10000L;
@@ -162,7 +234,7 @@ public final class EnableSwitchTest {
                             }
                             now += 20L;
                         }
-                        Assert.isTrue(transitions <= 8,
+                        Assert.isTrue(transitions <= 15,
                                 "6 s of alternating requests caused " + transitions
                                         + " transitions (must stay bounded)");
                     }

@@ -495,13 +495,15 @@ public final class CoreApi {
     /**
      * Turns the whole backend on or off.
      *
-     * <p>false: the daemon disables and releases every effect handle, and refuses parameter
-     * writes (see {@link #setParam}); the stored configuration is kept, so turning it back on
-     * restores the previous state. No engine parameter is written, so this works with every
-     * engine build.
+     * <p>false (unload): the daemon detaches every effect handle, so the instances are
+     * disabled (immediate bypass) and released. On ROMs that tear the handles down promptly
+     * the instances leave the chain entirely; on ROMs where the handles linger the leftovers
+     * are disabled (zero audio processing). Parameter writes are refused either way (see
+     * {@link #setParam}). The stored configuration is kept, so turning it back on restores the
+     * previous state. No engine parameter is written, so this works with every engine build.
      *
-     * <p>true: the watcher re-attaches the sessions it is allowed to touch and replays their
-     * parameters.
+     * <p>true (mount on demand): the watcher re-attaches the sessions it is allowed to touch and
+     * replays their parameters on its next tick (at most {@link SessionWatcher#POLL_MS} later).
      *
      * @return 0 = ok, {@link #ERR_DISABLED} never happens here, negative = error
      */
@@ -536,18 +538,18 @@ public final class CoreApi {
                     + " (policy on/exclude does not override the master switch)");
         }
         if (!enabled) {
-            // Bypass right away, without waiting for the next watcher tick: keep the handles
-            // (the instances stay in the chain) but switch every effect off.
-            int n = 0;
-            java.util.List<Integer> held = effects.attachedSessions();
-            for (int i = 0; i < held.size(); i++) {
-                if (effects.setEnabled(held.get(i).intValue(), false) == EffectManager.OK) {
-                    n++;
-                }
-            }
-            Log.i("global disabled: " + n + " effect instance(s) switched off");
+            // Off means unload: detach every handle (each detach first issues a synchronous
+            // setEnabled(false) - an immediate bypass - and then releases, see
+            // EffectManager.detach). On ROMs that tear handles down promptly the instances
+            // leave the chain; on ROMs where they linger the leftovers are at least
+            // enabled=n (zero audio processing). detachAll goes through detach() per session,
+            // so the write-lock unlock state is forgotten too.
+            int n = effects.detachAll();
+            Log.i("global disabled: " + n + " instance(s) detached");
         }
-        // The watcher reconciles the rest: off -> no new attaches, on -> re-attach and re-apply.
+        // The watcher reconciles the rest: off -> no new attaches (and it releases anything that
+        // is somehow still held), on -> re-attach the active sessions and re-apply their
+        // parameters on the next tick.
         watcher.poke();
     }
 

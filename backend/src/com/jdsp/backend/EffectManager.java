@@ -2,6 +2,8 @@ package com.jdsp.backend;
 
 import android.media.audiofx.AudioEffect;
 
+import com.jdsp.common.EngineUnlockGate;
+import com.jdsp.common.EngineWriteKey;
 import com.jdsp.common.JdspConst;
 
 import java.lang.reflect.Constructor;
@@ -92,6 +94,30 @@ public final class EffectManager {
 
     private final Map<Integer, Handle> handles = new LinkedHashMap<Integer, Handle>();
 
+    /**
+     * Engine write lock (jdsp_writelock), optimistic form: some engine builds refuse
+     * SET_PARAM from any caller that has not presented the engine key, others (no-lock
+     * builds) reject the reserved unlock id itself &mdash; so the unlock reply is not a gate.
+     * The first write of a session injects one unlock SET_PARAM (reserved id, key as value,
+     * reply ignored) and proceeds with the real write; the real write's result decides
+     * ({@link EngineUnlockGate#onWriteResult}): success marks the session unlocked, failure
+     * forces a fresh handshake on the next write. Without a key every write fails closed
+     * with {@link EngineUnlockGate#ERR_NO_KEY}. Covers ParamBus.setParam/applyAll as well,
+     * because they all funnel through {@link #setParam}.
+     */
+    private final EngineUnlockGate gate = new EngineUnlockGate(new EngineUnlockGate.Sink() {
+        @Override
+        public int setParamRaw(int sessionId, int paramId, byte[] value) {
+            Handle h = handles.get(Integer.valueOf(sessionId));
+            if (h == null) {
+                return ERR_NO_HANDLE;
+            }
+            return rawSetParam(h, paramId, value);
+        }
+    });
+    /** Bytes of /data/adb/jdspd/engine.key (mirrored to the HAL-readable path). */
+    private volatile byte[] engineKey;
+
     /** Loads the hidden framework entry points. Returns true when everything was found. */
     public static synchronized boolean initReflection() {
         if (reflectionReady) {
@@ -162,11 +188,33 @@ public final class EffectManager {
         return attach(sessionId, -1);
     }
 
-    /** Releases the handle. Idempotent: detaching a session without a handle returns OK. */
+    /**
+     * Releases the handle. Idempotent: detaching a session without a handle returns OK.
+     *
+     * <p><b>Disable before release (bypass-then-unload)</b>: first a synchronous
+     * {@code setEnabled(false)} (an immediate bypass that reaches the HAL), then
+     * {@code release()}. On ROMs that tear the EffectHandle down promptly this destroys the
+     * instance; on ROMs where the handle lingers (no binder death notification while the daemon
+     * is alive, measured on ColorOS 16) the leftover instance keeps its last state, so it must
+     * at least be left disabled: enabled=n means zero audio processing. Release is attempted
+     * either way.
+     */
     public synchronized int detach(int sessionId) {
         Handle h = handles.remove(Integer.valueOf(sessionId));
         if (h == null) {
             return OK;
+        }
+        /* The engine instance will be gone (or re-created fresh and locked). */
+        gate.forget(sessionId);
+        try {
+            if (safeEnabled(h.effect)) {
+                h.effect.setEnabled(false);
+                Log.i("detach session=" + sessionId + " disabled before release");
+            }
+        } catch (Throwable t) {
+            // Best effort: the release below must happen regardless.
+            Log.w("detach session=" + sessionId + " disable before release failed: "
+                    + describe(t));
         }
         try {
             h.effect.release();
@@ -181,6 +229,24 @@ public final class EffectManager {
         return handles.containsKey(Integer.valueOf(sessionId));
     }
 
+    /**
+     * Installs the engine write key (called once from Daemon startup). Pass
+     * null to disable unlocking: every parameter write then fails closed.
+     */
+    public synchronized void setEngineKey(byte[] key) {
+        engineKey = key == null ? null : key.clone();
+    }
+
+    /** The installed engine key (a copy), or null. Diagnostics / tests. */
+    public synchronized byte[] engineKey() {
+        return engineKey == null ? null : engineKey.clone();
+    }
+
+    /** True when the session's engine instance is currently known writable (diagnostics). */
+    public synchronized boolean isUnlocked(int sessionId) {
+        return gate.isUnlocked(sessionId);
+    }
+
     /** Forwards one SET_PARAM to the session handle and returns the engine status (0 = applied). */
     public synchronized int setParam(int sessionId, int paramId, byte[] value) {
         Handle h = handles.get(Integer.valueOf(sessionId));
@@ -190,18 +256,40 @@ public final class EffectManager {
         if (value == null || value.length == 0) {
             return ERR_BAD_ARG;
         }
+        boolean unlockWrite = paramId == EngineWriteKey.UNLOCK_PARAM_ID;
+        if (!unlockWrite && !gate.presentKey(sessionId, engineKey)) {
+            // No valid key installed: fail closed, nothing reaches the engine.
+            Log.w("setParam session=" + sessionId + " param=" + paramId
+                    + " blocked: no engine key (fail closed)");
+            return EngineUnlockGate.ERR_NO_KEY;
+        }
+        int status = rawSetParam(h, paramId, value);
+        if (!unlockWrite) {
+            // The real write decides: success = writable (no-lock engine or unlocked one),
+            // failure = present the key again on the next write (locked engine, wrong key).
+            gate.onWriteResult(sessionId, status);
+        }
+        if (status == OK) {
+            if (!unlockWrite) {
+                h.paramCount++;
+            }
+        } else if (!unlockWrite) {
+            Log.w("setParam session=" + sessionId + " param=" + paramId
+                    + " engine status=" + status + " (handshake retried on the next write)");
+        }
+        return status;
+    }
+
+    /** The reflective write, no unlock logic. Returns the engine status. */
+    private int rawSetParam(Handle h, int paramId, byte[] value) {
         if (!initReflection()) {
             return ERR_INTERNAL;
         }
         try {
             Object rc = methodSetParameter.invoke(h.effect, le32(paramId), value);
-            int status = rc instanceof Integer ? ((Integer) rc).intValue() : ERR_INTERNAL;
-            if (status == OK) {
-                h.paramCount++;
-            }
-            return status;
+            return rc instanceof Integer ? ((Integer) rc).intValue() : ERR_INTERNAL;
         } catch (Throwable t) {
-            Log.w("setParam session=" + sessionId + " param=" + paramId + " failed: " + describe(t));
+            Log.w("setParam param=" + paramId + " failed: " + describe(t));
             return ERR_INTERNAL;
         }
     }
@@ -309,6 +397,24 @@ public final class EffectManager {
 
     public synchronized int handleCount() {
         return handles.size();
+    }
+
+    /**
+     * Detaches every handle: the global master switch went off, so every session goes
+     * through {@link #detach} (disable = immediate bypass, then release; the unlock state
+     * is forgotten per session, see {@link EngineUnlockGate#forget}). Returns the number of
+     * handles that were held.
+     */
+    public synchronized int detachAll() {
+        int n = handles.size();
+        List<Integer> ids = new ArrayList<Integer>(handles.keySet());
+        for (int i = 0; i < ids.size(); i++) {
+            detach(ids.get(i).intValue());
+        }
+        if (n > 0) {
+            Log.i("detached all " + n + " effect handle(s)");
+        }
+        return n;
     }
 
     /** Releases every handle (used on shutdown and when switching modes). */

@@ -1,5 +1,6 @@
 package com.jdsp.backend;
 
+import com.jdsp.common.EngineWriteKey;
 import com.jdsp.common.JdspConst;
 
 import java.io.File;
@@ -130,6 +131,22 @@ public final class Daemon {
         policy = new PolicyEngine();
         policy.refresh();
         effects = new EffectManager();
+        // Engine write lock: generate/load the key, hand it to the manager (every
+        // parameter write unlocks the instance with it first) and mirror it to the
+        // HAL-readable path. Without a key the engine refuses every write, so a
+        // failure here is logged loudly but must not stop the daemon.
+        byte[] engineKey = EngineWriteKey.ensureKey(new File(dir, "engine.key"));
+        if (engineKey != null) {
+            effects.setEngineKey(engineKey);
+            boolean mirrored = EngineWriteKey.mirrorToVendor(engineKey,
+                    new File(EngineWriteKey.VENDOR_KEY_FILE));
+            Log.i("engine write key ready (" + EngineWriteKey.ADB_KEY_FILE
+                    + ", mirror " + EngineWriteKey.VENDOR_KEY_FILE + ": "
+                    + (mirrored ? "ok" : "FAILED - parameter writes will be refused") + ")");
+        } else {
+            Log.w("engine write key unavailable: parameter writes will be refused"
+                    + " (create " + EngineWriteKey.ADB_KEY_FILE + " and restart)");
+        }
         bus = new ParamBus(effects);
         watcher = new SessionWatcher(config, policy, effects, bus);
         api = new CoreApi(config, policy, effects, bus, watcher);

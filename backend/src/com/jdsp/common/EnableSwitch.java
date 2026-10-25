@@ -20,12 +20,15 @@ package com.jdsp.common;
  *   <li>requesting the value the backend already has: {@link #NONE}, no side effect. Such a
  *       request is an echo and carries no new intent, so it never cancels a pending transition
  *       (the pending transition is the user's explicit intent and must survive an echo);</li>
- *   <li>requesting the other value: applied at once when the rate limit has expired, otherwise
- *       {@link #DEFER}. The watcher applies the deferred transition when the deadline passes.</li>
+ *   <li>requesting "off" is <b>never</b> deferred: unmounting (detaching the effect instances)
+ *       must be instantaneous, so an explicit off always applies at once;</li>
+ *   <li>requesting "on" is rate limited: applied at once when the interval has expired,
+ *       otherwise {@link #DEFER}. The watcher applies the deferred transition when the deadline
+ *       passes.</li>
  * </ul>
  *
- * <p>Because the backend only ever has two states, a pending transition always points at the
- * opposite of the current state.
+ * <p>Because the backend only ever has two states, a pending transition always points at "on"
+ * (the only rate limited direction).
  *
  * <p>Pure Java so the behaviour is unit tested on the host.
  */
@@ -80,8 +83,11 @@ public final class EnableSwitch {
             // survives: it is the user's explicit intent and an echo must not drop it.
             return NONE;
         }
-        if (lastTransitionAt != 0L && now - lastTransitionAt < minIntervalMs) {
-            // Rate limited: a burst of requests collapses into one transition.
+        if (target && lastTransitionAt != 0L && now - lastTransitionAt < minIntervalMs) {
+            // Rate limited, but only in the "on" direction: turning on mounts the effect
+            // instances again (create + attach + parameter replay), so a burst of "on"
+            // requests collapses into one transition. Turning off is never deferred: the
+            // user wants the instances out of the chain now.
             pending = true;
             pendingDeadline = now + minIntervalMs;
             return DEFER;

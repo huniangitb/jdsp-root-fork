@@ -44,10 +44,10 @@ mkdir -p "$BUILD/classes" "$BUILD/test-classes" "$BUILD/gen"
 mapfile -t AIDL_FILES < <(find "$BACKEND/aidl" -name '*.aidl' | sort)
 "$AIDL" --lang=java -I"$BACKEND/aidl" --out="$BUILD/gen" "${AIDL_FILES[@]}"
 
-# 2) compile the CLI (Android-facing files included) against android.jar
+# 2) compile the CLI + backend daemon (Android-facing files included) against android.jar
 mapfile -t SOURCES < <(find "$BACKEND/src/com/jdsp/cli" "$BACKEND/src/com/jdsp/common" \
-        "$BUILD/gen" -name '*.java' | sort)
-echo "compiling ${#SOURCES[@]} cli sources..."
+        "$BACKEND/src/com/jdsp/backend" "$BUILD/gen" -name '*.java' | sort)
+echo "compiling ${#SOURCES[@]} cli/backend sources..."
 if ! javac --release 8 -nowarn -Xlint:-options -classpath "$ANDROID_JAR" \
         -d "$BUILD/classes" "${SOURCES[@]}" >"$BUILD/javac.log" 2>&1; then
     echo "cli javac FAILED:" >&2

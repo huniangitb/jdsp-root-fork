@@ -253,10 +253,15 @@ public final class SessionWatcher {
      *
      * <p>Three independent rules, in this order:
      * <ol>
-     *   <li>policy=exclude: the handle is released (the effect leaves the chain);</li>
-     *   <li>the global master switch is off: the handle is <em>kept but disabled</em>, so the
-     *       effect is bypassed without touching the chain (no click, instant reversible), and
-     *       no new session is attached while the switch is off;</li>
+     *   <li>policy=exclude: the handle is released (the instance is disabled first, an
+     *       immediate bypass, then released; see {@link EffectManager#detach}); moving the app
+     *       out of the blacklist re-attaches on a later tick with the configured parameters
+     *       replayed;</li>
+     *   <li>the global master switch is off: the same unload semantics &mdash; anything still
+     *       held is released and no new session is attached while the switch is off (the switch
+     *       itself already detached everything via CoreApi/EffectManager.detachAll; this is the
+     *       safety net for races, e.g. an attach that was in flight when the switch went
+     *       off);</li>
      *   <li>otherwise: attach when the policy allows it, and keep the instance enabled.</li>
      * </ol>
      */
@@ -271,26 +276,17 @@ public final class SessionWatcher {
                     effects.isAttached(s.sessionId));
             if (action == EnableGate.ACTION_RELEASE) {
                 if (effects.isAttached(s.sessionId)) {
-                    effects.setEnabled(s.sessionId, false);
                     effects.detach(s.sessionId);
                     bus.forgetSession(s.sessionId);
-                    Log.i("detached session=" + s.sessionId + " pkg=" + s.pkg + " (" + d.reason + ")");
+                    Log.i("detached session=" + s.sessionId + " pkg=" + s.pkg + " ("
+                            + (globallyDisabled ? "global switch off, " : "")
+                            + d.reason + ")");
                 }
                 continue;
             }
             if (action == EnableGate.ACTION_BYPASS) {
-                // Bypass: keep the handle (the instance stays in the chain) but switch the
-                // effect off. No attach, no parameter replay, no churn.
-                //
-                // IMPORTANT: only call setEnabled() when the state really has to change. A
-                // setEnabled() per watcher tick (1/s per session) reaches the audio HAL and
-                // was measured to crash system_server on a busy device; the idempotence rule
-                // lives in BypassRule so it is unit tested.
-                int bypass = BypassRule.whileDisabled(effects.isAttached(s.sessionId),
-                        effects.isEnabled(s.sessionId));
-                if (bypass == BypassRule.CALL_DISABLE) {
-                    effects.setEnabled(s.sessionId, false);
-                }
+                // Nothing is held and nothing may be attached while the switch is off (or the
+                // policy does not want the session): do nothing, no attach, no framework call.
                 continue;
             }
             if (d.attach) {
@@ -307,18 +303,21 @@ public final class SessionWatcher {
                     }
                 } else {
                     effects.setOwner(s.sessionId, s.uid, s.pkg, s.pid);
-                    // Same idempotence rule as the bypass branch: the framework is only
-                    // called when the enable state really changes.
+                    // Idempotence rule: the framework is only called when the enable state
+                    // really changes (a redundant setEnabled() per tick reaches the audio HAL
+                    // and was measured to crash system_server on a busy device).
                     if (BypassRule.whileEnabled(effects.isEnabled(s.sessionId))
                             == BypassRule.CALL_ENABLE) {
-                        // The switch was turned on again: re-apply and switch the effect back on.
+                        // The instance was disabled (e.g. freshly mounted or re-enabled after a
+                        // policy change): re-apply and switch it on.
                         bus.applyAll(s.sessionId, d.params);
                         effects.setEnabled(s.sessionId, true);
                         Log.i("re-enabled session=" + s.sessionId + " pkg=" + s.pkg);
                     }
                 }
             } else if (effects.isAttached(s.sessionId)) {
-                effects.setEnabled(s.sessionId, false);
+                // Unload semantics: disable (immediate bypass) then release; on ROMs where the
+                // EffectHandle lingers the leftover instance is at least left disabled.
                 effects.detach(s.sessionId);
                 bus.forgetSession(s.sessionId);
                 Log.i("detached session=" + s.sessionId + " pkg=" + s.pkg + " (" + d.reason + ")");

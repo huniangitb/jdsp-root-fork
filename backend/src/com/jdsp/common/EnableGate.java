@@ -6,8 +6,9 @@ package com.jdsp.common;
  * <p>Three independent rules, in this order:
  * <ol>
  *   <li>the app is excluded by policy: the handle is released (the effect leaves the chain);</li>
- *   <li>the global master switch is off: the handle is kept but the effect is switched off
- *       (bypass), and no new session is attached;</li>
+ *   <li>the global master switch is off: the same unload semantics as the exclusion &mdash; an
+ *       already held handle is released (the instances are destroyed, nothing is left in the
+ *       chain) and no new session is attached;</li>
  *   <li>otherwise the session is attached when the policy allows it.</li>
  * </ol>
  *
@@ -17,9 +18,9 @@ package com.jdsp.common;
 public final class EnableGate {
     /** What the daemon does with one session. */
     public static final int ACTION_ATTACH = 0;
-    /** Keep the handle, switch the effect off (global bypass). */
+    /** Nothing to do: the switch is off and no handle is held (never attach while off). */
     public static final int ACTION_BYPASS = 1;
-    /** Release the handle (policy exclude). */
+    /** Release the handle (policy exclude, or the global master switch is off). */
     public static final int ACTION_RELEASE = 2;
 
     private EnableGate() {
@@ -37,8 +38,11 @@ public final class EnableGate {
             return ACTION_RELEASE;
         }
         if (globallyOff) {
-            // Bypass: keep an existing handle (switched off), never attach a new one.
-            return alreadyHeld ? ACTION_BYPASS : ACTION_BYPASS;
+            // Unload semantics, identical to the exclusion path: while the switch is off no
+            // instance may stay in the chain, so a held handle is released (the watcher
+            // detaches it, AudioFlinger destroys the instance) and a new one is never
+            // attached. Turning the switch back on re-attaches via the watcher.
+            return alreadyHeld ? ACTION_RELEASE : ACTION_BYPASS;
         }
         if (policyAllows) {
             return ACTION_ATTACH;

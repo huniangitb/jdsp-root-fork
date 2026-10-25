@@ -25,18 +25,25 @@ public final class EnableGateTest {
             }
         });
 
-        suite.test("gate: global switch off bypasses and never attaches", new com.jdsp.cli.Body() {
-            public void run() {
-                // policy wants the effect, but the master switch is off -> bypass
-                Assert.eq(EnableGate.ACTION_BYPASS,
-                        EnableGate.action(false, true, true, false));
-                Assert.eq(EnableGate.ACTION_BYPASS,
-                        EnableGate.action(false, true, true, true));
-                // policy=follow in auto mode (no effect wanted) and the switch off -> bypass
-                Assert.eq(EnableGate.ACTION_BYPASS,
-                        EnableGate.action(false, true, false, true));
-            }
-        });
+        suite.test("gate: global switch off unloads held handles and never attaches",
+                new com.jdsp.cli.Body() {
+                    public void run() {
+                        // policy wants the effect, but the master switch is off and a handle
+                        // is held: unload semantics, identical to the exclusion path.
+                        Assert.eq(EnableGate.ACTION_RELEASE,
+                                EnableGate.action(false, true, true, true));
+                        // policy=follow in auto mode (no effect wanted) and the switch off:
+                        // still released.
+                        Assert.eq(EnableGate.ACTION_RELEASE,
+                                EnableGate.action(false, true, false, true));
+                        // Nothing held while the switch is off: nothing to do, and above all
+                        // no attach (that is what keeps the switch off from mounting instances).
+                        Assert.eq(EnableGate.ACTION_BYPASS,
+                                EnableGate.action(false, true, true, false));
+                        Assert.eq(EnableGate.ACTION_BYPASS,
+                                EnableGate.action(false, true, false, false));
+                    }
+                });
 
         suite.test("gate: normal operation attaches when the policy allows it",
                 new com.jdsp.cli.Body() {
