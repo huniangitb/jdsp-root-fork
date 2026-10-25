@@ -186,14 +186,20 @@ flinger 播放线程 `underruns=0`、`Normal mixer raw underrun counters partial
 
 ## 5. soak
 
-- 启跑：**2026-10-26 06:28:04**（干净基线、App 已 force-stop、daemon pid 20845），计划 72 h → 10-29 06:28
+- 启跑：**2026-10-26 06:32:15**（干净基线、App 已 force-stop），计划 72 h → **10-29 06:32**；
+  首行 `report.tsv`：`10-26 06:32:15  1  20845  289877  0  156  0  2  0  0  0  da961fdb  17664  0`
 - 启动方式：`setsid sh /data/local/tmp/jdsp-soak/soak_device.sh`（KernelSU 下 su 会杀后台子进程，必须 setsid）
-- **本会话加固了 soak 脚本**（`scripts/soak_device.sh`，旧栈复盘结论）：
-  新增 `bootid`（设备是否重启）、`devuptime`（区分 daemon 重启与设备重启）、
-  `jdsphits`（dropbox 里 james.dsp/jdspd/libjamesdsp 条目数 = JDSP 定向崩溃证据）。
-  因为 `fatal/anr/audiotrackCrash` 三列取的是 logcat 环形缓冲**当前内容**，会被 `logcat -c`/轮转清空，
-  只能当参考（见 `docs/COLOROS-v2.0.0-SOAK-REPORT.md`）。
-- 首行：`10-26 06:28:04  1  20845  38685  0  26  0  2  0  0  0  da961fdb  17413  0`
+- 说明：06:23 首次起跑后，为把被 App 污染过的配置换成干净基线，**有意** kill 了 daemon 两次
+  （daemon 退出码 143 = SIGTERM，由看护 `jdspd.sh` 2 s 内拉起；设备未重启，`bootid` 不变、`devuptime` 单调）。
+  因此最终 soak 窗口从 06:32:15 重新起算。**daemon 重启不是异常，是本会话的手工操作。**
+- **本会话加固了 soak 脚本**（`scripts/soak_device.sh`，旧栈复盘结论 + 本次实测）：
+  - 新增 `bootid`（设备是否重启）、`devuptime`（区分 daemon 重启与设备重启）、
+    `jdsphits`（dropbox 里 james.dsp/jdspd/libjamesdsp 条目数 = JDSP 定向崩溃证据）
+  - 每 6 h 的驱动 tone 改用 `timeout 20 env CLASSPATH=… Tone 5 soak` 包裹：ColorOS 上 tone 播完偶发不退出
+    （实测攒了 2 个僵进程），不包裹的话 72 h 会累积十几个
+  - 注意：`fatal/anr/audiotrackCrash` 三列取的是 logcat 环形缓冲**当前内容**，会被 `logcat -c`/轮转清空，
+    只能当参考；首行 `fatal=2` 是缓冲里的历史条目，与 JDSP 无关（`jdsphits=0`）。详见
+    `docs/COLOROS-v2.0.0-SOAK-REPORT.md`
 
 ---
 
@@ -244,6 +250,12 @@ flinger 播放线程 `underruns=0`、`Normal mixer raw underrun counters partial
 7. 旧栈 soak 报告：`docs/COLOROS-v2.0.0-SOAK-REPORT.md`（7h41m/72h = 10.7%，被 20:08 的普通重启掐断；
    fatal 列=环形缓冲快照，全部为腾讯 soter 的 NPE，零条 JDSP）。
 8. ColorOS 写锁 framework 返回值问题（0002 引擎侧已编入）：本机 backend 模式下未见异常，留观察。
+9. 开机竞态（O-1，低）：daemon 先于 App 数据目录就绪时写 `/data/data/james.dsp/files/jdsp.{port,token}` 失败
+   （日志 WARN `cannot write port/token files`），30 s 内自愈；首次开机到 App 首启之间有窗口期。
+10. 日志噪声（O-2，低）：`policy: 453 package entries, 388 uids` 每 30 s 一条（≈2880 行/天），
+    长期 soak 会把 jdspd.log 撑到 MB 级（已有 1 MB 轮转保护），建议降频或降级为 DEBUG。
+11. soak 的 `Tone 5 soak` 在 ColorOS 上偶发不退出（已用 `timeout 20` 包裹兜住）；根因疑似
+    AudioTrack release 与写入线程的竞态，未深挖（不影响数据）。
 
 ---
 

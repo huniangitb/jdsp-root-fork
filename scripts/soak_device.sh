@@ -55,9 +55,10 @@ while [ "$(date +%s)" -lt "$END" ]; do
     echo "$(date '+%m-%d %H:%M:%S')\t${PROCS}\t${PID}\t${UPT:-x}\t${WFAIL:-x}\t${SSET:-x}\t${PERR:-x}\t${FATAL}\t${ANR}\t${ATCRASH}\t${TCPERR}\t${BOOTID:-x}\t${DEVTUP:-x}\t${JDSPHITS:-x}" >> "$OUT"
 
     # 每 6 h 放 5 s tone（驱动 session attach / 参数回放）
+    # timeout 包裹：ColorOS 上 tone 播完后偶发不退出（AudioTrack 释放竞态），72h 会攒一堆僵进程
     if [ $(( NOW - LAST_TONE )) -ge $TONE_EVERY ] && [ -f "$TONE_DEX" ]; then
         LAST_TONE=$NOW
-        (CLASSPATH=$TONE_DEX app_process /system/bin Tone 5 soak >/dev/null 2>&1) &
+        (timeout 20 env CLASSPATH=$TONE_DEX app_process /system/bin Tone 5 soak >/dev/null 2>&1) &
     fi
 
     sleep "$INTERVAL"
