@@ -1,0 +1,587 @@
+diff -ruN '--exclude=*.o' src-baseline/Main/libjamesdsp/jni/jamesdsp/Android.mk src/Main/libjamesdsp/jni/jamesdsp/Android.mk
+--- src-baseline/Main/libjamesdsp/jni/jamesdsp/Android.mk	2026-10-25 10:43:28.287917152 +0800
++++ src/Main/libjamesdsp/jni/jamesdsp/Android.mk	2026-10-25 14:57:00.035400423 +0800
+@@ -97,6 +97,7 @@
+ 	peq_loudness.c \
+ 	jdsp_state.c \
+ 	jdsp_writelock.c \
++	jdsp_paramq.c \
+ 	jamesdsp.c \
+ # terminator
+ LOCAL_LDLIBS := -llog
+diff -ruN '--exclude=*.o' src-baseline/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c src/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c
+--- src-baseline/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c	2026-10-25 10:43:28.287917152 +0800
++++ src/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c	2026-10-25 15:04:05.199572626 +0800
+@@ -15,6 +15,7 @@
+ #include "peq_loudness.h"
+ #include "jdsp_state.h"
+ #include "jdsp_writelock.h"
++#include "jdsp_paramq.h"
+ typedef struct
+ {
+ 	unsigned long long initializeForFirst;
+@@ -1155,10 +1156,11 @@
+ 			}
+ 		}
+ 	}
+-	/* Nothing to do about parameter updates here: the builder thread prepares a
+-	 * complete replacement engine and generic_process() swaps it in at the start
+-	 * of a callback.  This callback therefore never applies parameters and never
+-	 * touches the filesystem. */
++	/* Parameter updates are applied by generic_process() before it calls this
++	 * (draining the per-instance deferred queue on the audio thread), and the
++	 * builder thread still prepares complete replacement engines for external
++	 * hot reloads.  This callback therefore never races a parameter write and
++	 * never touches the filesystem. */
+ 	return dspmain->mEnable ? 0 : -ENODATA;
+ }
+ // Effect section end
+@@ -1194,15 +1196,24 @@
+ // Library mandatory methods
+ /* One live effect instance.
+  *
+- * The engine object is not mutated in place when the persisted parameters
+- * change: the builder thread (see below) constructs a *complete* second engine,
+- * applies every recorded command to it there, and only then publishes it in
+- * `pending`.  The render thread swaps `cur` for `pending` at a buffer boundary,
+- * which costs a pointer store.  Consequences:
+- *   - the render callback never applies parameters, so a big impulse/EEL upload
+- *     can no longer overrun a buffer;
+- *   - the engine is always in a fully applied state, never half updated;
+- *   - the previous engine is handed to the builder and destroyed there. */
++ * Two mechanisms keep the render thread away from parameter mutation:
++ *
++ *   1. Value SET_PARAM commands (gains, EQ axes, enables, ...) are queued by
++ *      the command thread (jdsp_paramq) and applied by generic_process() at a
++ *      buffer boundary, on the audio thread itself - no concurrent reader, no
++ *      torn coefficient arrays, and a slider storm merges into one apply per
++ *      buffer per parameter.
++ *
++ *   2. When the persisted state changes from OUTSIDE the command path (the
++ *      state file was replaced behind our back, or an instance is created),
++ *      the builder thread (see below) constructs a *complete* second engine,
++ *      applies every recorded command to it there, and only then publishes it
++ *      in `pending`.  The render thread swaps `cur` for `pending` at a buffer
++ *      boundary, which costs a pointer store.  Consequences:
++ *         - the render callback never applies a replayed sequence, so a big
++ *           impulse/EEL upload can no longer overrun a buffer;
++ *         - the engine is always in a fully applied state, never half updated;
++ *         - the previous engine is handed to the builder and destroyed there. */
+ struct effect_module_s
+ {
+ 	const struct effect_interface_s *itfe;
+@@ -1222,6 +1233,12 @@
+ 	 * the command path (binder threads of the HAL), read from the same path, so
+ 	 * plain int + the gate's own ordering is enough. */
+ 	int write_locked;
++	/* Deferred parameter queue (see jdsp_paramq.h): the command thread copies
++	 * value SET_PARAM commands in here instead of mutating the engine in place
++	 * (which raced the render thread); generic_process() drains it at a buffer
++	 * boundary, on the audio thread.  Lives on the module so it survives engine
++	 * swaps done by the builder. */
++	jdsp_paramq_t pq;
+ };
+ 
+ #define JDSP_XFADE_MAX_FRAMES 8192
+@@ -1370,6 +1387,35 @@
+ 	(void)pthread_join(g_builder_tid, NULL);
+ 	g_builder_started = 0;
+ }
++
++/* Pull every live instance's cur_gen up to the given store generation.  Called
++ * on the command thread right after a value SET_PARAM was recorded: the daemon
++ * delivers the same parameter write to every mounted instance, so none of them
++ * needs the builder to replay the store on its behalf any more - each one gets
++ * the value through its own deferred queue.  External hot reloads (the state
++ * file replaced behind our back) bump the generation WITHOUT this call and
++ * therefore still trigger a rebuild, which is the behaviour 0001 defined. */
++static void jdsp_sync_generations(void)
++{
++	uint64_t gen = jdsp_state_generation();
++	struct effect_module_s *it;
++	pthread_mutex_lock(&g_inst_lock);
++	for (it = g_insts; it != NULL; it = it->next)
++		it->cur_gen = gen;
++	pthread_mutex_unlock(&g_inst_lock);
++}
++
++/* jdsp_paramq_drain callback: apply one deferred SET_PARAM to the engine the
++ * render thread is about to use.  Called from the audio thread at a buffer
++ * boundary, so there is no concurrent reader and the existing setters are safe. */
++static void jdsp_apply_deferred_param(void *eng, uint32_t size, const uint8_t *data)
++{
++	EffectDSPMain *engine = (EffectDSPMain *)eng;
++	uint32_t replySize = (uint32_t)sizeof(int32_t);
++	int32_t reply = 0;
++	(void)EffectDSPMainCommand(engine, EFFECT_CMD_SET_PARAM, size, (void *)data,
++		&replySize, &reply);
++}
+ /* Linear crossfade from the previous engine's output (src) to the new engine's
+  * output (dst), over exactly one buffer.  Both buffers use the instance's current
+  * sample format.  Unknown/unsupported formats keep the new output unchanged. */
+@@ -1427,6 +1473,10 @@
+ 		size_t need = frames * 2u * sizeof(int32_t);
+ 
+ 		e->cur = fresh;
++		/* Drain the deferred parameters into the engine that will keep
++		 * rendering (draining into the retiring one would lose values whose
++		 * store record the fresh engine predates). */
++		jdsp_paramq_drain(&e->pq, fresh, jdsp_apply_deferred_param);
+ 		if (old != NULL && frames > 0u && need <= e->xscratch_bytes)
+ 		{
+ 			audio_buffer_t scratch = *in;
+@@ -1443,6 +1493,13 @@
+ 		if (old != NULL)
+ 			jdsp_retire_push(old);
+ 	}
++	else
++	{
++		/* Apply every parameter the command threads queued since the last
++		 * callback, before rendering: at this point the audio thread is the
++		 * only user of e->cur, so the setters cannot race the render path. */
++		jdsp_paramq_drain(&e->pq, e->cur, jdsp_apply_deferred_param);
++	}
+ 	return EffectDSPMainProcess(e->cur, in, out);
+ }
+ static int32_t generic_command(effect_handle_t self, uint32_t cmdCode, uint32_t cmdSize, void *pCmdData, uint32_t *replySize, void *pReplyData)
+@@ -1458,6 +1515,55 @@
+ 		if (wl != JDSP_WL_PROCEED)
+ 			return wl;
+ 	}
++	/* Value SET_PARAM commands are no longer applied here: generic_command runs
++	 * on a binder thread while generic_process renders e->cur on the audio
++	 * thread, so an in-place apply raced the render path (element-wise writes
++	 * into live coefficient arrays -> audible noise).  Instead the command is
++	 * copied into the per-instance queue; the audio thread applies it at the
++	 * next buffer boundary (see generic_process).  Chunked transfers (impulse /
++	 * string upload) stay inline: they are rare, they do heavy work that must
++	 * not run on the render thread, and they must never be merged or evicted. */
++	if (cmdCode == EFFECT_CMD_SET_PARAM)
++	{
++		int32_t paramId = 0;
++		int cls = jdsp_param_classify(pCmdData, cmdSize, &paramId);
++		if (cls == JDSP_PARAM_CLASS_VALUE)
++		{
++			int32_t *replyData = (int32_t *)pReplyData;
++			uint8_t *copy = (uint8_t *)malloc(cmdSize);
++			if (copy == NULL)
++				return -ENOMEM;
++			memcpy(copy, pCmdData, cmdSize);
++			if (jdsp_paramq_push(&e->pq, paramId, cmdSize, copy, 1) < 0)
++			{
++				/* push never fails with owned data (it frees on argument
++				 * error), so this is unreachable; kept as a guard.  A full
++				 * queue is NOT an error: the entry was queued and the oldest
++				 * one evicted (counted in pq.dropped). */
++				return -ENOMEM;
++			}
++			if (replyData != NULL)
++				*replyData = 0;
++			/* Persist the parameter now (identical content and ordering to the
++			 * pre-deferral behaviour: the state store saw the command at
++			 * command time).  The unlock handshake is consumed by the gate and
++			 * classifies as invalid, so it can never reach this record. */
++			if (!e->cur->stateReplaying && !jdsp_writelock_is_unlock_cmd(cmdSize, pCmdData))
++			{
++				jdsp_state_record(cmdCode, cmdSize, pCmdData);
++				/* Every live instance receives the same direct write from the
++				 * daemon and applies it through its own queue: mark them all
++				 * current so the builder does not rebuild the whole engine set
++				 * on every slider tick.  External hot reloads still bump the
++				 * generation without this sync and still rebuild. */
++				jdsp_sync_generations();
++			}
++			return 0;
++		}
++		if (cls == JDSP_PARAM_CLASS_INVALID)
++			return -1; /* same reply the engine handler gave for these before */
++		/* JDSP_PARAM_CLASS_STREAM: fall through to the inline engine call. */
++	}
+ 	int32_t ret = EffectDSPMainCommand(e->cur, cmdCode, cmdSize, pCmdData, replySize, pReplyData);
+ 	/* Persist every state changing command that the engine accepted. Recording is
+ 	 * disabled while a recorded sequence is being replayed, otherwise a replay
+@@ -1466,7 +1572,9 @@
+ 	{
+ 		if (cmdCode == EFFECT_CMD_SET_PARAM)
+ 		{
+-			/* A parameter was applied only when the engine reported status 0. */
++			/* A parameter was applied only when the engine reported status 0.
++			 * Only chunked transfers reach this point (value parameters were
++			 * handled above). */
+ 			if (pReplyData != NULL && cmdSize >= sizeof(effect_param_t) &&
+ 				*(const int32_t *)pReplyData == 0)
+ 			{
+@@ -1512,6 +1620,9 @@
+ 	if (e == NULL)
+ 		return -ENOMEM;
+ 	e->itfe = &generic_interface;
++	/* Deferred parameter queue: filled by the command threads, drained by the
++	 * render thread at a buffer boundary (see generic_process). */
++	jdsp_paramq_init(&e->pq);
+ 	/* Every fresh instance starts locked: only jdspd, presenting the engine key,
+ 	 * opens the write window (see jdsp_writelock.h). */
+ 	e->write_locked = 1;
+@@ -1573,6 +1684,7 @@
+ 	jdsp_engine_free(pending);
+ 	jdsp_engine_free(e->cur);
+ 	e->cur = NULL;
++	jdsp_paramq_destroy(&e->pq);
+ 	free(e->xscratch);
+ 	free(e);
+ 	(void)swapped;
+diff -ruN '--exclude=*.o' src-baseline/Main/libjamesdsp/jni/jamesdsp/jdsp_paramq.c src/Main/libjamesdsp/jni/jamesdsp/jdsp_paramq.c
+--- src-baseline/Main/libjamesdsp/jni/jamesdsp/jdsp_paramq.c	1970-01-01 08:00:00.000000000 +0800
++++ src/Main/libjamesdsp/jni/jamesdsp/jdsp_paramq.c	2026-10-25 14:53:24.425123902 +0800
+@@ -0,0 +1,239 @@
++/*
++ * jdsp_paramq.c - deferred SET_PARAM application for the JamesDSP effect
++ * library.  See jdsp_paramq.h for the design and the rationale.
++ */
++#include "jdsp_paramq.h"
++
++#include <stdlib.h>
++#include <string.h>
++
++/* Parameter id table, mirrored from the SET_PARAM branches of
++ * EffectDSPMainCommand() (jamesdsp.c).  vsize is the exact value size that
++ * handler expects; 0 marks the one variable sized parameter (PEQ cascade,
++ * 1300).  A compile time guarantee that the mirrored set stays in sync with
++ * the handler is not possible without refactoring the handler itself, so the
++ * host test test_paramq.c cross-checks this table against the classification
++ * of every id the handler can consume. */
++typedef struct
++{
++	int32_t id;
++	uint32_t vsize; /* exact value size, 0 = variable (PEQ 1300) */
++	int cls;        /* JDSP_PARAM_CLASS_* */
++} jdsp_param_shape_t;
++
++static const jdsp_param_shape_t jdsp_param_shapes[] = {
++	/* Value parameters: every write fully replaces the previous value of the
++	 * same id, so a queued duplicate can be merged and a burst of slider
++	 * updates collapses into one apply per buffer. */
++	{112, 2, JDSP_PARAM_CLASS_VALUE},    /* bass boost max gain */
++	{115, 68, JDSP_PARAM_CLASS_VALUE},   /* compander shape */
++	{116, 128, JDSP_PARAM_CLASS_VALUE},  /* multimodal equalizer axis */
++	{128, 2, JDSP_PARAM_CLASS_VALUE},    /* reverb mode */
++	{137, 2, JDSP_PARAM_CLASS_VALUE},    /* stereo enhancement */
++	{150, 2, JDSP_PARAM_CLASS_VALUE},    /* vacuum tube drive */
++	{188, 2, JDSP_PARAM_CLASS_VALUE},    /* crossfeed mode */
++	{1200, 2, JDSP_PARAM_CLASS_VALUE},   /* compressor enable */
++	{1201, 2, JDSP_PARAM_CLASS_VALUE},   /* bass boost enable */
++	{1202, 2, JDSP_PARAM_CLASS_VALUE},   /* equalizer enable */
++	{1203, 2, JDSP_PARAM_CLASS_VALUE},   /* reverb enable */
++	{1204, 2, JDSP_PARAM_CLASS_VALUE},   /* stereo widen enable */
++	{1205, 2, JDSP_PARAM_CLASS_VALUE},   /* convolver enable */
++	{1206, 2, JDSP_PARAM_CLASS_VALUE},   /* analogue model enable */
++	{1208, 2, JDSP_PARAM_CLASS_VALUE},   /* crossfeed enable */
++	{1210, 2, JDSP_PARAM_CLASS_VALUE},   /* arbitrary response eq enable */
++	{1212, 2, JDSP_PARAM_CLASS_VALUE},   /* viper ddc enable */
++	{1213, 2, JDSP_PARAM_CLASS_VALUE},   /* liveprog enable */
++	{1214, 2, JDSP_PARAM_CLASS_VALUE},   /* PEQ enable */
++	{1215, 2, JDSP_PARAM_CLASS_VALUE},   /* loudness enable */
++	{1216, 2, JDSP_PARAM_CLASS_VALUE},   /* harmonic expander enable */
++	{1217, 2, JDSP_PARAM_CLASS_VALUE},   /* sub harmonic expander enable */
++	{1218, 2, JDSP_PARAM_CLASS_VALUE},   /* NOS R2R enable */
++	{1300, 0, JDSP_PARAM_CLASS_VALUE},   /* PEQ cascade (variable 8..1288) */
++	{1301, 20, JDSP_PARAM_CLASS_VALUE},  /* loudness config */
++	{1302, 4, JDSP_PARAM_CLASS_VALUE},   /* loudness volume */
++	{1305, 44, JDSP_PARAM_CLASS_VALUE},  /* harmonic expander config */
++	{1306, 44, JDSP_PARAM_CLASS_VALUE},  /* sub harmonic expander config */
++	{1307, 44, JDSP_PARAM_CLASS_VALUE},  /* NOS R2R config */
++	{1500, 12, JDSP_PARAM_CLASS_VALUE},  /* limiter threshold/release/postgain */
++	{25000, 4, JDSP_PARAM_CLASS_VALUE},  /* ArbEq hash slot */
++	{25001, 4, JDSP_PARAM_CLASS_VALUE},  /* DDC hash slot */
++	{25002, 4, JDSP_PARAM_CLASS_VALUE},  /* LiveProg hash slot */
++	{25003, 4, JDSP_PARAM_CLASS_VALUE},  /* convolver app hash slot */
++	/* Chunked transfers: the alloc/chunk/done sequence must stay complete and
++	 * ordered, and the done commands do heavy work (impulse FFT reload,
++	 * string parsers) that must not run on the render thread.  These stay on
++	 * the command path exactly as before. */
++	{8888, 8, JDSP_PARAM_CLASS_STREAM},      /* string buffer alloc */
++	{9999, 16, JDSP_PARAM_CLASS_STREAM},     /* impulse header */
++	{12000, 16384, JDSP_PARAM_CLASS_STREAM}, /* impulse chunk */
++	{12001, 256, JDSP_PARAM_CLASS_STREAM},   /* string chunk */
++	{10004, 2, JDSP_PARAM_CLASS_STREAM},     /* impulse done (convolver load) */
++	{10006, 2, JDSP_PARAM_CLASS_STREAM},     /* ArbEq string done */
++	{10009, 2, JDSP_PARAM_CLASS_STREAM},     /* DDC string done */
++	{10010, 2, JDSP_PARAM_CLASS_STREAM},     /* EEL string done */
++};
++
++#define JDSP_PARAM_SHAPE_COUNT (sizeof(jdsp_param_shapes) / sizeof(jdsp_param_shapes[0]))
++
++static uint32_t jdsp_paramq_get_u32(const uint8_t *p)
++{
++	return (uint32_t)p[0] | ((uint32_t)p[1] << 8) | ((uint32_t)p[2] << 16) |
++	       ((uint32_t)p[3] << 24);
++}
++
++int jdsp_param_classify(const void *cmd_data, uint32_t cmd_size, int32_t *id_out)
++{
++	const uint8_t *d = (const uint8_t *)cmd_data;
++	uint32_t psize, vsize, id;
++	size_t i;
++
++	if (d == NULL || cmd_size < 16u)
++		return JDSP_PARAM_CLASS_INVALID;
++	psize = jdsp_paramq_get_u32(d + 4);
++	vsize = jdsp_paramq_get_u32(d + 8);
++	if (psize != 4u || vsize == 0u)
++		return JDSP_PARAM_CLASS_INVALID;
++	/* The engine handler trusts the framework not to truncate commands; the
++	 * queue copies the bytes, so it has to verify the bound itself. */
++	if (vsize > cmd_size - 16u)
++		return JDSP_PARAM_CLASS_INVALID;
++	id = jdsp_paramq_get_u32(d + 12);
++	if (id_out != NULL)
++		*id_out = (int32_t)id;
++
++	for (i = 0; i < JDSP_PARAM_SHAPE_COUNT; i++)
++	{
++		const jdsp_param_shape_t *s = &jdsp_param_shapes[i];
++		if (s->id != (int32_t)id)
++			continue;
++		if (s->vsize == 0u)
++		{
++			/* PEQ cascade: 2 header floats + N * 5 band floats,
++			 * 8..1288 bytes (PEQ_MAX_BANDS = 64), multiple of 4. */
++			if (vsize >= 8u && vsize <= 1288u && (vsize & 3u) == 0u)
++				return s->cls;
++			return JDSP_PARAM_CLASS_INVALID;
++		}
++		if (vsize == s->vsize)
++			return s->cls;
++		return JDSP_PARAM_CLASS_INVALID;
++	}
++	/* Unknown parameter id (includes the write-lock handshake 0x7A00, which
++	 * the gate consumes before this point when the lock is enabled): the
++	 * engine handler returned -1 for these before deferral, keep that. */
++	return JDSP_PARAM_CLASS_INVALID;
++}
++
++void jdsp_paramq_init(jdsp_paramq_t *q)
++{
++	if (q == NULL)
++		return;
++	memset(q, 0, sizeof(*q));
++	pthread_mutex_init(&q->lock, NULL);
++}
++
++void jdsp_paramq_destroy(jdsp_paramq_t *q)
++{
++	int i;
++	if (q == NULL)
++		return;
++	pthread_mutex_lock(&q->lock);
++	for (i = 0; i < JDSP_PARAMQ_CAPACITY; i++)
++	{
++		free(q->slot[i].data);
++		q->slot[i].data = NULL;
++	}
++	q->head = 0;
++	q->count = 0;
++	pthread_mutex_unlock(&q->lock);
++	pthread_mutex_destroy(&q->lock);
++}
++
++int jdsp_paramq_push(jdsp_paramq_t *q, int32_t id, uint32_t size, uint8_t *data,
++                     int mergeable)
++{
++	int ret = 0;
++
++	if (q == NULL || data == NULL || size == 0u)
++	{
++		free(data);
++		return -1;
++	}
++
++	pthread_mutex_lock(&q->lock);
++	if (mergeable)
++	{
++		int i;
++		for (i = 0; i < q->count; i++)
++		{
++			int idx = (q->head + i) % JDSP_PARAMQ_CAPACITY;
++			if (q->slot[idx].id == id)
++			{
++				/* Same parameter already queued: replace it in place.  The
++				 * position is kept so unrelated parameters still apply in
++				 * arrival order; the audio thread then applies only the
++				 * latest value of this parameter. */
++				free(q->slot[idx].data);
++				q->slot[idx].data = data;
++				q->slot[idx].size = size;
++				pthread_mutex_unlock(&q->lock);
++				return 0;
++			}
++		}
++	}
++	if (q->count >= JDSP_PARAMQ_CAPACITY)
++	{
++		/* Full: drop the oldest entry (counted).  Mergeable ids rarely get
++		 * here - a slider storm merges into one slot - but a stream of more
++		 * distinct parameters than the capacity can hold must not corrupt
++		 * the queue. */
++		free(q->slot[q->head].data);
++		q->slot[q->head].data = NULL;
++		q->head = (q->head + 1) % JDSP_PARAMQ_CAPACITY;
++		q->count--;
++		q->dropped++;
++		ret = 1;
++	}
++	q->slot[(q->head + q->count) % JDSP_PARAMQ_CAPACITY].id = id;
++	q->slot[(q->head + q->count) % JDSP_PARAMQ_CAPACITY].size = size;
++	q->slot[(q->head + q->count) % JDSP_PARAMQ_CAPACITY].data = data;
++	q->count++;
++	pthread_mutex_unlock(&q->lock);
++	return ret;
++}
++
++void jdsp_paramq_drain(jdsp_paramq_t *q, void *engine,
++                       void (*apply)(void *engine, uint32_t size, const uint8_t *data))
++{
++	jdsp_paramq_entry_t local[JDSP_PARAMQ_CAPACITY];
++	int n = 0;
++	int i;
++
++	if (q == NULL || apply == NULL)
++		return;
++
++	/* Swap the queue contents out under the lock (a couple of pointer stores
++	 * per entry), then run the apply callbacks without holding it: the
++	 * setters can be expensive, and a concurrent command thread must still be
++	 * able to enqueue while they run. */
++	pthread_mutex_lock(&q->lock);
++	if (q->count > 0)
++	{
++		for (i = 0; i < q->count; i++)
++		{
++			int idx = (q->head + i) % JDSP_PARAMQ_CAPACITY;
++			local[i] = q->slot[idx];
++			q->slot[idx].data = NULL;
++		}
++		n = q->count;
++		q->count = 0;
++		q->head = 0;
++	}
++	pthread_mutex_unlock(&q->lock);
++
++	for (i = 0; i < n; i++)
++	{
++		apply(engine, local[i].size, local[i].data);
++		free(local[i].data);
++	}
++}
+diff -ruN '--exclude=*.o' src-baseline/Main/libjamesdsp/jni/jamesdsp/jdsp_paramq.h src/Main/libjamesdsp/jni/jamesdsp/jdsp_paramq.h
+--- src-baseline/Main/libjamesdsp/jni/jamesdsp/jdsp_paramq.h	1970-01-01 08:00:00.000000000 +0800
++++ src/Main/libjamesdsp/jni/jamesdsp/jdsp_paramq.h	2026-10-25 14:52:37.983430478 +0800
+@@ -0,0 +1,109 @@
++/*
++ * jdsp_paramq.h - deferred SET_PARAM application for the JamesDSP effect library.
++ *
++ * Problem this solves: generic_command() runs on a binder thread of the audio
++ * HAL while generic_process() renders on the audio callback thread.  Applying
++ * a SET_PARAM in place from the command thread mutates engine state (EQ
++ * coefficient arrays, gains, ...) element by element while the render thread
++ * reads the same state - a data race that produces short bursts of wrong
++ * samples (audible noise) even though nothing underruns.  Slider drags push
++ * 30-100 such writes per second.
++ *
++ * Fix: the command thread no longer applies value parameters at all.  It
++ * validates the command shape, copies it into a small per-instance queue and
++ * answers success immediately; generic_process() drains the queue at the start
++ * of every buffer, on the audio thread, before any rendering - at that point
++ * there is no concurrent reader, so the existing setters are safe to call.
++ * While a value sits in the queue, a newer write of the same parameter id
++ * replaces it (merge), which bounds the queue under slider storms and lets the
++ * audio thread apply at most one value per parameter per buffer.
++ *
++ * What is NOT deferred (stays inline on the command thread, exactly as before):
++ *   - chunked transfers (impulse/string alloc, chunks, done): rare, heavy, and
++ *     they must not be merged or evicted, so they never enter the queue;
++ *   - EFFECT_CMD_ENABLE/DISABLE (a single flag store, sent by AudioFlinger);
++ *   - EFFECT_CMD_GET_PARAM and the health/hash queries (synchronous replies);
++ *   - the write-lock handshake 0x7A00 (consumed by jdsp_writelock_gate before
++ *     this module ever sees it; it classifies as invalid here, so a build with
++ *     the write lock compiled out still never queues or records it).
++ *
++ * Persisted-state interaction (jdsp_state): a queued value parameter is
++ * recorded to the state store at enqueue time - the state file therefore
++ * contains the command even if the process dies before the audio thread
++ * applied it, and replays (new instances, engine rebuilds) keep working
++ * unchanged.
++ *
++ * Host tests: test/run_tests.sh compiles this file standalone (no engine
++ * dependency).
++ */
++
++#ifndef JDSP_PARAMQ_H
++#define JDSP_PARAMQ_H
++
++#include <pthread.h>
++#include <stddef.h>
++#include <stdint.h>
++
++/* Queue depth.  One render callback at 48 kHz / 1024 frames is ~21 ms; even a
++ * 100 Hz slider storm produces ~2 updates per callback.  The burst case (an
++ * applyAll pushes ~30 distinct parameters at once) fits with headroom; beyond
++ * that the oldest entry is dropped (counted, see jdsp_paramq_t::dropped). */
++#ifndef JDSP_PARAMQ_CAPACITY
++#define JDSP_PARAMQ_CAPACITY 64
++#endif
++
++/* jdsp_param_classify() results. */
++#define JDSP_PARAM_CLASS_INVALID 0 /* malformed or unknown parameter id */
++#define JDSP_PARAM_CLASS_VALUE   1 /* value parameter: defer, mergeable by id */
++#define JDSP_PARAM_CLASS_STREAM  2 /* chunked transfer: apply inline, never merge */
++
++typedef struct
++{
++	int32_t id;      /* SET_PARAM parameter id (effect_param_t::data[0..3]) */
++	uint32_t size;   /* command bytes (effect_param_t header + payload) */
++	uint8_t *data;   /* malloc()'d copy of the command */
++} jdsp_paramq_entry_t;
++
++typedef struct
++{
++	pthread_mutex_t lock; /* short critical sections only (pointer swaps) */
++	jdsp_paramq_entry_t slot[JDSP_PARAMQ_CAPACITY];
++	int head;             /* index of the oldest entry */
++	int count;            /* number of queued entries */
++	unsigned long long dropped; /* entries evicted because the queue was full */
++} jdsp_paramq_t;
++
++/* Initialize / tear down.  destroy() frees any still queued entries. */
++void jdsp_paramq_init(jdsp_paramq_t *q);
++void jdsp_paramq_destroy(jdsp_paramq_t *q);
++
++/* Queue one command.  data must be malloc()'d; ownership transfers to the
++ * queue on any return value (including failure).  When mergeable is non-zero
++ * and an entry with the same id is already queued, that entry is replaced in
++ * place (position preserved).  When the queue is full the oldest entry is
++ * evicted (dropped++).  Returns 0 normally, 1 when an entry had to be evicted,
++ * -1 on argument error. */
++int jdsp_paramq_push(jdsp_paramq_t *q, int32_t id, uint32_t size, uint8_t *data,
++                     int mergeable);
++
++/* Take every queued entry and apply it in order via apply(engine, size, data),
++ * then free it.  Runs the apply callbacks outside the queue lock.  Designed to
++ * be called from the render thread at a buffer boundary. */
++void jdsp_paramq_drain(jdsp_paramq_t *q, void *engine,
++                       void (*apply)(void *engine, uint32_t size, const uint8_t *data));
++
++/* Validate and classify a SET_PARAM command payload.
++ *
++ * A command is well formed when cmd_data holds at least an effect_param_t
++ * header (16 bytes: status, psize, vsize, first parameter word), psize == 4,
++ * vsize > 0, cmd_size covers the announced payload (16 + vsize) and the
++ * parameter id is one the engine's command handler knows, with the value size
++ * that handler expects.  Everything else classifies as INVALID - which is what
++ * the engine handler returned (-1) for such commands before deferral existed,
++ * so reply semantics and state recording behaviour are unchanged.
++ *
++ * Returns JDSP_PARAM_CLASS_*; on any result other than INVALID, *id_out (when
++ * non-NULL) receives the parameter id. */
++int jdsp_param_classify(const void *cmd_data, uint32_t cmd_size, int32_t *id_out);
++
++#endif /* JDSP_PARAMQ_H */

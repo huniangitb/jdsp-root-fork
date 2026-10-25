@@ -8,7 +8,7 @@
 #
 set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
-SRC=$ROOT/src/Main/libjamesdsp/jni/jamesdsp
+SRC=${SRC:-$ROOT/src/Main/libjamesdsp/jni/jamesdsp}
 OUT=$ROOT/build
 CC=${CC:-cc}
 mkdir -p "$OUT"
@@ -35,5 +35,15 @@ echo "-- watcher mode"
 "$OUT/test_watch" watch
 echo "-- polling fallback mode"
 JDSP_STATE_NO_INOTIFY=1 "$OUT/test_watch" poll
+
+echo "== build test_writelock (caller write protection)"
+$CC -std=gnu99 -O1 -g -Wall -Wextra -Wno-unused-parameter -I"$SRC" \
+    "$ROOT/test/test_writelock.c" "$SRC/jdsp_writelock.c" -o "$OUT/test_writelock" -lpthread
+"$OUT/test_writelock"
+
+echo "== build test_paramq (deferred SET_PARAM queue, 0003)"
+$CC -std=gnu99 -O1 -g -Wall -Wextra -Wno-unused-parameter -I"$SRC" \
+    "$ROOT/test/test_paramq.c" "$SRC/jdsp_paramq.c" -o "$OUT/test_paramq" -lpthread
+"$OUT/test_paramq"
 
 echo "== all host tests passed"
