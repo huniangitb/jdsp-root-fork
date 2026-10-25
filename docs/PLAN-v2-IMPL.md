@@ -338,3 +338,30 @@ phase3 smali 补丁路线在真机暴露三类不可修（或修起来比换路�
    嫌疑：协程周期任务触发参数下发 / sync 全量链。终态改造（写直达、sync 退役）中一并处理。
 2. 写锁 framework 返回值问题（§11.2.4）。
 3. 72h soak 未起（等终态 APK）；PLAN-v2 P6 第三台设备仍未接入。
+
+### 11.5 终态验收（v3–v5，2026-10-25 12:20 全部通过）
+
+迭代史：v3 `8b722cdf`（终态架构）→ v4 `4ff66993`（修主线程连网致桥自禁用）→
+v5 `692e51d2`（修控制连接被服务端 30s 空闲断开后不自愈：统一连接 + 2s 轮询保活 +
+失败重连重试一次）。终态 APK 即 `james.dsp-src-v1.apk`（loundess_git 仓库已提交）。
+
+| 验收项 | 结果 |
+|---|---|
+| 读侧后端权威 | ✅ CLI 改后端 → 冷启 UI 精确显示后端特征值；本地 xml 不再污染 |
+| 写直达后端 | ✅ UI 开关 → 后端 1201=0100 即时落库并 applyAll；`dsp_bass.xml` 等本地偏好不再生成 |
+| 静置提交归零 | ✅ 5 分钟 setParamCalls/paramErrors 增量 0/0（v2 时代 85–113/s 风暴消除） |
+| 零 AudioEffect 实例 | ✅ App pid 在 flinger effect 表 0 命中 |
+| 主线程零连网 | ✅ 冷启全程 NetworkOnMainThreadException 0 条（v5 复测） |
+| **黑名单端到端** | ✅ UI 添加 DeepSeek → 后端 `{"com.deepseek.chat":2}`；UI 移除 → 清空；**空闲 2.5 分钟后操作仍即时生效**（保活）；结合 §6.4（mode 2 会话不 attach）排除机制完整生效 |
+| per-app 参数实时 | ✅ §11.3 后续补验：policy on 后按会话写只落 `perAppParams[该包]`，全局不动；他应用写落全局；重挂按包名回放 per-app 集 |
+| 信号回归 | ✅ **13/0**（offline 全判据：+12dB→12.00dB、恢复 0.00dB、underrun 0） |
+| 降级存活 | ✅ 杀 jdspd App 存活；daemon 自动重启 |
+
+**72h soak 已于 2026-10-25 12:19 启动**（设备侧独立运行，10min 一行 TSV，
+`scripts/soak.sh --report` 随时取报告；首行 procs=1、watcherFail=0、fatal=0）。
+
+### 11.6 最终遗留（更新）
+
+1. 写锁 framework 返回值问题（§11.2.4）——纵深防御，非阻塞。
+2. 72h soak 结果待收集（2026-10-28 12:19 后）。
+3. PLAN-v2 P6 第三台设备仍未接入；听感验证仍为人工项。
