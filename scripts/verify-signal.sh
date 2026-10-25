@@ -48,6 +48,12 @@ GAIN_DB=${GAIN_DB:-12}
 THRESHOLD=${THRESHOLD:-0}
 RELEASE=${RELEASE:-0}
 DELTA_MIN_DB=${DELTA_MIN_DB:-1.5}
+# Tone level for the offline renderer.  The engine always runs a brickwall
+# limiter whose threshold is clamped to -0.09 dBFS, so a -6 dBFS test tone
+# plus +12 dB of post gain would be limited back to ~0 dBFS and the gain
+# would be invisible.  At -18 dBFS the limiter stays transparent and the
+# post gain shows up as exactly the requested dB.
+OFFLINE_TONE_DBFS=${OFFLINE_TONE_DBFS:--18}
 RESTORE_TOL_DB=${RESTORE_TOL_DB:-0.5}
 CAPTURE_SOURCE=${CAPTURE_SOURCE:-auto}
 # The native offline renderer (built from tools/native/offline_render.c).  It
@@ -319,6 +325,15 @@ if [ -n "$SOURCE" ]; then
     record PASS "capture-available" "capture source=$SOURCE (REMOTE_SUBMIX, the digital output mix)"
 elif [ "$PLAN" = "offline" ] && sh_ "[ -x $DEVICE_DIR/offline_render ] && echo yes" | grep -q yes; then
     record PASS "capture-available" "REMOTE_SUBMIX is unusable; using the offline renderer (plan=offline)"
+elif [ "$PLAN" = "offline" ]; then
+    # The renderer is missing or not executable: the signal criteria cannot
+    # be measured at all.
+    record SKIP "capture-available" "REMOTE_SUBMIX delivered only zeros ($(printf '%s' "$PROBE_REMOTE" | grep -o 'reason=[^ ]*' | head -1)); the offline renderer is not available on the device"
+    record SKIP "signal-delta" "no usable capture path (REMOTE_SUBMIX all zero, offline renderer unavailable)"
+    record SKIP "signal-direction" "no usable capture path"
+    record SKIP "signal-restore" "no usable capture path"
+    report_and_exit
+    exit 0
 else
     record SKIP "capture-available" "REMOTE_SUBMIX delivered only zeros ($(printf '%s' "$PROBE_REMOTE" | grep -o 'reason=[^ ]*' | head -1)); no usable capture path"
     record SKIP "signal-delta" "no usable capture path (REMOTE_SUBMIX all zero, offline renderer unavailable)"
@@ -340,23 +355,33 @@ measure_remote() { # tag -> "rms peak" in dBFS
     echo "$rms $peak"
 }
 
-measure_offline() { # paramId v1 v2 v3 -> "neutral tested restored" rms in dB
+measure_offline() { # paramId v1 v2 v3 [toneDbfs] -> "neutral tested restored" rms in dBFS
     local out
-    out=$(timeout 90 $ADB shell "cd $DEVICE_DIR; LD_LIBRARY_PATH=$DEVICE_DIR ./offline_render $1 $2 $3 $4 2>&1" 2>&1 | tr -d '\r')
+    # The renderer needs the tone level as well: the engine always runs a
+    # brickwall limiter, so the tone has to sit far enough below 0 dBFS for
+    # the post gain to be observable at all.
+    out=$(timeout 90 $ADB shell "cd $DEVICE_DIR; LD_LIBRARY_PATH=$DEVICE_DIR ./offline_render $1 $2 $3 $4 $OFFLINE_TONE_DBFS 2>&1" 2>&1 | tr -d '\r')
     printf '%s' "$out" > "$LOG_DIR/offline-render.log"
+    # The renderer prints the levels in dBFS itself (NEUTRAL_DBFS=...); that
+    # is the primary source.  The linear RMS lines are the fallback for an
+    # older renderer.
     local n t r
-    n=$(printf '%s' "$out" | sed -n 's/^NEUTRAL rms=\([0-9.eE+-]*\).*/\1/p' | head -1)
-    t=$(printf '%s' "$out" | sed -n 's/^TESTED rms=\([0-9.eE+-]*\).*/\1/p' | head -1)
-    r=$(printf '%s' "$out" | sed -n 's/^RESTORED rms=\([0-9.eE+-]*\).*/\1/p' | head -1)
+    n=$(printf '%s' "$out" | sed -n 's/^NEUTRAL_DBFS=\([0-9.-]*\).*/\1/p' | head -1)
+    t=$(printf '%s' "$out" | sed -n 's/^TESTED_DBFS=\([0-9.-]*\).*/\1/p' | head -1)
+    r=$(printf '%s' "$out" | sed -n 's/^RESTORED_DBFS=\([0-9.-]*\).*/\1/p' | head -1)
     if [ -z "$n" ] || [ -z "$t" ] || [ -z "$r" ]; then
-        return 1
+        local ln lt lr
+        ln=$(printf '%s' "$out" | sed -n 's/^NEUTRAL rms=\([0-9.eE+-]*\).*/\1/p' | head -1)
+        lt=$(printf '%s' "$out" | sed -n 's/^TESTED rms=\([0-9.eE+-]*\).*/\1/p' | head -1)
+        lr=$(printf '%s' "$out" | sed -n 's/^RESTORED rms=\([0-9.eE+-]*\).*/\1/p' | head -1)
+        if [ -z "$ln" ] || [ -z "$lt" ] || [ -z "$lr" ]; then
+            return 1
+        fi
+        n=$(awk "BEGIN { printf \"%.2f\", 20 * log($ln / 32768) }")
+        t=$(awk "BEGIN { printf \"%.2f\", 20 * log($lt / 32768) }")
+        r=$(awk "BEGIN { printf \"%.2f\", 20 * log($lr / 32768) }")
     fi
-    # linear rms -> dBFS
-    local nd td rd
-    nd=$(awk "BEGIN { printf \"%.2f\", 20 * log($n / 32768) }")
-    td=$(awk "BEGIN { printf \"%.2f\", 20 * log($t / 32768) }")
-    rd=$(awk "BEGIN { printf \"%.2f\", 20 * log($r / 32768) }")
-    echo "$nd $td $rd"
+    echo "$n $t $r"
 }
 
 ORIG_HEX=""
@@ -438,7 +463,7 @@ if [ "$PLAN" = "remote" ]; then
     R_RMS=$(printf '%s' "$MEAS" | cut -d' ' -f1)
     echo "restored    : rms=${R_RMS} dBFS (baseline ${N_RMS} dBFS)"
 else
-    MEAS=$(measure_offline "$PARAM_ID" "$THRESHOLD" "$RELEASE" 12.0)
+    MEAS=$(measure_offline "$PARAM_ID" "$THRESHOLD" "$RELEASE" "$GAIN_DB")
     if [ -z "$MEAS" ]; then
         record SKIP "signal-delta" "the offline renderer could not render the block (see $LOG_DIR/offline-render.log)"
         record SKIP "signal-direction" "no usable signal measurement"

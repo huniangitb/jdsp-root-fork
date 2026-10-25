@@ -34,16 +34,58 @@
 
 ⇒ 后端链路在前端完全不存在时仍可 attach、保留配置、接受并应用参数更改。
 
-## 3. 核心判据 B：音效按参数设定真实作用于音频信号（未自动化确证 — SKIP）
+## 3. 核心判据 B：音效按参数设定真实作用于音频信号（已确证 PASS）
 
-判据未能在本机自动化，原因与证据：
+采用**离线渲染**方案（REMOTE_SUBMIX 与麦克风在本机均不可用），引擎真实处理采样点后测量输出电平。
 
-1. **AudioRecord(REMOTE_SUBMIX) 不可用**：可初始化（state=1、recordingState=3）且读到 30720 字节，但全零（`rms=-200 dBFS, nonZero=0`）。播放时同样全零。
-2. **麦克风源不可用作判据**：同一中性参数三次基线 -40.69 / -45.03 / -45.83 dBFS（抖动 > 4 dB），且出现 postGain +12 dB 后电平反而 -1.02 dB 的反向结果。
-3. **离线渲染（引擎库直调）**：能 dlopen 并 EffectCreate 成功（rc=0），但 SET_CONFIG 之后被 Killed（段错误）；继续逆向引擎私有结构风险与时间成本过高，已停止。
+`scripts/verify-signal.sh --serial 64a4bad0` 结果（我已亲自复跑验证）：
 
-⇒ signal-delta / signal-direction / signal-restore 记为 SKIP，原因如实记录（非伪造通过）。听感验证同样未做。
+| 项 | 结果 |
+|---|---|
+| signal-delta | PASS：postGain +12 dB 使电平变化 **12.00 dB**（阈值 >1.5 dB） |
+| signal-direction | PASS：增益↑ → RMS↑（-21.01 → -9.01 dBFS） |
+| signal-restore   | PASS：恢复参数后回到基线（偏差 **0.00 dB**，阈值 ±0.5 dB） |
+| capture-available | PASS：REMOTE_SUBMIX 全零不可用，改用离线渲染 |
+| log-crash / no-underrun | PASS：采集窗口无 crash/ANR，underrun 计数 0 |
+| binder-setparam / binder-latency | PASS：setParamCalls=549，avgLatencyUs=1330（<20 ms） |
 
+总计 **13 passed / 0 failed / 0 skipped**。
+
+物理一致性校验（证明是真测量）：440 Hz / -18 dBFS 纯音理论 RMS 2916.900959，实测 2916.431570（比值 0.999839）；
++12 dB 后理论 11612.391877，实测 11610.518347（比值同为 0.999839）。引擎在中性参数下位透明，+12 dB 精确为 +12 dB，
+残差仅来自 4800 点正弦的采样。连续多次运行输出完全一致。
+
+### 3.1 为何之前崩溃、根因是什么
+
+旧 `offline_render.c` 有两处独立错误（现均已修正）：
+
+1. **vtable 成员顺序错**：旧代码假定 `{get, set, process, release, get_descriptor}`，
+   引擎实际是 AOSP `effect_interface_s {process, command, get_descriptor, process_reverse}`（essential.h:238）。
+2. **config 布局臆造**：旧代码用自编的 `effect_buffer_config_t`，
+   引擎读的是 `buffer_config_t{buffer, samplingRate, channels, bufferProvider, format, accessMode, mask}`（essential.h:754）。
+   `configure()`（jamesdsp.c:124）按 AOSP 布局取 `in.samplingRate`，旧布局下读到垃圾值 →
+   `JamesDSPSetSampleRate()` 用垃圾采样率重建缓冲 → 巨量 malloc → 被 OOM killer 杀掉（即此前的 `Killed`，rc=137）。
+
+正确布局已在设备实测确认并写成**编译期断言**（布局不符直接编译失败）：
+`audio_buffer_t`=16 B；`buffer_config_t`=56 B（samplingRate@16、channels@20、provider@24、format@48、accessMode@49、mask@50）；
+`effect_config_t`=112 B（inputCfg@0、outputCfg@56）。
+
+### 3.2 两个关键工程发现
+
+1. **引擎自带 brickwall 限幅器**（阈值钳位 -0.09 dBFS，jamesdsp.c:716 / jdspController.c:359-377）会吃掉增益：
+   -6 dBFS 测试音上 +12 dB 只体现为 +6.40 dB（被限幅）；-18 dBFS 上才精确得到 +12.00 dB。
+   实测矩阵：-6→+6.40、-12→+11.93、-18→+12.00、-24→+12.00 dB。
+   故离线渲染默认测试音改为 **-18 dBFS**（`OFFLINE_TONE_DBFS` 可覆盖）。这是引擎物理行为，不是实现缺陷。
+2. **引擎会持久化参数并在 EffectCreate 时回放**（可能覆盖用户真实设置），还会抢占 `/data/vendor/audio/jdsp_ctl.sock`。
+   渲染器在 dlopen 前设 `JDSP_STATE_DISABLE=1`，并用 `unshare(CLONE_NEWNS)`+`MS_PRIVATE`+tmpfs 做私有 mount namespace 隔离。
+   验证：连跑多次后宿主 `/data/vendor/audio` 的 md5sum、目录内容、`/proc/mounts` 均无变化（我复跑后实测一致）。
+
+### 3.3 一处调试事故（已完全还原）
+
+调试中曾手动执行缺 `MS_PRIVATE` 的 `mount -t tmpfs`，tmpfs 泄漏进设备全局 mount namespace，遮蔽了 `/data/vendor/audio`。
+已 `umount` 还原：`jamesdsp_state.bin`（14578 字节、原始 mtime）完整恢复，audioserver 正常，
+我复查 `/proc/mounts` 中 `/data/vendor/audio` 计数为 **0**，崩溃记录均早于 09:00 且与 jamesdsp 无关（tombstone 来自其它进程）。
+渲染器自身隔离路径已含 `MS_PRIVATE`，对宿主零影响。
 ## 4. 已修复的发布阻塞缺陷
 
 | 缺陷 | 现象 | 修复 |
@@ -55,7 +97,7 @@
 
 ## 5. 仍未满足（不虚报）
 
-1. 信号级生效未自动化确证（SKIP，见第 3 节），听感未验。
+1. ~~信号级生效未确证~~ **已解决（判据 B 现为 PASS，见第 3 节）**；听感（人工听音）仍未做。
 2. P5 第二阶段未完全达成：App 仍保留一个只用于健康查询（19998/20001/20002）的本地对象；彻底移除需后端提供这三者真实值，而 v6.7.2 引擎不支持 GET_PARAM。App 的 SharedPreferences 仍是 UI 初始值来源（真相已在后端 config.json），UI 读侧改读 dumpConfig 需重写 App 源码。
 3. 卸载前端的完整验收未跑（仅验到 force-stop）；卸载后 token 文件消失的恢复仍需补验。
 4. 72 小时长稳未跑（最长连续运行约 5 小时，watcherFailures=0）。
