@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# 打包 KernelSU/Magisk 模块 dist/JDSP-fork-v2.0.0.zip
+# 打包 KernelSU/Magisk 模块 dist/JDSP-fork-v2.1.0.zip
 #
 #   ./module/package.sh          # 从 backend/out 取 dex + 打 zip + 自检（打完删掉拷进来的 dex）
 #   ./module/package.sh --keep   # 同上，但保留 module/src/backend/*.dex（调试用）
@@ -17,8 +17,8 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/.." && pwd)
 SRC="$HERE/src"
-OUT="$REPO/dist/JDSP-fork-v2.0.0.zip"
-VER_EXPECT="versionCode=200"
+OUT="$REPO/dist/JDSP-fork-v2.1.0.zip"
+VER_EXPECT="versionCode=210"
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -73,7 +73,7 @@ say "   OK   module.prop $VER_EXPECT"
 N=$(unzip -p "$OUT" sepolicy.rule | grep -c '^allow mtk_hal_audio')
 [ "$N" -ge 4 ] || die "sepolicy.rule 里 allow mtk_hal_audio 规则只有 $N 条（应 >=4）"
 say "   OK   sepolicy.rule allow mtk_hal_audio 规则 $N 条"
-unzip -p "$OUT" module.prop | grep -q '^version=v2\.0\.0' || die "module.prop version 不是 v2.0.0"
+unzip -p "$OUT" module.prop | grep -q '^version=v2\.1\.0' || die "module.prop version 不是 v2.0.0"
 say "   OK   module.prop version=v2.0.0-fork"
 unzip -p "$OUT" jdspd.sh | grep -q 'jdspd_normalize_state' || die "jdspd.sh 缺 state.bin 归一化"
 say "   OK   jdspd.sh 带 state.bin 归一化"

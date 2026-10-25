@@ -1,3 +1,25 @@
+### v2.1.0-fork（引擎 0003-0006 + 后端 2.1.0 + 源码改造版 App）
+
+* **引擎 0003（高频调参噪声根修）**：SET_PARAM 不再从命令线程原地改写渲染中的引擎（系数撕裂读），
+  改为每实例参数队列（同参数最新值合并），音频回调在块边界统一应用；直接写参后同步全部实例代次，
+  消除"其余实例整引擎重建+交叉淡化切换"风暴。外部热重载语义不变。
+* **引擎 0004**：补 EFFECT_CMD_DUMP 分支（消除 watcher 每秒一条的 DUMP 错误日志）；禁用态 process 返回 0；
+  PEQ/loudness 段改堆缓冲（>4096 帧不再静默跳过）；state.bin 异步落盘（250ms 去抖，参数记录路径纯内存）。
+* **引擎 0005（同输出第二会话静音根修）**：遵守 AOSP EFFECT_BUFFER_ACCESS_ACCUMULATE 契约——
+  链输出缓冲映射线程共享混音时先渲染进私有缓冲再饱和累加，不再替换写抹掉其他会话
+  （原"第一路播空音频、第二路整路无声"即此）。别名缓冲/OOM/packed-24 保持原语义。
+* **引擎 0006（开关/生效延迟优化）**：EffectCreate 发布 pristine 直通实例，state 重放移到 builder 线程
+  异步完成后交叉淡化换入，attach 引擎路径从同步数百 ms 降到 ~90ms。
+* **后端 jdspd 2.1.0**：watcher 500ms；自适应防抖（常态 400ms，短命会话风暴才升 2s，已知会话跳过）；
+  attach/detach 并行（4 线程池）；开关 on 方向 300ms。实测：off 全卸载 26ms、on 全挂载 256ms、
+  新会话 ~1s 生效；切换毛刺有界、零静音。
+* **内置 App 换为源码改造版 v1.6.16（versionCode 62）**：App 不再持有任何 AudioEffect，
+  配置读/写全走 jdspd 后端（TCP），参数保存由后端权威管理；与旧签名相同可直接升级
+  （versionCode ≥ 旧 59/61）。
+* 已知事项：aidl / arm64-sve / x86 三路仍为上游预编译引擎（无 0001-0006）；若设备装有
+  其它提供 /vendor/etc/audio_effects.xml 的模块（如第三方调音包），需移除其 jamesdsp apply 行
+  backend 模式才能生效（service.sh 的 boot.log 会给出 WARN 与来源）。
+
 ### v6.7.2-fork
 
 * 安装器新增 AIDL 版本校验：只有当设备同时具备 `android.hardware.audio.effect.IFactory`
