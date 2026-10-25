@@ -8,6 +8,11 @@ package com.jdsp.common;
  * crash system_server. The daemon therefore only calls it when the state actually has to
  * change.
  *
+ * <p>Note: since the master switch uses unload semantics (off detaches the handles, the
+ * instances leave the chain), {@link #whileDisabled} is no longer used by the watcher &mdash;
+ * the switch-off path detaches instead of disabling. It is kept as the documented idempotence
+ * rule for any future bypass-style feature.
+ *
  * <p>Pure Java so the rules are unit tested on the host.
  */
 public final class BypassRule {

@@ -4,6 +4,7 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.InputStreamReader;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -25,6 +26,15 @@ public final class SessionWatcher {
     public static final long POLL_MS = 1000L;
     /** Hard timeout for one dumpsys invocation. */
     public static final long DUMPSYS_TIMEOUT_MS = 3000L;
+    /**
+     * Short-session debounce: a freshly discovered session is only attached once it
+     * has been seen alive for at least this long.  Every effect-chain create/teardown
+     * round trip stresses the vendor HAL (on an MTK device a HAL SIGSEGV was observed
+     * under chain churn), and most of the churn comes from sessions that live well
+     * under two seconds (UI blips, probe apps, decoder warm-ups).  Sessions that are
+     * already attached are never affected by this gate.
+     */
+    public static final long ATTACH_DEBOUNCE_MS = 2000L;
     private static final int MAX_DUMP_BYTES = 8 * 1024 * 1024;
     private static final String DUMPSYS_CMD = "dumpsys media.audio_flinger";
 
@@ -52,6 +62,8 @@ public final class SessionWatcher {
     private volatile int lastDumpBytes;
     private volatile String lastError = "";
     private long lastEndpointCheck;
+    /** sessionId -> wall clock of the tick the session was first seen (short-session debounce). */
+    private final Map<Integer, Long> firstSeen = new HashMap<Integer, Long>();
 
     public SessionWatcher(ConfigStore config, PolicyEngine policy, EffectManager effects,
                           ParamBus bus) {
@@ -158,6 +170,11 @@ public final class SessionWatcher {
             if (s.pkg == null || s.pkg.length() == 0) {
                 s.pkg = policy.resolvePkg(s);
             }
+            // Short-session debounce: remember when this session first showed up.
+            Integer key = Integer.valueOf(s.sessionId);
+            if (!firstSeen.containsKey(key)) {
+                firstSeen.put(key, Long.valueOf(t0));
+            }
         }
         sessions = list;
         reconcile(list);
@@ -249,6 +266,17 @@ public final class SessionWatcher {
     }
 
     /**
+     * Pure decision helper for the short-session debounce (host-testable):
+     * a session may be attached only once it has been observed for at least
+     * {@link #ATTACH_DEBOUNCE_MS}.  A session that was never seen before
+     * (firstSeenAt == null) is never attachable - the caller records it first
+     * and waits for a later tick.
+     */
+    static boolean mayAttach(Long firstSeenAt, long now) {
+        return firstSeenAt != null && now - firstSeenAt.longValue() >= ATTACH_DEBOUNCE_MS;
+    }
+
+    /**
      * Attaches / releases handles so that the live set matches policy and config.
      *
      * <p>Three independent rules, in this order:
@@ -291,6 +319,19 @@ public final class SessionWatcher {
             }
             if (d.attach) {
                 if (!effects.isAttached(s.sessionId)) {
+                    // Short-session debounce: the session must have survived at least
+                    // ATTACH_DEBOUNCE_MS before we build an effect chain for it.  Nothing
+                    // is held yet, so skipping the attach here is free; a still-alive
+                    // session is picked up on a later tick with parameters replayed.
+                    Integer key = Integer.valueOf(s.sessionId);
+                    Long seenAt = firstSeen.get(key);
+                    if (seenAt == null) {
+                        firstSeen.put(key, Long.valueOf(System.currentTimeMillis()));
+                        continue;
+                    }
+                    if (!mayAttach(seenAt, System.currentTimeMillis())) {
+                        continue;
+                    }
                     int rc = effects.attach(s.sessionId, s.effectId);
                     if (rc == EffectManager.OK) {
                         effects.setOwner(s.sessionId, s.uid, s.pkg, s.pid);
@@ -331,6 +372,9 @@ public final class SessionWatcher {
                 Log.i("released session=" + id + " (no longer present)");
             }
         }
+        // Debounce bookkeeping: forget first-seen stamps of sessions that vanished
+        // (a session id that re-appears later starts a fresh observation window).
+        firstSeen.keySet().retainAll(present);
     }
 
     /** uid of a pid: /proc/<pid> is owned by the process' real uid. */

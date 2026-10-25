@@ -14,6 +14,7 @@ public final class AllTests {
         com.jdsp.common.EnableSwitchTest.run(suite);
         com.jdsp.common.EngineWriteLockTest.run(suite);
         com.jdsp.backend.EffectManagerDetachTest.run(suite);
+        com.jdsp.backend.AttachDebounceTest.run(suite);
         ParserTest.run(suite);
         ValueCodecTest.run(suite);
         FormatTest.run(suite);

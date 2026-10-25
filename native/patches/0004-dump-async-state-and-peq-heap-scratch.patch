@@ -1,0 +1,634 @@
+diff -ruN '--exclude=*.o' '--exclude=*.rej' '--exclude=*.orig' src-0003/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c src/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c
+--- src-0003/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c	2026-10-25 17:08:23.226286245 +0800
++++ src/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c	2026-10-25 16:59:44.800631911 +0800
+@@ -10,6 +10,13 @@
+ #include <math.h>
+ #include <unistd.h>
+ #include "essential.h"
++/* EFFECT_CMD_DUMP is missing from the vendored essential.h enum (it predates
++ * the command).  AOSP system/media audio_effect.h defines it right after
++ * EFFECT_CMD_OFFLOAD, i.e. value 21 - the framework (dumpsys of
++ * media.audio_flinger) sends it once per dump cycle. */
++#ifndef EFFECT_CMD_DUMP
++#define EFFECT_CMD_DUMP 21u
++#endif
+ // Effect section
+ #include "jdsp/jdsp_header.h"
+ #include "peq_loudness.h"
+@@ -37,6 +44,13 @@
+ 	// PEQ and loudness (root version extensions)
+ 	peq_cascade_t peq;
+ 	loudness_t loudness;
++	/* 0004: heap scratch for the PEQ/loudness float pass.  Preallocated in
++	 * EffectDSPMainConstructor (2 * 4096 samples covers every common HAL
++	 * buffer), grown on demand up to the configured block size; freed in
++	 * EffectDSPMainDestructor.  Replaces the old 8192-sample stack buffer
++	 * whose cap silently skipped the pass for frame counts > 4096. */
++	float *peqScratch;
++	size_t peqScratchSamples;
+ 	// Self recorded state persistence (see jdsp_state.c)
+ 	int stateReplaying;      // non-zero while a recorded sequence is replayed
+ 	int stateReplayed;       // recorded sequence was applied at least once
+@@ -101,9 +115,16 @@
+ 	JamesDSPInit(&dspmain->jdsp, 128, 48000.0f);
+ 	peq_cascade_init(&dspmain->peq);
+ 	loudness_init(&dspmain->loudness);
++	/* 0004: preallocate the PEQ/loudness scratch (32 KB).  If this fails the
++	 * process path will try to grow it on demand. */
++	dspmain->peqScratchSamples = 8192u;
++	dspmain->peqScratch = (float *)malloc(dspmain->peqScratchSamples * sizeof(float));
+ }
+ void EffectDSPMainDestructor(EffectDSPMain *dspmain)
+ {
++	free(dspmain->peqScratch);
++	dspmain->peqScratch = NULL;
++	dspmain->peqScratchSamples = 0;
+ 	JamesDSPFree(&dspmain->jdsp);
+ 	if (dspmain->tempImpulseIncoming)
+ 		free(dspmain->tempImpulseIncoming);
+@@ -1019,25 +1040,19 @@
+ 					return 0;
+ 				}
+ 		}
+-		/* Loudness config: 6 floats = 24 bytes (mode-aware, current app),
+-		 * or 5 floats = 20 bytes (legacy app builds, mode defaults to 0).
+-		 * Layout: [0] sampleRate (ignored), [1] referenceLevel,
+-		 * [2] referenceOffset, [3] attenuation, [4] volume, [5] mode
+-		 * (0 = classic Fletcher-Munson, 1 = ISO 226:2023) */
+-		if (cep->psize == 4 && (cep->vsize == 24 || cep->vsize == 20))
++		/* Loudness config: 5 floats = 20 bytes */
++		if (cep->psize == 4 && cep->vsize == 20)
+ 		{
+ 			int32_t cmd = ((int32_t *)cep)[3];
+ 			if (cmd == 1301)
+ 				{
+ 					float *fdata = &((float*)cep)[4];
+-					int numFloats = cep->vsize / 4;
+-					int mode = numFloats >= 6 ? (int)fdata[5] : 0;
+ 					/* Всегда используем реальную частоту AudioFlinger (dspmain->jdsp.fs).
+ 					 * См. комментарий в cmd == 1300 выше. fdata[0] игнорируется. */
+ 					double sr = (double)dspmain->jdsp.fs;
+ 					loudness_configure(&dspmain->loudness, sr,
+ 						(double)fdata[1], (double)fdata[2],
+-						(double)fdata[3], (double)fdata[4], mode);
++						(double)fdata[3], (double)fdata[4], 0);
+ 					*replyData = 0;
+ 					return 0;
+ 				}
+@@ -1054,37 +1069,6 @@
+ 				return 0;
+ 			}
+ 		}
+-		/* Loudness tuning: 8 floats = 32 bytes
+-		 * [0] lsFreq, [1] lsSlope, [2] lsRatio,
+-		 * [3] hsFreq, [4] hsSlope, [5] hsRatio, [6] isoBasePhon, [7] isoQ */
+-		if (cep->psize == 4 && cep->vsize == 32)
+-		{
+-			int32_t cmd = ((int32_t *)cep)[3];
+-			if (cmd == 1303)
+-			{
+-				float *fdata = &((float*)cep)[4];
+-				loudness_set_tuning(&dspmain->loudness,
+-					(double)fdata[0], (double)fdata[1], (double)fdata[2],
+-					(double)fdata[3], (double)fdata[4], (double)fdata[5],
+-					(double)fdata[6], (double)fdata[7]);
+-				*replyData = 0;
+-				return 0;
+-			}
+-		}
+-		/* Loudness subsonic filter: 4 floats = 16 bytes
+-		 * [0] enable, [1] freq, [2] order, [3] qFactor */
+-		if (cep->psize == 4 && cep->vsize == 16)
+-		{
+-			int32_t cmd = ((int32_t *)cep)[3];
+-			if (cmd == 1304)
+-			{
+-				float *fdata = &((float*)cep)[4];
+-				loudness_set_subsonic(&dspmain->loudness, fdata[0] != 0.0f,
+-					(double)fdata[1], (int)fdata[2], (double)fdata[3]);
+-				*replyData = 0;
+-				return 0;
+-			}
+-		}
+ 		return -1;
+ 	}
+     switch (cmdCode)
+@@ -1146,14 +1130,40 @@
+ 		break;
+ 	}
+ 	/* Apply PEQ cascade and loudness correction (root version extensions).
+-	 * Convert output to float interleaved, process, convert back. */
++	 * Convert output to float interleaved, process, convert back.  The float
++	 * scratch is a per-engine heap buffer (0004): a frame count above 4096
++	 * used to silently skip the whole pass because the stack buffer was
++	 * capped at 8192 samples. */
+ 	if (dspmain->peq.enabled || dspmain->loudness.enabled)
+ 	{
+-		/* Use a stack buffer; blockSizeMax bounds the frame count */
+ 		size_t totalSamples = actualFrameCount * 2; /* stereo interleaved */
+-		if (totalSamples <= 8192) /* safety limit */
++		float *tmpBuf = dspmain->peqScratch;
++		if (tmpBuf != NULL && totalSamples > dspmain->peqScratchSamples)
++		{
++			/* Grow on demand.  By this point the main pass above has already
++			 * ensured jdsp.blockSizeMax >= actualFrameCount, so the bound is
++			 * the configured block size; growing on the render thread is the
++			 * same trade-off upstream makes inside the process functions
++			 * (JamesDSPReallocateBlock) and happens once per size increase,
++			 * never per buffer. */
++			size_t want = (size_t)dspmain->jdsp.blockSizeMax * 2u;
++			float *grown;
++			if (want < totalSamples)
++				want = totalSamples;
++			grown = (float *)realloc(tmpBuf, want * sizeof(float));
++			if (grown != NULL)
++			{
++				tmpBuf = grown;
++				dspmain->peqScratch = grown;
++				dspmain->peqScratchSamples = want;
++			}
++			else
++			{
++				tmpBuf = NULL; /* OOM: skip the pass, keep audio flowing */
++			}
++		}
++		if (tmpBuf != NULL && totalSamples <= dspmain->peqScratchSamples)
+ 		{
+-			float tmpBuf[8192];
+ 			switch (dspmain->formatFloatModeInt32Mode)
+ 			{
+ 			case 0: /* int16 */
+@@ -1197,8 +1207,18 @@
+ 	 * (draining the per-instance deferred queue on the audio thread), and the
+ 	 * builder thread still prepares complete replacement engines for external
+ 	 * hot reloads.  This callback therefore never races a parameter write and
+-	 * never touches the filesystem. */
+-	return dspmain->mEnable ? 0 : -ENODATA;
++	 * never touches the filesystem.
++	 *
++	 * 0004: always report success.  The old "return dspmain->mEnable ? 0 :
++	 * -ENODATA" relies on framework tolerance for a non-zero process return
++	 * from an insert effect.  In AOSP mainline (services/audioflinger/
++	 * Effects.cpp) the process return is only consumed for the STOPPED -> IDLE
++	 * tail transition ("mState == STOPPED && ret == -ENODATA" forces
++	 * mDisableWaitCnt = 1); with it gone, the disable tail simply renders the
++	 * framework's normal mMaxDisableWaitCnt buffers - bounded, no hang.  Some
++	 * vendor forks treat any non-zero return as a processing error instead
++	 * (passthrough/mute), so reporting 0 unconditionally is the safe contract. */
++	return 0;
+ }
+ // Effect section end
+ static effect_descriptor_t jamesdsp_descriptor =
+@@ -1560,6 +1580,18 @@
+ 	 * next buffer boundary (see generic_process).  Chunked transfers (impulse /
+ 	 * string upload) stay inline: they are rare, they do heavy work that must
+ 	 * not run on the render thread, and they must never be merged or evicted. */
++	if (cmdCode == EFFECT_CMD_DUMP)
++	{
++		/* dumpsys asks the effect to describe itself; the AOSP contract for
++		 * this command is "success, zero reply bytes".  Letting it fall
++		 * through to the engine's default switch returned an error, so
++		 * audioserver logged "EffectHAL: Effect ... command DUMP error:
++		 * Invalid argument" on every dumpsys tick (~1.1 s apart on an idle
++		 * device, once per mounted instance). */
++		if (replySize != NULL)
++			*replySize = 0;
++		return 0;
++	}
+ 	if (cmdCode == EFFECT_CMD_SET_PARAM)
+ 	{
+ 		int32_t paramId = 0;
+diff -ruN '--exclude=*.o' '--exclude=*.rej' '--exclude=*.orig' src-0003/Main/libjamesdsp/jni/jamesdsp/jdsp_state.c src/Main/libjamesdsp/jni/jamesdsp/jdsp_state.c
+--- src-0003/Main/libjamesdsp/jni/jamesdsp/jdsp_state.c	2026-10-25 17:08:23.049279246 +0800
++++ src/Main/libjamesdsp/jni/jamesdsp/jdsp_state.c	2026-10-25 17:02:12.928116518 +0800
+@@ -13,7 +13,12 @@
+  *   - never crash, never block the audio thread: every failure path falls back
+  *     to the compiled in defaults;
+  *   - atomic persistence: the whole file is rewritten to <path>.tmp.<pid>,
+- *     fsync()ed (rate limited) and rename()d over the old file;
++ *     fsync()ed (rate limited) and rename()ed over the old file.  Since 0004
++ *     the write+rename is owned by a debounced writer thread (see the writer
++ *     section below): record() only marks the store dirty, so a parameter
++ *     burst collapses into one file write and the command path never waits
++ *     on IO.  A crash may lose the newest ~250 ms of records; process exit
++ *     flushes (jdsp_state_shutdown -> jdsp_state_flush with fsync);
+  *   - bounded: per record 1 MiB, per chunked transfer group 2 MiB, 8 MiB total;
+  *   - replay reuses the existing command handler, no second parser.
+  *
+@@ -123,6 +128,7 @@
+ 
+ static pthread_once_t g_once = PTHREAD_ONCE_INIT;
+ static pthread_mutex_t g_lock = PTHREAD_MUTEX_INITIALIZER;
++static pthread_cond_t g_save_cond = PTHREAD_COND_INITIALIZER;
+ 
+ /* Identity of the state file as we last read or wrote it.  The hot reload path
+  * compares this against a fresh stat() to notice that somebody else (the app, a
+@@ -142,6 +148,10 @@
+     int disabled;     /* JDSP_STATE_DISABLE=1 */
+     int readonly;     /* JDSP_STATE_READONLY=1 */
+     int debug;        /* JDSP_STATE_DEBUG=1 */
++    int sync_save;    /* JDSP_STATE_SYNC_SAVE=1: save synchronously per record
++                       * (legacy pre-0004 behaviour; used by the off-device
++                       * format tests, which assert the file right after a
++                       * record).  Default is the debounced writer thread. */
+     int skip_stream;  /* current chunked transfer is too big to persist */
+     int write_warned;
+     int fsync_warned;
+@@ -171,6 +181,123 @@
+ /* JDSP_STATE_SRC_* (last change source) comes from jdsp_state.h. */
+ 
+ /* ------------------------------------------------------------------------- */
++/* debounced writer thread (0004)                                             */
++/* ------------------------------------------------------------------------- */
++
++/* Before 0004 every recorded parameter synchronously serialised the whole
++ * store (state.bin is ~64 KB), wrote it, and renamed it - all under g_lock,
++ * on the binder thread that delivered the SET_PARAM.  With the file at ~64 KB
++ * that path measured p95 ~48 ms, right on the caller's latency budget.
++ *
++ * Now record() only marks the store dirty and signals this thread; the
++ * serialisation happens under g_lock (cheap: one memcpy of the records into a
++ * private buffer) but the write+rename runs here, outside every lock.  A burst
++ * of slider updates therefore collapses into one file write.
++ *
++ * Trade-offs (deliberate):
++ *   - a crash can lose the newest ~250 ms of records (the coalescing window
++ *     plus one IO); the file itself is always a complete, CRC-valid snapshot;
++ *   - process exit is covered: jdsp_state_shutdown() joins this thread and
++ *     then runs one forced (fsync) flush of whatever is still dirty.  There is
++ *     nothing per-instance to flush: the store is process-global, so engine
++ *     teardown (EffectRelease) never loses records either.
++ *   - the realtime path (enqueue -> audio-thread drain) never touches this
++ *     thread: record() got strictly cheaper (no serialize, no IO).
++ */
++static struct {
++    int started;
++    int stop;
++    pthread_t tid;
++} wr = {
++    .started = 0,
++    .stop = 0,
++};
++
++#define JDSP_STATE_SAVE_DEBOUNCE_MS 250u
++
++/* defined in the file IO section below */
++static uint8_t *state_serialize(size_t *out_len);
++static int state_write_atomic(uint8_t *buf, size_t len, int force_fsync);
++
++static void *state_writer_thread(void *arg)
++{
++    (void)arg;
++
++    pthread_mutex_lock(&g_lock);
++    for (;;) {
++        uint8_t *buf;
++        size_t len = 0;
++        struct timespec ts;
++        int can_save;
++
++        if (wr.stop)
++            break;
++        if (!g.dirty) {
++            /* Sleep until signalled; the timeout is also the idle poll that
++             * keeps the shutdown request responsive. */
++            clock_gettime(CLOCK_REALTIME, &ts);
++            ts.tv_nsec += (long)JDSP_STATE_SAVE_DEBOUNCE_MS * 1000L * 1000L;
++            if (ts.tv_nsec >= 1000000000L) {
++                ts.tv_sec += 1;
++                ts.tv_nsec -= 1000000000L;
++            }
++            pthread_cond_timedwait(&g_save_cond, &g_lock, &ts);
++            continue;
++        }
++        /* Debounce: give an in-flight burst a moment to finish, then save
++         * whatever is dirty exactly once.  Signals that arrive during the
++         * wait just keep the dirty flag set for the next round. */
++        clock_gettime(CLOCK_REALTIME, &ts);
++        ts.tv_nsec += (long)JDSP_STATE_SAVE_DEBOUNCE_MS * 1000L * 1000L;
++        if (ts.tv_nsec >= 1000000000L) {
++            ts.tv_sec += 1;
++            ts.tv_nsec -= 1000000000L;
++        }
++        pthread_cond_timedwait(&g_save_cond, &g_lock, &ts);
++        if (wr.stop)
++            break; /* shutdown flushes the remaining dirty state itself */
++        can_save = g.dirty && g.initialized && !g.disabled && !g.readonly;
++        if (can_save) {
++            g.dirty = 0;
++            buf = state_serialize(&len);
++        } else {
++            g.dirty = 0;
++            buf = NULL;
++        }
++        pthread_mutex_unlock(&g_lock);
++        (void)state_write_atomic(buf, len, 0);
++        free(buf);
++        pthread_mutex_lock(&g_lock);
++    }
++    pthread_mutex_unlock(&g_lock);
++    return NULL;
++}
++
++static void state_writer_start(void)
++{
++    pthread_t tid;
++    if (wr.started || wr.stop)
++        return;
++    if (pthread_create(&tid, NULL, state_writer_thread, NULL) != 0)
++        return; /* save-on-flush only; record still works */
++    wr.tid = tid;
++    wr.started = 1;
++}
++
++static void state_writer_stop(void)
++{
++    if (!wr.started)
++        return;
++    pthread_mutex_lock(&g_lock);
++    wr.stop = 1;
++    pthread_cond_signal(&g_save_cond);
++    pthread_mutex_unlock(&g_lock);
++    pthread_join(wr.tid, NULL);
++    wr.started = 0;
++    wr.stop = 0;
++}
++
++/* ------------------------------------------------------------------------- */
+ /* file watcher                                                              */
+ /* ------------------------------------------------------------------------- */
+ /* One inotify instance plus a single poll() loop is enough here: we watch
+@@ -407,7 +534,7 @@
+ }
+ 
+ /* ------------------------------------------------------------------------- */
+-/* in-memory store                                                           */
++/* in-memory store                                                            */
+ /* ------------------------------------------------------------------------- */
+ 
+ static void state_free_records(void)
+@@ -634,24 +761,24 @@
+         g.stamp.valid = 0;
+ }
+ 
+-/* Serialise the whole store and replace the state file atomically. */
+-static int state_save(int force_fsync)
++/* ------------------------------------------------------------------------- */
++/* serialisation + atomic file replace                                        */
++/* ------------------------------------------------------------------------- */
++
++/* Serialise the whole store into a freshly malloc'd buffer.
++ * Caller must hold g_lock (the records are owned by the store).
++ * Returns NULL on oversize/OOM; *out_len is then undefined. */
++static uint8_t *state_serialize(size_t *out_len)
+ {
+     size_t need = JDSP_STATE_HEADER_BYTES + JDSP_STATE_TRAILER_BYTES;
+     size_t i;
+     size_t off;
+     uint8_t *buf;
+-    char tmp[JDSP_STATE_PATH_MAX + 32];
+-    int fd;
+-    int rc = -1;
+-    uint64_t now;
+ 
+-    if (g.disabled || g.readonly)
+-        return 0;
+     for (i = 0; i < g.count; i++)
+         need += 8u + g.recs[i].size;
+     if (need > JDSP_STATE_MAX_FILE_BYTES)
+-        return -1;
++        return NULL;
+ 
+     buf = (uint8_t *)malloc(need);
+     if (buf == NULL) {
+@@ -659,7 +786,7 @@
+             g.write_warned = 1;
+             STATE_LOGW("out of memory, state file not updated");
+         }
+-        return -1;
++        return NULL;
+     }
+ 
+     buf[0] = 'J';
+@@ -683,10 +810,40 @@
+     off += JDSP_STATE_TRAILER_BYTES;
+     if (off != need) {
+         free(buf);
+-        return -1;
++        return NULL;
+     }
++    *out_len = off;
++    return buf;
++}
+ 
+-    snprintf(tmp, sizeof(tmp), "%s.tmp.%d", g.path, (int)getpid());
++/* The IO itself is serialised independently of g_lock so a manual flush can
++ * never interleave with the writer thread's tmp-file + rename (same tmp path,
++ * and a torn tmp file would only be caught by the CRC on the next load). */
++static pthread_mutex_t g_io_lock = PTHREAD_MUTEX_INITIALIZER;
++
++/* Atomically replace the state file with one serialised snapshot.
++ * Never called with g_lock held: the write+rename runs outside the store
++ * lock, and the post-rename stamp refresh takes it briefly (the watcher
++ * compares stamps under the same lock). */
++static int state_write_atomic(uint8_t *buf, size_t len, int force_fsync)
++{
++    char tmp[JDSP_STATE_PATH_MAX + 32];
++    char path[JDSP_STATE_PATH_MAX];
++    int fd;
++    int rc = -1;
++    uint64_t now, last;
++
++    if (buf == NULL || g.disabled || g.readonly)
++        return -1;
++
++    /* Snapshot the path under g_lock: the writer thread runs without it and
++     * jdsp_state_set_path() may swap the path concurrently. */
++    pthread_mutex_lock(&g_lock);
++    memcpy(path, g.path, sizeof(path));
++    pthread_mutex_unlock(&g_lock);
++
++    pthread_mutex_lock(&g_io_lock);
++    snprintf(tmp, sizeof(tmp), "%s.tmp.%d", path, (int)getpid());
+     fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0660);
+     if (fd < 0) {
+         if (!g.write_warned) {
+@@ -694,26 +851,25 @@
+             STATE_LOGW("cannot create %s (%s), state is kept in memory only", tmp,
+                        strerror(errno));
+         }
+-        free(buf);
+-        return -1;
++        goto out;
+     }
+-    if (state_write_all(fd, buf, off) != 0) {
++    if (state_write_all(fd, buf, len) != 0) {
+         if (!g.write_warned) {
+             g.write_warned = 1;
+             STATE_LOGW("cannot write %s (%s)", tmp, strerror(errno));
+         }
+         close(fd);
+         unlink(tmp);
+-        free(buf);
+-        return -1;
++        goto out;
+     }
+     now = state_now_ms();
+-    if (force_fsync || now == 0u || now - g.last_fsync_ms >= JDSP_STATE_FSYNC_INTERVAL_MS) {
++    last = __atomic_load_n(&g.last_fsync_ms, __ATOMIC_RELAXED);
++    if (force_fsync || now == 0u || now - last >= JDSP_STATE_FSYNC_INTERVAL_MS) {
+         if (fsync(fd) != 0 && !g.fsync_warned) {
+             g.fsync_warned = 1;
+             STATE_LOGW("fsync(%s) failed (%s)", tmp, strerror(errno));
+         }
+-        g.last_fsync_ms = now;
++        __atomic_store_n(&g.last_fsync_ms, now, __ATOMIC_RELAXED);
+     }
+     if (close(fd) != 0) {
+         if (!g.write_warned) {
+@@ -721,27 +877,31 @@
+             STATE_LOGW("close(%s) failed (%s)", tmp, strerror(errno));
+         }
+         unlink(tmp);
+-        free(buf);
+-        return -1;
++        goto out;
+     }
+-    if (rename(tmp, g.path) != 0) {
++    if (rename(tmp, path) != 0) {
+         if (!g.write_warned) {
+             g.write_warned = 1;
+-            STATE_LOGW("cannot rename %s -> %s (%s)", tmp, g.path, strerror(errno));
++            STATE_LOGW("cannot rename %s -> %s (%s)", tmp, path, strerror(errno));
+         }
+         unlink(tmp);
+-        free(buf);
+-        return -1;
++        goto out;
+     }
+     if (force_fsync)
+         state_fsync_dir();
+-    g.dirty = 0;
+-    g.write_warned = 0;
+     rc = 0;
+-    free(buf);
+-    /* Our own write must not look like a foreign change to the reload check. */
+-    state_stamp_refresh();
+-    STATE_LOGI("state file updated: %zu record(s), %zu byte(s)", g.count, need);
++out:
++    pthread_mutex_unlock(&g_io_lock);
++    if (rc == 0) {
++        /* Our own write must not look like a foreign change to the reload
++         * check.  The watcher stats and compares under g_lock, so the stamp
++         * has to be refreshed under the same lock. */
++        pthread_mutex_lock(&g_lock);
++        state_stamp_refresh();
++        g.write_warned = 0;
++        pthread_mutex_unlock(&g_lock);
++        STATE_LOGI("state file updated: %zu byte(s)", len);
++    }
+     return rc;
+ }
+ 
+@@ -960,9 +1120,9 @@
+         }
+         if (!hit)
+             continue;
+-        /* Our own state_save() also produces these events; the stamp says
++        /* Our own writer thread also produces these events; the stamp says
+          * whether the file is really different from what we hold.  The stat has
+-         * to happen under g_lock: state_save() holds it across its rename and
++         * to happen under g_lock: the writer holds it across its rename and
+          * the following stamp refresh, so a stat taken outside the lock can
+          * describe a file that has already been replaced again and would turn
+          * our own write into a spurious reload. */
+@@ -1043,6 +1203,7 @@
+     g.disabled = state_env_flag("JDSP_STATE_DISABLE");
+     g.readonly = state_env_flag("JDSP_STATE_READONLY");
+     g.debug = state_env_flag("JDSP_STATE_DEBUG");
++    g.sync_save = state_env_flag("JDSP_STATE_SYNC_SAVE");
+     path = getenv("JDSP_STATE_PATH");
+     if (path != NULL && path[0] != '\0') {
+         strncpy(g.path, path, sizeof(g.path) - 1u);
+@@ -1066,6 +1227,10 @@
+      * delivered. */
+     if (!g.disabled)
+         state_watch_start();
++    /* The writer thread is harmless even when disabled or read-only (the
++     * dirty flag is never set on those paths); starting it unconditionally
++     * keeps shutdown uniform. */
++    state_writer_start();
+ }
+ 
+ /* ------------------------------------------------------------------------- */
+@@ -1172,7 +1337,21 @@
+     __atomic_add_fetch(&g.store_gen, 1, __ATOMIC_RELEASE);
+     state_trim();
+     g.dirty = 1;
+-    (void)state_save(0);
++    if (g.sync_save) {
++        /* Legacy synchronous path (test hook): serialize under the lock, do
++         * the IO with the lock released, exactly like the writer thread. */
++        size_t len = 0;
++        uint8_t *buf = state_serialize(&len);
++        g.dirty = 0;
++        pthread_mutex_unlock(&g_lock);
++        (void)state_write_atomic(buf, len, 0);
++        free(buf);
++        pthread_mutex_lock(&g_lock);
++    } else {
++        /* 0004: the debounced writer thread owns the file IO.  This call is
++         * on the SET_PARAM command path - keep it free of serialize/IO. */
++        pthread_cond_signal(&g_save_cond);
++    }
+ 
+ out:
+     pthread_mutex_unlock(&g_lock);
+@@ -1220,7 +1399,7 @@
+ 
+     pthread_once(&g_once, state_init_once);
+     /* The stat is taken under g_lock so that it cannot observe a file that a
+-     * concurrent state_save() is in the middle of replacing. */
++     * concurrent state_write_atomic() is in the middle of replacing. */
+     pthread_mutex_lock(&g_lock);
+     if (!state_stat_stamp(&now)) {
+         pthread_mutex_unlock(&g_lock);
+@@ -1267,11 +1446,21 @@
+ 
+ void jdsp_state_flush(void)
+ {
++    uint8_t *buf;
++    size_t len = 0;
++
+     pthread_once(&g_once, state_init_once);
+     pthread_mutex_lock(&g_lock);
+-    if (g.initialized && g.dirty && !g.disabled && !g.readonly)
+-        (void)state_save(1);
++    if (!g.initialized || !g.dirty || g.disabled || g.readonly) {
++        pthread_mutex_unlock(&g_lock);
++        return;
++    }
++    g.dirty = 0;
++    buf = state_serialize(&len);
+     pthread_mutex_unlock(&g_lock);
++    /* Forced flush: always fsync (exit path / explicit request). */
++    (void)state_write_atomic(buf, len, 1);
++    free(buf);
+ }
+ 
+ void jdsp_state_shutdown(void)
+@@ -1280,9 +1469,12 @@
+     /* Stop the watcher before tearing the store down: it takes g_lock and reads
+      * g.recs.  A no-op when the watcher never started. */
+     state_watch_stop();
++    /* Stop the writer first so the final flush below cannot race the thread's
++     * own IO; whatever the thread did not get to stays dirty and is written
++     * (with fsync) by the flush. */
++    state_writer_stop();
++    jdsp_state_flush();
+     pthread_mutex_lock(&g_lock);
+-    if (g.initialized && g.dirty && !g.disabled && !g.readonly)
+-        (void)state_save(1);
+     state_free_records();
+     g.initialized = 0;
+     pthread_mutex_unlock(&g_lock);

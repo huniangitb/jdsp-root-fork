@@ -13,6 +13,13 @@ OUT=$ROOT/build
 CC=${CC:-cc}
 mkdir -p "$OUT"
 
+# Since 0004 the record path saves through a debounced writer thread.  The
+# format/replay tests below assert the state file immediately after a record,
+# so they run against the legacy synchronous save path (the same serialize/
+# write/rename code, just called inline).  The async path is smoke-tested by
+# test_async_save at the end.
+export JDSP_STATE_SYNC_SAVE=1
+
 # The format/replay tests drive the polling API directly, so the watcher is
 # switched off for them: otherwise its thread could pick the change up first and
 # the poll would legitimately report "unchanged".  The watcher has its own test.
@@ -45,5 +52,10 @@ echo "== build test_paramq (deferred SET_PARAM queue, 0003)"
 $CC -std=gnu99 -O1 -g -Wall -Wextra -Wno-unused-parameter -I"$SRC" \
     "$ROOT/test/test_paramq.c" "$SRC/jdsp_paramq.c" -o "$OUT/test_paramq" -lpthread
 "$OUT/test_paramq"
+
+echo "== build test_async_save (debounced writer thread, 0004)"
+$CC -std=gnu99 -O1 -g -Wall -Wextra -Wno-unused-parameter -I"$SRC" \
+    "$ROOT/test/test_async_save.c" "$SRC/jdsp_state.c" -o "$OUT/test_async_save" -lpthread
+"$OUT/test_async_save"
 
 echo "== all host tests passed"
