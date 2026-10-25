@@ -166,6 +166,49 @@ public final class ShellTransport implements JdspTransport {
     }
 
     @Override
+    public int detach(int sessionId) {
+        List<String> args = new ArrayList<String>();
+        args.add("detach");
+        args.add(String.valueOf(sessionId));
+        int[] r = exec(args, null);
+        return r == null ? -1 : (r[0] == 0 ? 0 : -2);
+    }
+
+    @Override
+    public int setEnabled(boolean enabled) {
+        // jdspcli 的命令名是 "enabled"（不是 setEnabled）
+        List<String> args = new ArrayList<String>();
+        args.add("enabled");
+        args.add(enabled ? "on" : "off");
+        int[] r = exec(args, null);
+        return r == null ? -1 : (r[0] == 0 ? 0 : -2);
+    }
+
+    @Override
+    public Boolean getEnabled() {
+        StringBuilder out = new StringBuilder();
+        int[] r = exec(java.util.Collections.singletonList("enabled"), out);
+        if (r == null || r[0] != 0) return null;
+        String text = out.toString().trim();
+        if (text.isEmpty()) return null;
+        String lower = text.toLowerCase(java.util.Locale.ROOT);
+        if (lower.contains("off") || lower.contains("false") || lower.startsWith("0")) {
+            return Boolean.FALSE;
+        }
+        return Boolean.TRUE;
+    }
+
+    @Override
+    public String dumpConfig() {
+        // jdspcli 的命令名是 "dump-config"（带连字符）。
+        StringBuilder out = new StringBuilder();
+        int[] r = exec(java.util.Collections.singletonList("dump-config"), out);
+        if (r == null || r[0] != 0) return null;
+        String text = out.toString().trim();
+        return text.isEmpty() ? null : text;
+    }
+
+    @Override
     public int commit(int sessionId) {
         int[] r = exec(java.util.Collections.singletonList("commit"), null);
         return r == null ? -1 : (r[0] == 0 ? 0 : -2);

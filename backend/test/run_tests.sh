@@ -11,6 +11,8 @@
 #      android.jar, so compile errors in those files are caught here too
 #   3. compile and run backend/test/java/** WITHOUT android.jar on the runtime
 #      classpath, proving the tested code is pure Java
+#   4. run the shell self-test of the shared device-selection library
+#      (backend/test/device/lib/selftest.sh), which needs no device
 #
 # Output directory: backend/test/build/units (gitignored via the build/ rule).
 set -euo pipefail
@@ -66,4 +68,17 @@ fi
 # 4) run without android.jar: this is a feature, it proves the tested classes
 #    have no Android dependency
 echo
-java -cp "$BUILD/test-classes:$BUILD/classes" com.jdsp.cli.AllTests
+UNIT_RC=0
+java -cp "$BUILD/test-classes:$BUILD/classes" com.jdsp.cli.AllTests || UNIT_RC=$?
+
+# 5) shell-level self-test of the shared device-selection library
+#    (used by scripts/verify-v2.sh, module/accept-v2.sh and this script)
+echo
+echo "== device selection self-test =="
+SELFTEST_RC=0
+bash "$HERE/device/lib/selftest.sh" || SELFTEST_RC=$?
+
+if [ "$UNIT_RC" -ne 0 ] || [ "$SELFTEST_RC" -ne 0 ]; then
+    echo "FAILED (unit=$UNIT_RC selftest=$SELFTEST_RC)" >&2
+    exit 1
+fi

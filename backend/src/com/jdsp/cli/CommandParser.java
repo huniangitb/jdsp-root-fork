@@ -19,7 +19,7 @@ public final class CommandParser {
 
     static final Set<String> COMMANDS = Collections.unmodifiableSet(new HashSet<String>(Arrays.asList(
             "sessions", "get", "set", "attach", "detach", "commit", "dump-config", "dump-session",
-            "stats", "ping", "version", "mode", "policy", "bench", "help")));
+            "stats", "ping", "version", "mode", "policy", "bench", "help", "enabled")));
 
     public static ParsedCommand parse(String[] argv) throws CliException {
         if (argv == null || argv.length == 0) {

@@ -227,11 +227,22 @@ public final class EffectManager {
         }
     }
 
-    /** Enables or disables the held instance. Returns the engine status (0 = ok). */
+    /**
+     * Enables or disables the held instance. Returns the engine status (0 = ok).
+     *
+     * <p><b>Idempotent on purpose</b>: a call that would not change the state is not forwarded to
+     * the framework. {@code AudioEffect.setEnabled()} reaches the audio HAL, and a stream of
+     * redundant calls (one per watcher tick and session) was measured to crash system_server on
+     * a busy device. A redundant call returns 0 without touching the framework.
+     */
     public synchronized int setEnabled(int sessionId, boolean on) {
         Handle h = handles.get(Integer.valueOf(sessionId));
         if (h == null) {
             return ERR_NO_HANDLE;
+        }
+        if (safeEnabled(h.effect) == on) {
+            // Already in the requested state: do not call the framework.
+            return OK;
         }
         try {
             int rc = h.effect.setEnabled(on);

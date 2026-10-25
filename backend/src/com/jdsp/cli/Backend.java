@@ -45,5 +45,11 @@ public interface Backend {
 
     int getMode() throws CliException;
 
+    /** Global master switch: false bypasses every session's effect. 0 = ok. */
+    int setEnabled(boolean enabled) throws CliException;
+
+    /** Current state of the global master switch. */
+    boolean getEnabled() throws CliException;
+
     String stats() throws CliException;
 }

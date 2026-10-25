@@ -27,8 +27,23 @@
 #   SOAK_SECONDS=1800 bash backend/test/device/run_acceptance.sh  # + 30 min soak
 #   bash .../run_acceptance.sh --soak                             # same as SOAK_SECONDS=1800
 #   STRICT_SKIP=1 ...                                             # exit 3 when jdspd is absent
+#   bash .../run_acceptance.sh <serial>                           # pick the device
+#   bash .../run_acceptance.sh --serial <serial>                  # same
 #
-# Env: ADB, SERIAL, ANDROID_SDK, DEVICE_DIR, SOAK_SECONDS, STRICT_SKIP.
+# Device selection (same rules as scripts/verify-v2.sh and
+# module/accept-v2.sh):
+#   1. first argument / --serial
+#   2. $DSH_SERIAL
+#   3. $ANDROID_SERIAL
+#   4. $SERIAL
+#   5. the only online device reported by "adb devices"
+#   With 0 or more than one online device the script exits 2 instead of guessing.
+#
+# The test tone is built from the repository (tools/Tone.java) and the CLI from
+# backend/src/com/jdsp/cli, so the script needs nothing pre-installed on the device.
+#
+# Env: ADB, DSH_SERIAL, ANDROID_SERIAL, SERIAL, ANDROID_SDK, DEVICE_DIR,
+#      SOAK_SECONDS, STRICT_SKIP.
 # Exit: 0 all measured items passed (skips allowed unless STRICT_SKIP=1);
 #       1 at least one FAIL; 2 environment problem (no device / build failure);
 #       3 daemon unavailable and STRICT_SKIP=1.
@@ -37,9 +52,10 @@ set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 BACKEND=$(cd "$HERE/../.." && pwd)
 REPO=$(cd "$BACKEND/.." && pwd)
+# shellcheck source=lib/device.sh
+. "$HERE/lib/device.sh"
 SDK=${ANDROID_SDK:-/home/bdy/Android/Sdk}
 ADB=${ADB:-adb}
-SERIAL=${SERIAL:-${ANDROID_SERIAL:-}}
 DEVICE_DIR=${DEVICE_DIR:-/data/local/tmp/jdsp-accept}
 SOAK_SECONDS=${SOAK_SECONDS:-0}
 STRICT_SKIP=${STRICT_SKIP:-0}
@@ -55,20 +71,30 @@ CLI_OUT=""
 CLI_ERR=""
 CLI_RC=0
 
-for arg in "$@"; do
+SERIAL_ARG=""
+while [ $# -gt 0 ]; do
+    arg=$1
     case "$arg" in
-        --soak) SOAK_SECONDS=1800 ;;
-        --soak=*) SOAK_SECONDS="${arg#--soak=}" ;;
-        --strict) STRICT_SKIP=1 ;;
+        --soak) SOAK_SECONDS=1800; shift ;;
+        --soak=*) SOAK_SECONDS="${arg#--soak=}"; shift ;;
+        --strict) STRICT_SKIP=1; shift ;;
+        --serial) SERIAL_ARG=${2:-}; shift 2 ;;
+        --serial=*) SERIAL_ARG=${arg#--serial=}; shift ;;
         -h|--help) sed -n '2,40p' "$0"; exit 0 ;;
-        *) echo "unknown argument: $arg" >&2; exit 2 ;;
+        -*) echo "unknown argument: $arg" >&2; exit 2 ;;
+        *) if [ -n "$SERIAL_ARG" ]; then
+               echo "only one serial may be given" >&2
+               exit 2
+           fi
+           SERIAL_ARG=$arg; shift ;;
     esac
 done
 
-ADB_CMD=("$ADB")
-if [ -n "$SERIAL" ]; then
-    ADB_CMD+=(-s "$SERIAL")
-fi
+# Device selection: first argument / --serial, then DSH_SERIAL, ANDROID_SERIAL,
+# SERIAL, then the single online device.  Never guesses with several devices.
+jdsp_select_device "$SERIAL_ARG" || exit 2
+SERIAL=$JDSP_SERIAL
+ADB_CMD=("${JDSP_ADB_SN[@]}")
 adb_() { "${ADB_CMD[@]}" "$@"; }
 dev() { adb_ shell "$1"; }
 
@@ -216,68 +242,28 @@ fi
 
 # ---------------------------------------------------------------- build ----
 echo "== build =="
-ANDROID_JAR=$(ls "$SDK"/platforms/android-*/android.jar 2>/dev/null | sort -V | tail -1)
-D8="$SDK/cmdline-tools/latest/bin/d8"
-AIDL_BIN=$(ls -d "$SDK"/build-tools/*/aidl 2>/dev/null | sort -V | tail -1)
+ANDROID_JAR=$(jdsp_android_jar)
+D8=$(jdsp_d8)
+AIDL_BIN=$(jdsp_aidl)
 [ -f "$ANDROID_JAR" ] || { echo "ERROR: missing android.jar under $SDK" >&2; exit 2; }
 [ -x "$D8" ] || { echo "ERROR: missing d8 at $D8" >&2; exit 2; }
 [ -x "$AIDL_BIN" ] || { echo "ERROR: missing aidl under $SDK/build-tools" >&2; exit 2; }
 
-# Compile the CLI from the same sources with the same aidl/javac/d8 recipe.
-# Used when backend/out is unavailable: a concurrent daemon build calls
-# build.sh, which rm -rf's backend/out, so the normal artifact can vanish
-# between build.sh returning and the push below.
-build_cli_dex() {
-    mkdir -p "$LOG_DIR/gen" "$LOG_DIR/cli-classes" "$LOG_DIR/cli-dex"
-    local files
-    mapfile -t AIDL_FILES < <(find "$BACKEND/aidl" -name '*.aidl' | sort)
-    "$AIDL_BIN" --lang=java -I"$BACKEND/aidl" --out="$LOG_DIR/gen" "${AIDL_FILES[@]}" || return 1
-    mapfile -t files < <(find "$BACKEND/src/com/jdsp/cli" "$BACKEND/src/com/jdsp/common"             "$LOG_DIR/gen" -name '*.java' | sort)
-    javac --release 8 -nowarn -Xlint:-options -classpath "$ANDROID_JAR"             -d "$LOG_DIR/cli-classes" "${files[@]}" || return 1
-    find "$LOG_DIR/cli-classes" -name '*.class' > "$LOG_DIR/cli-files.txt"
-    "$D8" --lib "$ANDROID_JAR" --min-api 29 --output "$LOG_DIR/cli-dex"             $(cat "$LOG_DIR/cli-files.txt") >/dev/null || return 1
-    cp "$LOG_DIR/cli-dex/classes.dex" "$LOG_DIR/jdspcli.dex"
-}
-
-echo "running backend/build.sh (logged, best effort)..."
-( cd "$BACKEND" && ./build.sh ) >"$LOG_DIR/build.log" 2>&1         || echo "WARN: build.sh failed (see $LOG_DIR/build.log)"
-CLI_DEX="$LOG_DIR/jdspcli.dex"
-rm -f "$CLI_DEX"
-if [ -f "$BACKEND/out/jdspcli.dex" ]; then
-    cp "$BACKEND/out/jdspcli.dex" "$CLI_DEX" 2>/dev/null || true
-fi
-if [ -s "$CLI_DEX" ]; then
-    echo "cli dex     : backend/build.sh ($(stat -c %s "$CLI_DEX") B)"
-else
-    echo "cli dex     : backend/out unavailable, compiling standalone..."
-    if ! build_cli_dex; then
-        echo "ERROR: standalone jdspcli compile failed" >&2
-        exit 2
-    fi
-    echo "cli dex     : standalone ($(stat -c %s "$CLI_DEX") B)"
-fi
-rm -rf "$LOG_DIR/tone-classes" "$LOG_DIR/tone-dex"
-mkdir -p "$LOG_DIR/tone-classes" "$LOG_DIR/tone-dex"
-if ! javac --release 8 -nowarn -classpath "$ANDROID_JAR" -d "$LOG_DIR/tone-classes" \
-        "$REPO/tools/Tone.java" >"$LOG_DIR/tone-javac.log" 2>&1; then
-    echo "ERROR: javac tools/Tone.java failed" >&2
-    cat "$LOG_DIR/tone-javac.log" >&2
+# The CLI and the test tone are built from the repository with the same
+# aidl -> javac -> d8 recipe as backend/build.sh and pushed into DEVICE_DIR.
+# The shared library prefers backend/out/jdspcli.dex and falls back to a
+# standalone compile, so a concurrent daemon build (which rm -rf's backend/out)
+# cannot break the acceptance run.
+echo "building test dex files from the repository..."
+if ! jdsp_push_test_dexs "$DEVICE_DIR"; then
+    echo "ERROR: could not build/push the test dex files" >&2
     exit 2
 fi
-if ! "$D8" --lib "$ANDROID_JAR" --min-api 29 --output "$LOG_DIR/tone-dex" \
-        "$LOG_DIR/tone-classes/Tone.class" >"$LOG_DIR/tone-d8.log" 2>&1; then
-    echo "ERROR: d8 Tone.class failed" >&2
-    cat "$LOG_DIR/tone-d8.log" >&2
-    exit 2
-fi
-cp "$LOG_DIR/tone-dex/classes.dex" "$LOG_DIR/tone.dex"
-
-dev "mkdir -p $DEVICE_DIR && chmod 755 $DEVICE_DIR"
-adb_ push "$CLI_DEX" "$DEVICE_DIR/jdspcli.dex" >/dev/null || { echo "ERROR: push jdspcli.dex" >&2; exit 2; }
-adb_ push "$LOG_DIR/tone.dex" "$DEVICE_DIR/tone.dex" >/dev/null || { echo "ERROR: push tone.dex" >&2; exit 2; }
-dev "chmod 644 $DEVICE_DIR/jdspcli.dex $DEVICE_DIR/tone.dex"
-echo "build ok: jdspcli.dex $(stat -c %s "$CLI_DEX") B, tone.dex $(stat -c %s "$LOG_DIR/tone.dex") B"
+CLI_DEX="$(jdsp_build_dir)/jdspcli.dex"
+TONE_DEX="$(jdsp_build_dir)/tone.dex"
+echo "build ok: jdspcli.dex $(stat -c %s "$CLI_DEX") B, tone.dex $(stat -c %s "$TONE_DEX") B)"
 echo
+
 
 # ------------------------------------------------------ daemon transport ---
 echo "== daemon transport probe =="
@@ -537,5 +523,5 @@ else
 fi
 
 echo
-echo "artifacts: $LOG_DIR (build.log, tone.dex, packages.list)"
+echo "artifacts: $LOG_DIR (packages.list), $(jdsp_build_dir) (tone.dex, jdspcli.dex)"
 finish

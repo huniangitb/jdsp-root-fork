@@ -45,6 +45,8 @@ public final class PolicyEngine {
     public static final class Decision {
         /** True when jdspd should hold an effect handle for the session. */
         public boolean attach;
+        /** True when the policy forbids any effect for this session (must be released). */
+        public boolean excluded;
         /** Effective policy mode (0 follow / 1 on / 2 exclude). */
         public int policyMode = JdspConst.POLICY_FOLLOW;
         /** Human readable reason, for logs and stats. */
@@ -194,6 +196,7 @@ public final class PolicyEngine {
 
         if (policy == JdspConst.POLICY_EXCLUDE) {
             d.attach = false;
+            d.excluded = true;
             d.reason = "excluded by policy";
             return d;
         }
@@ -203,11 +206,6 @@ public final class PolicyEngine {
             return d;
         }
         // follow global
-        if (!cfg.isEnabled()) {
-            d.attach = false;
-            d.reason = "globally disabled";
-            return d;
-        }
         if (cfg.getMode() == JdspConst.MODE_BACKEND) {
             d.attach = true;
             d.reason = "backend mode";

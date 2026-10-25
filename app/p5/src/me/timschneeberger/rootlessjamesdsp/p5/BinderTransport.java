@@ -157,6 +157,83 @@ public final class BinderTransport implements JdspTransport {
     }
 
     @Override
+    public int detach(final int sessionId) {
+        return transactInt(IBinder.FIRST_CALL_TRANSACTION + 5, new Call() {
+            @Override public void run(Parcel data, Parcel reply) {
+                data.writeInt(sessionId);
+            }
+        });
+    }
+
+    @Override
+    public int setEnabled(final boolean enabled) {
+        // AIDL 侧暂无 setEnabled（需 daemon-core 扩展）；这里先走占位事务号，
+        // 服务端未实现时返回失败，App 会保留重试队列。
+        final android.os.Parcel data = android.os.Parcel.obtain();
+        final android.os.Parcel reply = android.os.Parcel.obtain();
+        IBinder b = binder;
+        if (b == null) return -1;
+        try {
+            data.writeInterfaceToken(DESCRIPTOR);
+            data.writeInt(enabled ? 1 : 0);
+            if (!b.transact(IBinder.FIRST_CALL_TRANSACTION + 19, data, reply, 0)) return -1;
+            reply.readException();
+            return reply.dataAvail() > 0 ? reply.readInt() : 0;
+        } catch (Throwable t) {
+            lastError = t.getClass().getSimpleName() + ": " + t.getMessage();
+            return -1;
+        } finally {
+            reply.recycle();
+            data.recycle();
+        }
+    }
+
+    @Override
+    public Boolean getEnabled() {
+        IBinder b = binder;
+        if (b == null) return null;
+        android.os.Parcel data = android.os.Parcel.obtain();
+        android.os.Parcel reply = android.os.Parcel.obtain();
+        try {
+            data.writeInterfaceToken(DESCRIPTOR);
+            if (!b.transact(IBinder.FIRST_CALL_TRANSACTION + 20, data, reply, 0)) return null;
+            reply.readException();
+            if (reply.dataAvail() == 0) return null;
+            Object v = reply.readValue(null);
+            return v == null ? null : Boolean.valueOf(((Integer) v).intValue() != 0);
+        } catch (Throwable t) {
+            lastError = t.getClass().getSimpleName() + ": " + t.getMessage();
+            return null;
+        } finally {
+            reply.recycle();
+            data.recycle();
+        }
+    }
+
+    @Override
+    public String dumpConfig() {
+        // AIDL 事务号 +9 = dumpConfig()（见 backend/out/gen/.../IJdspService.java）。
+        IBinder b = binder;
+        if (b == null) return null;
+        android.os.Parcel data = android.os.Parcel.obtain();
+        android.os.Parcel reply = android.os.Parcel.obtain();
+        try {
+            data.writeInterfaceToken(DESCRIPTOR);
+            if (!b.transact(IBinder.FIRST_CALL_TRANSACTION + 9, data, reply, 0)) return null;
+            reply.readException();
+            if (reply.dataAvail() == 0) return null;
+            Object v = reply.readValue(null);
+            return v == null ? null : String.valueOf(v);
+        } catch (Throwable t) {
+            lastError = t.getClass().getSimpleName() + ": " + t.getMessage();
+            return null;
+        } finally {
+            reply.recycle();
+            data.recycle();
+        }
+    }
+
+    @Override
     public int commit(final int sessionId) {
         return transactInt(T_COMMIT, new Call() {
             @Override public void run(Parcel data, Parcel reply) {

@@ -9,6 +9,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
+import com.jdsp.common.BypassRule;
+import com.jdsp.common.EnableGate;
+
 /**
  * Polls {@code dumpsys media.audio_flinger} once per second, resolves sessions to (pid, uid, pkg)
  * and reconciles the effect handles: new sessions get attached (and their configured parameters
@@ -31,6 +34,8 @@ public final class SessionWatcher {
     private final ParamBus bus;
     /** Optional: keeps the App's endpoint files alive across App reinstalls. */
     private TcpService tcp;
+    /** Optional: the core API (used for the deferred global switch transition). */
+    private CoreApi api;
 
     /** How often the App's endpoint files (port/token) are re-checked. */
     public static final long ENDPOINT_REFRESH_MS = 30000L;
@@ -59,6 +64,11 @@ public final class SessionWatcher {
     /** Lets the watcher re-create the App's port/token files when they disappear. */
     public void setTcpService(TcpService tcp) {
         this.tcp = tcp;
+    }
+
+    /** Lets the watcher apply a deferred global switch transition. */
+    public void setCoreApi(CoreApi api) {
+        this.api = api;
     }
 
     public void start() {
@@ -153,6 +163,10 @@ public final class SessionWatcher {
         reconcile(list);
         config.saveIfDirty();
         refreshEndpointFiles();
+        // Apply a "on" transition that was rate limited (see EnableSwitch).
+        if (api != null) {
+            api.pollEnableSwitch();
+        }
     }
 
     /**
@@ -234,13 +248,51 @@ public final class SessionWatcher {
         }
     }
 
-    /** Attaches / releases handles so that the live set matches policy and config. */
+    /**
+     * Attaches / releases handles so that the live set matches policy and config.
+     *
+     * <p>Three independent rules, in this order:
+     * <ol>
+     *   <li>policy=exclude: the handle is released (the effect leaves the chain);</li>
+     *   <li>the global master switch is off: the handle is <em>kept but disabled</em>, so the
+     *       effect is bypassed without touching the chain (no click, instant reversible), and
+     *       no new session is attached while the switch is off;</li>
+     *   <li>otherwise: attach when the policy allows it, and keep the instance enabled.</li>
+     * </ol>
+     */
     private void reconcile(List<SessionInfo> list) {
         Set<Integer> present = new HashSet<Integer>();
+        boolean globallyDisabled = !config.isEnabled();
         for (int i = 0; i < list.size(); i++) {
             SessionInfo s = list.get(i);
             present.add(Integer.valueOf(s.sessionId));
             PolicyEngine.Decision d = policy.decide(s, config);
+            int action = EnableGate.action(d.excluded, globallyDisabled, d.attach,
+                    effects.isAttached(s.sessionId));
+            if (action == EnableGate.ACTION_RELEASE) {
+                if (effects.isAttached(s.sessionId)) {
+                    effects.setEnabled(s.sessionId, false);
+                    effects.detach(s.sessionId);
+                    bus.forgetSession(s.sessionId);
+                    Log.i("detached session=" + s.sessionId + " pkg=" + s.pkg + " (" + d.reason + ")");
+                }
+                continue;
+            }
+            if (action == EnableGate.ACTION_BYPASS) {
+                // Bypass: keep the handle (the instance stays in the chain) but switch the
+                // effect off. No attach, no parameter replay, no churn.
+                //
+                // IMPORTANT: only call setEnabled() when the state really has to change. A
+                // setEnabled() per watcher tick (1/s per session) reaches the audio HAL and
+                // was measured to crash system_server on a busy device; the idempotence rule
+                // lives in BypassRule so it is unit tested.
+                int bypass = BypassRule.whileDisabled(effects.isAttached(s.sessionId),
+                        effects.isEnabled(s.sessionId));
+                if (bypass == BypassRule.CALL_DISABLE) {
+                    effects.setEnabled(s.sessionId, false);
+                }
+                continue;
+            }
             if (d.attach) {
                 if (!effects.isAttached(s.sessionId)) {
                     int rc = effects.attach(s.sessionId, s.effectId);
@@ -255,10 +307,20 @@ public final class SessionWatcher {
                     }
                 } else {
                     effects.setOwner(s.sessionId, s.uid, s.pkg, s.pid);
+                    // Same idempotence rule as the bypass branch: the framework is only
+                    // called when the enable state really changes.
+                    if (BypassRule.whileEnabled(effects.isEnabled(s.sessionId))
+                            == BypassRule.CALL_ENABLE) {
+                        // The switch was turned on again: re-apply and switch the effect back on.
+                        bus.applyAll(s.sessionId, d.params);
+                        effects.setEnabled(s.sessionId, true);
+                        Log.i("re-enabled session=" + s.sessionId + " pkg=" + s.pkg);
+                    }
                 }
             } else if (effects.isAttached(s.sessionId)) {
                 effects.setEnabled(s.sessionId, false);
                 effects.detach(s.sessionId);
+                bus.forgetSession(s.sessionId);
                 Log.i("detached session=" + s.sessionId + " pkg=" + s.pkg + " (" + d.reason + ")");
             }
         }

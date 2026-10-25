@@ -32,6 +32,8 @@ public final class TcpTransport implements JdspTransport {
     public static final int DEFAULT_PORT = 37501;
 
     private final String host;
+    /** 最近一次后端返回的错误描述（用于诊断）。 */
+    private String lastError = "";
     private final int port;
     private final String token;
 
@@ -179,6 +181,80 @@ public final class TcpTransport implements JdspTransport {
             for (int i = 0; i < out.length; i++) out[i] = ids.get(i).intValue();
             return out;
         } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    @Override
+    public int detach(int sessionId) {
+        try {
+            JSONObject req = new JSONObject();
+            req.put("op", "detach");
+            req.put("s", sessionId);
+            String reply = roundTrip(req);
+            if (reply == null) return -1;
+            JSONObject o = new JSONObject(reply);
+            return o.optBoolean("ok", false) ? o.optInt("r", 0) : -2;
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    @Override
+    public int setEnabled(boolean enabled) {
+        try {
+            JSONObject req = new JSONObject();
+            req.put("op", "setEnabled");
+            req.put("enabled", enabled);
+            String reply = roundTrip(req);
+            if (reply == null) return -1;
+            JSONObject o = new JSONObject(reply);
+            if (o.optBoolean("ok", false)) return o.optInt("r", 0);
+            // 失败：把后端的 code 带出来（-1006 = 后端被全局关掉，属用户意图）
+            int code = o.optInt("code", o.optInt("r", -1004));
+            lastError = "setEnabled: " + o.optString("e", "") + " (code=" + code + ")";
+            return code;
+        } catch (Throwable t) {
+            return -1;
+        }
+    }
+
+    @Override
+    public Boolean getEnabled() {
+        try {
+            JSONObject req = new JSONObject();
+            req.put("op", "getEnabled");
+            String reply = roundTrip(req);
+            if (reply == null) return null;
+            JSONObject o = new JSONObject(reply);
+            if (!o.optBoolean("ok", false)) return null;
+            // enabled 字段是权威值；没有就退回 r（1=开 0=关）
+            if (o.has("enabled")) {
+                return Boolean.valueOf(o.optBoolean("enabled", false));
+            }
+            return Boolean.valueOf(o.optInt("r", 0) != 0);
+        } catch (Throwable t) {
+            return null;
+        }
+    }
+
+    @Override
+    public String dumpConfig() {
+        try {
+            JSONObject req = new JSONObject();
+            req.put("op", "dumpConfig");
+            String reply = roundTrip(req);
+            if (reply == null) return null;
+            JSONObject o = new JSONObject(reply);
+            if (!o.optBoolean("ok", false)) return null;
+            // 后端把 config.json 作为一个 JSON 对象放在 "config" 字段里。
+            JSONObject cfg = o.optJSONObject("config");
+            if (cfg != null) return cfg.toString();
+            // 兼容：后端直接给了文本
+            String raw = o.optString("config", "");
+            return raw.isEmpty() ? null : raw;
+        } catch (Throwable t) {
+            lastError = "dumpConfig: " + t.getClass().getSimpleName();
             return null;
         }
     }

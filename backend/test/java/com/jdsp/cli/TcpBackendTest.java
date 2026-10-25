@@ -268,6 +268,26 @@ public final class TcpBackendTest {
             Assert.eq("{\"cmd\":\"mode\",\"mode\":1}\n", set.requests());
         });
 
+        suite.test("tcp: enabled get and set", () -> {
+            Exchange get = new Exchange("{\"ok\":true,\"enabled\":false}");
+            Assert.isTrue(!get.backend.getEnabled(), "getEnabled(false) parsed");
+            Assert.eq("{\"cmd\":\"getEnabled\"}\n", get.requests());
+            Exchange set = new Exchange("{\"ok\":true,\"status\":0,\"enabled\":true}");
+            Assert.eq(0, set.backend.setEnabled(true));
+            Assert.eq("{\"cmd\":\"setEnabled\",\"enabled\":true}\n", set.requests());
+            Exchange off = new Exchange("{\"ok\":true,\"status\":0,\"enabled\":false}");
+            Assert.eq(0, off.backend.setEnabled(false));
+            Assert.eq("{\"cmd\":\"setEnabled\",\"enabled\":false}\n", off.requests());
+        });
+
+        suite.test("tcp: enabled failure returns the error code", () -> {
+            // The TCP transport reports the daemon's code; the driver maps a non-zero status to
+            // exit 4 (same convention as setMode / setParam).
+            Exchange error = new Exchange(
+                    "{\"ok\":false,\"error\":\"setEnabled failed\",\"code\":-1006}");
+            Assert.eq(-1006, error.backend.setEnabled(false));
+        });
+
         suite.test("tcp: policy get and set", () -> {
             Exchange get = new Exchange("{\"ok\":true,\"pkg\":\"com.foo\",\"mode\":2}");
             Assert.eq(2, get.backend.getAppPolicy("com.foo"));

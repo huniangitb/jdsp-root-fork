@@ -22,6 +22,10 @@ OUT=${2:?output apk}
 KS=${3:-${JDSP_KEYSTORE:-/home/bdy/work/fork-rootfix/jdsp.keystore}}
 KS_PASS=${4:-${JDSP_KS_PASS:-jdsp123}}
 KEY_PASS=${5:-${JDSP_KEY_PASS:-jdsp123}}
+# 模式：mirror（第一阶段，默认，已真机验证）| phase2（第二阶段，构建产物已出，未装机）
+#   mirror : 写路径 = 本地 + 镜像给 jdspd（两套实例都在写）。
+#   phase2 : 写路径 = 只给 jdspd（本地作为只读回退 + 无后端时的回退）。
+MODE=${P5_MODE:-mirror}
 
 HERE=$(cd "$(dirname "$0")" && pwd)
 SDK=${ANDROID_SDK:-${ANDROID_HOME:-/home/bdy/Android/Sdk}}
@@ -50,20 +54,44 @@ apk d -f -q -o "$WORK/app" "$IN"
 PKG_SMALI="$WORK/app/smali/me/timschneeberger/rootlessjamesdsp/p5"
 mkdir -p "$PKG_SMALI"
 
-echo "== inject JdspProxyEffect.smali"
-cp "$HERE/smali/JdspProxyEffect.smali" "$PKG_SMALI/JdspProxyEffect.smali"
+case "$MODE" in
+  mirror)
+    PROXY="JdspProxyEffect.smali"
+    PROXY_CLS="Lme/timschneeberger/rootlessjamesdsp/p5/JdspProxyEffect;"
+    ;;
+  phase2)
+    PROXY="JdspRemoteEffect.smali"
+    PROXY_CLS="Lme/timschneeberger/rootlessjamesdsp/p5/JdspRemoteEffect;"
+    ;;
+  phase3)
+    # phase3 = phase2 + **读侧**也走后端（App 不持有配置）。
+    # 写路径与 phase2 相同；额外把 androidx PreferenceManager 的
+    # getSharedPreferences() 包一层 JdspBackendSharedPreferences，
+    # 于是界面显示的是后端 config.json 里的值。
+    PROXY="JdspRemoteEffect.smali"
+    PROXY_CLS="Lme/timschneeberger/rootlessjamesdsp/p5/JdspRemoteEffect;"
+    PATCH_READ=1
+    ;;
+  *)
+    echo "unknown P5_MODE=$MODE (expected mirror|phase2|phase3)" >&2
+    exit 2
+    ;;
+esac
+
+echo "== inject $PROXY (mode=$MODE)"
+cp "$HERE/smali/$PROXY" "$PKG_SMALI/$PROXY"
 
 echo "== patch JamesDspRemoteEngine.createEffect()"
-python3 - "$WORK/app" <<'PY'
+python3 - "$WORK/app" "$PROXY_CLS" <<'PY'
 import sys, pathlib, re
 root = pathlib.Path(sys.argv[1])
+old_new = sys.argv[2]
+old_cls = "Landroid/media/audiofx/AudioEffect;"
 hits = list(root.glob("smali*/me/timschneeberger/rootlessjamesdsp/interop/JamesDspRemoteEngine.smali"))
 if len(hits) != 1:
     raise SystemExit("expected exactly one JamesDspRemoteEngine.smali, got %r" % hits)
 p = hits[0]
 s = p.read_text(encoding="utf-8")
-old_new = "Lme/timschneeberger/rootlessjamesdsp/p5/JdspProxyEffect;"
-old_cls = "Landroid/media/audiofx/AudioEffect;"
 
 # 只改 createEffect() 方法体内的两处；其它 AudioEffect 引用（release/enabled 等）保持不动
 m = re.search(r"(\.method private final createEffect\(\)Landroid/media/audiofx/AudioEffect;.*?)\.end method",
@@ -80,6 +108,11 @@ s = s[:m.start(1)] + patched + s[m.end(1):]
 p.write_text(s, encoding="utf-8")
 print("   patched", p.name)
 PY
+
+if [ -n "${PATCH_READ:-}" ]; then
+  echo "== patch androidx PreferenceManager.getSharedPreferences() (read side -> backend)"
+  python3 "$HERE/patch_read_side.py" "$WORK/app"
+fi
 
 echo "== build bridge dex (classes4.dex)"
 rm -rf "$WORK/classes" "$WORK/dex"

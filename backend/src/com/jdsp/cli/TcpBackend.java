@@ -265,6 +265,22 @@ public final class TcpBackend implements Backend {
     }
 
     @Override
+    public int setEnabled(boolean enabled) throws CliException {
+        return status(call(request("setEnabled", "enabled", Boolean.valueOf(enabled))));
+    }
+
+    @Override
+    public boolean getEnabled() throws CliException {
+        Map<String, Object> response = call(request("getEnabled"));
+        requireOk(response);
+        Object value = response.get("enabled");
+        if (value instanceof Boolean) {
+            return ((Boolean) value).booleanValue();
+        }
+        return Json.intValue(response, "r", 0) != 0;
+    }
+
+    @Override
     public String stats() throws CliException {
         Map<String, Object> response = call(request("stats"));
         requireOk(response);

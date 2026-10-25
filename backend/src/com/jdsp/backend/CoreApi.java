@@ -1,6 +1,9 @@
 package com.jdsp.backend;
 
+import com.jdsp.common.EnableErrors;
+import com.jdsp.common.EnableSwitch;
 import com.jdsp.common.JdspConst;
+import com.jdsp.common.WritePolicy;
 
 import java.util.ArrayList;
 import java.util.Collections;
@@ -27,6 +30,12 @@ public final class CoreApi {
     public static final String VERSION = "jdspd 2.0.0";
     /** Returned by ping(). */
     public static final int PING_OK = 1;
+    /**
+     * The backend is globally disabled (master switch off): parameter writes and attaches are
+     * refused. Distinct from the other error codes so the client can tell "off on purpose" from
+     * "something went wrong".
+     */
+    public static final int ERR_DISABLED = EnableErrors.DISABLED;
 
     public static final byte[] EMPTY = new byte[0];
 
@@ -43,6 +52,8 @@ public final class CoreApi {
     }
 
     private volatile ShutdownHook shutdownHook;
+    /** Rate limits the global master switch (see {@link EnableSwitch}). */
+    private final EnableSwitch enableSwitch = new EnableSwitch();
     private volatile String instanceLockFile = "";
     private volatile long instanceStartedAt;
     private volatile boolean binderPublished;
@@ -59,6 +70,9 @@ public final class CoreApi {
         this.effects = effects;
         this.bus = bus;
         this.watcher = watcher;
+        // The switch must start in the state the configuration says, otherwise the first
+        // setEnabled() call would be treated as a transition even when nothing changes.
+        this.enableSwitch.transitionApplied(config.isEnabled(), 0L);
     }
 
     // ---- session views -------------------------------------------------------
@@ -241,6 +255,13 @@ public final class CoreApi {
             Log.w("attach: invalid session " + sessionId);
             return EffectManager.ERR_BAD_ARG;
         }
+        // The master switch is checked first: an attach that arrives while the backend is off
+        // reports "disabled" (-1006), not "no handle" (-1001).
+        if (!config.isEnabled()) {
+            // The master switch is off: no session may get an effect until it is turned on.
+            Log.w("attach: refused, backend is globally disabled (session " + sessionId + ")");
+            return ERR_DISABLED;
+        }
         int rc = effects.attach(sessionId, -1);
         if (rc != EffectManager.OK) {
             return rc;
@@ -270,7 +291,19 @@ public final class CoreApi {
         if (value == null || value.length == 0) {
             return EffectManager.ERR_BAD_ARG;
         }
-        if (!effects.isAttached(sessionId)) {
+        // The master switch is checked BEFORE the handle question (see WritePolicy): a write
+        // that arrives while the backend is off always reports "disabled" (-1006), also for a
+        // session that has no handle yet, so the client can keep the intent and retry later.
+        int outcome = WritePolicy.writeOutcome(!config.isEnabled(),
+                effects.isAttached(sessionId));
+        if (outcome == WritePolicy.DISABLED) {
+            // Writing a parameter while the master switch is off would look like it worked
+            // (the value would be stored) but nothing would be applied, so it is refused.
+            Log.w("setParam: refused, backend is globally disabled (session "
+                    + sessionId + " param " + paramId + ")");
+            return outcome;
+        }
+        if (outcome == WritePolicy.NO_HANDLE) {
             // The App expects setParam to work without an explicit attach first.
             int rc = attach(sessionId);
             if (rc != EffectManager.OK) {
@@ -455,6 +488,86 @@ public final class CoreApi {
             return "{\"policies\":{},\"count\":0}";
         }
         return o.toString();
+    }
+
+    // ---- global master switch ------------------------------------------------
+
+    /**
+     * Turns the whole backend on or off.
+     *
+     * <p>false: the daemon disables and releases every effect handle, and refuses parameter
+     * writes (see {@link #setParam}); the stored configuration is kept, so turning it back on
+     * restores the previous state. No engine parameter is written, so this works with every
+     * engine build.
+     *
+     * <p>true: the watcher re-attaches the sessions it is allowed to touch and replays their
+     * parameters.
+     *
+     * @return 0 = ok, {@link #ERR_DISABLED} never happens here, negative = error
+     */
+    public int setEnabled(boolean enabled) {
+        long now = System.currentTimeMillis();
+        int decision = enableSwitch.request(enabled, now);
+        if (decision == EnableSwitch.NONE) {
+            // The backend already has this state: a pure no-op. No config write, no framework
+            // call, no watcher poke. This is what keeps an old App that mirrors the state back
+            // from causing any churn at all.
+            return 0;
+        }
+        if (decision == EnableSwitch.DEFER) {
+            // The "on" direction is rate limited: a burst of requests collapses into one
+            // transition (the watcher applies it when the deadline passes).
+            Log.i("global enable deferred (rate limited), the switch is currently "
+                    + (enableSwitch.applied() ? "on" : "off"));
+            return 0;
+        }
+        applyEnabled(enabled, now);
+        return 0;
+    }
+
+    /** Applies a switch state: writes the config, switches the instances, pokes the watcher. */
+    private void applyEnabled(boolean enabled, long now) {
+        boolean changed = config.isEnabled() != enabled;
+        config.setEnabled(enabled);
+        config.saveThrottled(200L);
+        enableSwitch.transitionApplied(enabled, now);
+        if (changed) {
+            Log.i("global " + (enabled ? "enabled" : "disabled")
+                    + " (policy on/exclude does not override the master switch)");
+        }
+        if (!enabled) {
+            // Bypass right away, without waiting for the next watcher tick: keep the handles
+            // (the instances stay in the chain) but switch every effect off.
+            int n = 0;
+            java.util.List<Integer> held = effects.attachedSessions();
+            for (int i = 0; i < held.size(); i++) {
+                if (effects.setEnabled(held.get(i).intValue(), false) == EffectManager.OK) {
+                    n++;
+                }
+            }
+            Log.i("global disabled: " + n + " effect instance(s) switched off");
+        }
+        // The watcher reconciles the rest: off -> no new attaches, on -> re-attach and re-apply.
+        watcher.poke();
+    }
+
+    /** Current state of the master switch. */
+    public boolean getEnabled() {
+        return config.isEnabled();
+    }
+
+    /**
+     * Applies a deferred "on" transition when its rate limit has expired. Called by the watcher
+     * every tick, so a burst of "on" requests ends up as exactly one transition.
+     */
+    public void pollEnableSwitch() {
+        long now = System.currentTimeMillis();
+        Boolean value = enableSwitch.poll(now);
+        if (value == null) {
+            return;
+        }
+        Log.i("applying the deferred global enable");
+        applyEnabled(value.booleanValue(), now);
     }
 
     // ---- mode ----------------------------------------------------------------

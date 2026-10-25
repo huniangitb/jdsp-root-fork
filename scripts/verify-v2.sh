@@ -2,6 +2,16 @@
 # One-shot verification of the v2 backend after a reboot.
 #
 #   scripts/verify-v2.sh [serial]
+#   scripts/verify-v2.sh --serial <serial>
+#
+# Device selection (same rules as module/accept-v2.sh and
+# backend/test/device/run_acceptance.sh):
+#   1. first argument
+#   2. $DSH_SERIAL
+#   3. $ANDROID_SERIAL
+#   4. $SERIAL
+#   5. the only online device reported by "adb devices"
+#   With 0 or more than one online device the script exits 2 instead of guessing.
 #
 # Checks, in order:
 #   1. module + engine baseline (lib sha, no experimental socket code)
@@ -10,11 +20,40 @@
 #   4. a music session gets a JamesDSP instance (postprocess in auto, jdspd in backend)
 #   5. parameters reach the engine (state file grows) and can be read back
 #
+# The test tone and the CLI are built from the repository (tools/Tone.java and
+# backend/src/com/jdsp/cli) and pushed into /data/local/tmp/jdsp-verify, so the
+# script does not depend on any pre-existing file on the device.
+#
 # Exit code 0 only when every check passes.  Read-only apart from one setParam.
 set -uo pipefail
 
-SERIAL=${1:-LNNZXG8TPFHU69AI}
-ADB="adb -s $SERIAL"
+HERE=$(cd "$(dirname "$0")" && pwd)
+REPO=$(cd "$HERE/.." && pwd)
+# shellcheck source=../backend/test/device/lib/device.sh
+. "$REPO/backend/test/device/lib/device.sh"
+
+DEVICE_DIR=${DEVICE_DIR:-/data/local/tmp/jdsp-verify}
+TONE_SECONDS=${TONE_SECONDS:-60}
+
+SERIAL_ARG=""
+while [ $# -gt 0 ]; do
+    a=$1
+    case "$a" in
+        -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
+        --serial) SERIAL_ARG=${2:-}; shift 2 ;;
+        --serial=*) SERIAL_ARG=${a#--serial=}; shift ;;
+        -*) echo "unknown option: $a" >&2; exit 2 ;;
+        *) if [ -n "$SERIAL_ARG" ]; then
+               echo "only one serial may be given" >&2
+               exit 2
+           fi
+           SERIAL_ARG=$a; shift ;;
+    esac
+done
+
+jdsp_select_device "$SERIAL_ARG" || exit 2
+ADB="${JDSP_ADB_SN[*]}"
+
 PASS=0
 FAIL=0
 
@@ -23,6 +62,16 @@ bad()  { echo "  FAIL  $*"; FAIL=$((FAIL + 1)); }
 note() { echo "        $*"; }
 
 sh_() { $ADB shell "$@" 2>&1 | tr -d '\r'; }
+
+echo "=== 0. test binaries ==="
+if jdsp_push_test_dexs "$DEVICE_DIR"; then
+    ok "tone.dex + jdspcli.dex built from the repo and pushed to $DEVICE_DIR"
+else
+    bad "could not build/push the test dex files"
+    echo
+    echo "=== summary: $PASS passed, $FAIL failed ==="
+    exit 1
+fi
 
 echo "=== 1. baseline ==="
 LIB=$(sh_ 'sha256sum /vendor/lib64/soundfx/libjamesdsp.so' | awk '{print $1}')
@@ -66,8 +115,10 @@ case "${MODE:-}" in
 esac
 
 echo "=== 4. music session gets an effect ==="
-sh_ 'pkill -f "[T]oneUsage"; sleep 1' >/dev/null
-sh_ "su -c 'CLASSPATH=/data/local/tmp/toneusage.dex nohup app_process /system/bin ToneUsage 0 60 >/dev/null 2>&1 &'" >/dev/null
+sh_ 'pkill -f "[a]pp_process /system/bin Tone"' >/dev/null
+sleep 1
+# Tone is the repo's canonical test tone: USAGE_MEDIA -> STREAM_MUSIC.
+jdsp_run_bg "env CLASSPATH=$DEVICE_DIR/tone.dex app_process /system/bin Tone $TONE_SECONDS" "$DEVICE_DIR"
 sleep 6
 SESS=$(sh_ 'dumpsys media.audio_flinger | sed -n "/Global session refs/,+8p"' | awk '$3 ~ /^[0-9]+$/ {print $1}' | sort -n | tail -1)
 if [ -n "$SESS" ]; then
@@ -87,17 +138,17 @@ fi
 
 echo "=== 5. parameters reach the engine ==="
 BEFORE=$(sh_ 'stat -c %s /data/vendor/audio/jamesdsp_state.bin 2>/dev/null')
-sh_ "su -c 'CLASSPATH=/data/local/tmp/jdspcli.dex app_process /system/bin com.jdsp.cli.Main set $SESS 1500 -0.2 50 2.0'" >/dev/null 2>&1
+sh_ "su -c 'CLASSPATH=$DEVICE_DIR/jdspcli.dex app_process /system/bin com.jdsp.cli.Main set $SESS 1500 -0.2 50 2.0'" >/dev/null 2>&1
 sleep 2
 AFTER=$(sh_ 'stat -c %s /data/vendor/audio/jamesdsp_state.bin 2>/dev/null')
 [ -n "$AFTER" ] && ok "engine state file present (${AFTER} B, was ${BEFORE:-none})" || bad "engine state file missing"
-GET=$(sh_ "su -c 'CLASSPATH=/data/local/tmp/jdspcli.dex app_process /system/bin com.jdsp.cli.Main get $SESS 1500'" 2>&1 | tail -1)
+GET=$(sh_ "su -c 'CLASSPATH=$DEVICE_DIR/jdspcli.dex app_process /system/bin com.jdsp.cli.Main get $SESS 1500'" 2>&1 | tail -1)
 case "$GET" in
     *cdcc*|*hex*) ok "get returns the last set value ($GET)" ;;
     *) [ -n "$GET" ] && ok "get returned: $GET" || bad "get returned nothing" ;;
 esac
 
-sh_ 'pkill -f "[T]oneUsage"' >/dev/null 2>&1
+sh_ 'pkill -f "[a]pp_process /system/bin Tone"' >/dev/null 2>&1
 echo
 echo "=== summary: $PASS passed, $FAIL failed ==="
 [ "$FAIL" -eq 0 ]

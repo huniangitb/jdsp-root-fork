@@ -27,6 +27,8 @@ public final class Usage {
             + "  ping                           Check that jdspd answers\n"
             + "  version                        Print the daemon version\n"
             + "  mode [auto|backend]            Show or set the architecture mode\n"
+            + "  enabled [on|off]               Show or set the global master switch\n"
+            + "                                 (off = every session's effect is bypassed)\n"
             + "  policy list                    All per-app policies (JSON)\n"
             + "  policy get <pkg>               Show one app policy\n"
             + "  policy set <pkg> <follow|on|exclude>\n"
@@ -89,6 +91,9 @@ public final class Usage {
         }
         if ("mode".equals(command)) {
             return "jdspcli mode [auto|backend]";
+        }
+        if ("enabled".equals(command)) {
+            return "jdspcli enabled [on|off]";
         }
         if ("policy".equals(command)) {
             return "jdspcli policy list|get <pkg>|set <pkg> <follow|on|exclude>";

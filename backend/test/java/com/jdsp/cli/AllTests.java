@@ -7,6 +7,11 @@ public final class AllTests {
     public static void main(String[] args) {
         Suite suite = new Suite(System.out);
         com.jdsp.common.BackendCommonTest.run(suite);
+        com.jdsp.common.EnableGateTest.run(suite);
+        com.jdsp.common.EnableErrorsTest.run(suite);
+        com.jdsp.common.WritePolicyTest.run(suite);
+        com.jdsp.common.BypassRuleTest.run(suite);
+        com.jdsp.common.EnableSwitchTest.run(suite);
         ParserTest.run(suite);
         ValueCodecTest.run(suite);
         FormatTest.run(suite);

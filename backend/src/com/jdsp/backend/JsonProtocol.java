@@ -3,6 +3,8 @@ package com.jdsp.backend;
 import org.json.JSONArray;
 import org.json.JSONObject;
 
+import com.jdsp.common.EnableErrors;
+
 /**
  * Transport agnostic JSON-line protocol shared by the loopback TCP control channel.
  *
@@ -124,8 +126,10 @@ public final class JsonProtocol {
                     o.put("e", reply.error);
                 } else {
                     o.put("error", reply.error);
-                    o.put("code", reply.code);
                 }
+                // The code is part of the contract in both dialects: the client has to be able
+                // to tell "the backend is switched off" (-1006) from a real failure.
+                o.put("code", reply.code);
                 if (reply.hasStatus) {
                     o.put("r", reply.status);
                 }
@@ -180,6 +184,9 @@ public final class JsonProtocol {
                 return Reply.error("missing 'session'", EffectManager.ERR_BAD_ARG);
             }
             int rc = api.attach(session);
+            if (rc == CoreApi.ERR_DISABLED) {
+                return Reply.error("backend is globally disabled", rc);
+            }
             return rc == 0 ? Reply.status(0) : Reply.error("attach failed", rc);
         }
         if ("detach".equals(cmd)) {
@@ -202,6 +209,9 @@ public final class JsonProtocol {
                 return Reply.error("value is not a valid hex string", EffectManager.ERR_BAD_ARG);
             }
             int rc = api.setParam(session, param, value);
+            if (rc == CoreApi.ERR_DISABLED) {
+                return Reply.error("backend is globally disabled", rc);
+            }
             return rc == 0 ? Reply.status(0) : Reply.error("setParam status " + rc, rc);
         }
         if ("getparam".equals(cmd)) {
@@ -264,6 +274,31 @@ public final class JsonProtocol {
                 }
             }
             return Reply.ok().with("pkg", pkg).with("mode", api.getAppPolicy(pkg));
+        }
+        if ("setenabled".equals(cmd)) {
+            Object raw = firstValue(req, new String[] {"enabled", "value", "on"});
+            if (raw == null) {
+                return Reply.error("missing 'enabled'", EffectManager.ERR_BAD_ARG);
+            }
+            Boolean on = parseBoolean(raw);
+            if (on == null) {
+                return Reply.error("'enabled' must be a boolean", EffectManager.ERR_BAD_ARG);
+            }
+            int rc = api.setEnabled(on.booleanValue());
+            if (rc != 0) {
+                // The switch command must never report "disabled" (-1006): the client would
+                // read it as "the user switched the backend off" and wait for a re-enable.
+                return Reply.error("setEnabled failed", EnableErrors.forEnableCommand(rc));
+            }
+            Reply reply = Reply.status(0);
+            reply.with("enabled", api.getEnabled());
+            return reply;
+        }
+        if ("getenabled".equals(cmd)) {
+            boolean on = api.getEnabled();
+            Reply reply = Reply.status(on ? 1 : 0);
+            reply.with("enabled", on);
+            return reply;
         }
         if ("policies".equals(cmd) || "listpolicies".equals(cmd)) {
             try {
@@ -392,6 +427,33 @@ public final class JsonProtocol {
         } catch (Throwable t) {
             return -1;
         }
+    }
+
+    /** Boolean-ish input: true/false, "true"/"false", "on"/"off", 1/0. null when invalid. */
+    private static Boolean parseBoolean(Object raw) {
+        if (raw instanceof Boolean) {
+            return (Boolean) raw;
+        }
+        if (raw instanceof Number) {
+            int n = ((Number) raw).intValue();
+            if (n == 1) {
+                return Boolean.TRUE;
+            }
+            if (n == 0) {
+                return Boolean.FALSE;
+            }
+            return null;
+        }
+        String s = String.valueOf(raw).trim().toLowerCase(java.util.Locale.ROOT);
+        if ("true".equals(s) || "on".equals(s) || "yes".equals(s) || "enable".equals(s)
+                || "enabled".equals(s)) {
+            return Boolean.TRUE;
+        }
+        if ("false".equals(s) || "off".equals(s) || "no".equals(s) || "disable".equals(s)
+                || "disabled".equals(s)) {
+            return Boolean.FALSE;
+        }
+        return null;
     }
 
     /** 0=follow 1=on 2=exclude; accepts int or names. -1 when invalid. */

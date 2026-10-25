@@ -6,29 +6,55 @@
 #   bash module/accept-v2.sh --mode backend  # 按 backend 判据检查（apply 必须 0）
 #   bash module/accept-v2.sh --kill-restart  # 额外做"杀 daemon 是否自愈"（会短暂中断）
 #   bash module/accept-v2.sh --tone          # 额外播 tone 并检查实例（10s）
+#   bash module/accept-v2.sh --serial <s>    # 指定设备（也可用第一个位置参数）
+#
+# 设备选择（与 scripts/verify-v2.sh、backend/test/device/run_acceptance.sh 一致）：
+#   1) --serial <s> 或第一个位置参数
+#   2) $DSH_SERIAL
+#   3) $ANDROID_SERIAL
+#   4) $SERIAL
+#   5) adb devices 里唯一在线的设备
+#   在线设备不是恰好 1 台时报错退出 2，不会瞎猜。
 #
 # 退出码：0 全部 PASS（SKIP 不算失败）；1 有 FAIL；2 环境问题。
-# 环境变量：ADB / SERIAL / TONE_SECONDS（默认 12）
+# 环境变量：ADB / DSH_SERIAL / ANDROID_SERIAL / SERIAL / TONE_SECONDS（默认 12）
 set -uo pipefail
 
-SDK=${ANDROID_SDK:-/home/bdy/Android/Sdk}
-ADB=${ADB:-adb}
-SERIAL=${SERIAL:-LNNZXG8TPFHU69AI}
+HERE=$(cd "$(dirname "$0")" && pwd)
+REPO=$(cd "$HERE/.." && pwd)
+# shellcheck source=../backend/test/device/lib/device.sh
+. "$REPO/backend/test/device/lib/device.sh"
+
 WANT_MODE=""
 DO_KILL=0
 DO_TONE=0
 TONESEC=${TONE_SECONDS:-12}
+SERIAL_ARG=""
+DEVICE_DIR=${DEVICE_DIR:-/data/local/tmp/jdsp-verify}
+NEED_TONE=0
 
-for a in "$@"; do
+while [ $# -gt 0 ]; do
+    a=$1
     case "$a" in
-        --mode) WANT_MODE="__next__" ;;
-        --mode=*) WANT_MODE=${a#--mode=} ;;
-        --kill-restart) DO_KILL=1 ;;
-        --tone) DO_TONE=1 ;;
-        -h|--help) sed -n "2,13p" "$0"; exit 0 ;;
-        *) echo "unknown arg: $a" >&2; exit 2 ;;
+        --mode) WANT_MODE="__next__"; shift ;;
+        --mode=*) WANT_MODE=${a#--mode=}; shift ;;
+        --kill-restart) DO_KILL=1; shift ;;
+        --tone) DO_TONE=1; NEED_TONE=1; shift ;;
+        --serial) SERIAL_ARG=${2:-}; shift 2 ;;
+        --serial=*) SERIAL_ARG=${a#--serial=}; shift ;;
+        -h|--help) sed -n "2,22p" "$0"; exit 0 ;;
+        -*) echo "unknown arg: $a" >&2; exit 2 ;;
+        *) if [ -n "$SERIAL_ARG" ]; then
+               echo "only one serial may be given" >&2
+               exit 2
+           fi
+           SERIAL_ARG=$a; shift ;;
     esac
 done
+
+jdsp_select_device "$SERIAL_ARG" || exit 2
+SERIAL=$JDSP_SERIAL
+ADB=$JDSP_ADB
 
 P=0; F=0; S=0
 pass() { printf "PASS  %-26s %s\n" "$1" "$2"; P=$((P+1)); }
@@ -171,9 +197,22 @@ fi
 
 # 11 optional tone -> instance + client pid
 if [ "$DO_TONE" = 1 ]; then
-    DR "CLASSPATH=/data/local/tmp/tone.dex nohup app_process /system/bin Tone $TONESEC >/data/local/tmp/tone-acc.log 2>&1 &" >/dev/null 2>&1
+    D "pkill -f '[a]pp_process /system/bin Tone'" >/dev/null 2>&1
+    sleep 1
+    # The test tone is built from the repository (tools/Tone.java) and pushed here,
+    # so the script does not depend on a tone.dex that happens to exist on the device.
+    tone_dex="$(jdsp_build_dir)/tone.dex"
+    if jdsp_build_tone_dex "$tone_dex"; then
+        D "mkdir -p $DEVICE_DIR && chmod 755 $DEVICE_DIR" >/dev/null 2>&1
+        "$ADB" -s "$SERIAL" push "$tone_dex" "$DEVICE_DIR/tone.dex" >/dev/null 2>&1
+        D "chmod 644 $DEVICE_DIR/tone.dex" >/dev/null 2>&1
+        pass "tone.dex" "built from tools/Tone.java and pushed to $DEVICE_DIR"
+    else
+        skip "tone.dex" "could not build tools/Tone.java into a dex"
+    fi
+    DR "CLASSPATH=$DEVICE_DIR/tone.dex app_process /system/bin Tone $TONESEC >$DEVICE_DIR/tone-acc.log 2>&1 &" >/dev/null 2>&1
     sleep 6
-    sess=$(D "cat /data/local/tmp/tone-acc.log" | tr -d "\r" | sed -n "s/^SESSION=\([0-9]*\).*/\1/p")
+    sess=$(D "cat $DEVICE_DIR/tone-acc.log" | tr -d "\r" | sed -n "s/^SESSION=\([0-9]*\).*/\1/p")
     dump=$(D "dumpsys media.audio_flinger")
     inst=$(printf "%s" "$dump" | grep -c "name: JamesDSP")
     cli=$(printf "%s" "$dump" | grep -A8 "UUID: f27317f4" | sed -n "s/.*Pid \([0-9]*\).*/\1/p" | head -1)

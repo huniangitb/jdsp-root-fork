@@ -262,6 +262,24 @@ public final class Client implements Backend {
     }
 
     @Override
+    public int setEnabled(boolean enabled) throws CliException {
+        try {
+            return service.setEnabled(enabled);
+        } catch (RemoteException e) {
+            throw unavailable("setEnabled", e);
+        }
+    }
+
+    @Override
+    public boolean getEnabled() throws CliException {
+        try {
+            return service.getEnabled();
+        } catch (RemoteException e) {
+            throw unavailable("getEnabled", e);
+        }
+    }
+
+    @Override
     public String stats() throws CliException {
         try {
             return service.stats();

@@ -43,6 +43,24 @@ javac -source 8 -target 8 -nowarn -Xlint:-options -cp "$JAR" -d "$OUT/cc-classes
 "$BT/d8" --release --min-api 26 --lib "$JAR" --output "$OUT/cc-dex" \
     $(find "$OUT/cc-classes" -name '*.class')
 
+echo "== host unit test (JdspRemoteOps 策略分支，不需要设备)"
+HOST_SRC="$HERE/host"
+rm -rf "$OUT/host-classes"
+mkdir -p "$OUT/host-classes"
+# 只编译**纯 Java**的源文件：宿主单测不能依赖 Android SDK。
+# JdspRemoteOps / JdspParamCodec / JdspParamMapping / JdspJson / JdspConfigSnapshot
+# 都只用到 java.*，可以直接在宿主上跑。
+HOST_PURE="$SRC/me/timschneeberger/rootlessjamesdsp/p5/JdspRemoteOps.java"
+HOST_PURE="$HOST_PURE $SRC/me/timschneeberger/rootlessjamesdsp/p5/JdspParamCodec.java"
+HOST_PURE="$HOST_PURE $SRC/me/timschneeberger/rootlessjamesdsp/p5/JdspParamMapping.java"
+HOST_PURE="$HOST_PURE $SRC/me/timschneeberger/rootlessjamesdsp/p5/JdspJson.java"
+HOST_PURE="$HOST_PURE $SRC/me/timschneeberger/rootlessjamesdsp/p5/JdspConfigSnapshot.java"
+HOST_PURE="$HOST_PURE $SRC/me/timschneeberger/rootlessjamesdsp/p5/JdspCodec.java"
+javac -source 8 -target 8 -nowarn -Xlint:-options -d "$OUT/host-classes" \
+    $(find "$HOST_SRC" -name '*.java') $HOST_PURE
+java -cp "$OUT/host-classes" host.OpsHostTest
+java -cp "$OUT/host-classes" host.ConfigReadHostTest
+
 echo "== javac + d8 (probe)"
 javac -source 8 -target 8 -nowarn -Xlint:-options -cp "$JAR" -d "$OUT/probe-classes" "$HERE/ProbeServer.java"
 "$BT/d8" --release --min-api 26 --lib "$JAR" --output "$OUT/probe-dex" \

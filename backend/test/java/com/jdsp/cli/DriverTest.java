@@ -28,6 +28,8 @@ public final class DriverTest {
         int commitStatus;
         int getModeValue;
         int setModeStatus;
+        boolean enabledValue = true;
+        int setEnabledStatus;
         int getPolicyValue;
         int setPolicyStatus;
         byte[] getReply;
@@ -154,6 +156,17 @@ public final class DriverTest {
         @Override
         public int getMode() {
             return getModeValue;
+        }
+
+        @Override
+        public int setEnabled(boolean enabled) {
+            enabledValue = enabled;
+            return setEnabledStatus;
+        }
+
+        @Override
+        public boolean getEnabled() {
+            return enabledValue;
         }
 
         @Override
@@ -399,6 +412,46 @@ public final class DriverTest {
 
         suite.test("driver: invalid mode is a usage error", () ->
                 Assert.eq(Exit.USAGE, run(of(new FakeBackend()), "mode", "bogus").code));
+
+        suite.test("driver: enabled show", () -> {
+            FakeBackend backend = new FakeBackend();
+            backend.enabledValue = true;
+            Result r = run(of(backend), "enabled");
+            Assert.eq(Exit.OK, r.code);
+            Assert.eq("on\n", r.out);
+            backend.enabledValue = false;
+            r = run(of(backend), "enabled");
+            Assert.eq("off\n", r.out);
+        });
+
+        suite.test("driver: enabled set on and off", () -> {
+            FakeBackend backend = new FakeBackend();
+            Result r = run(of(backend), "enabled", "off");
+            Assert.eq(Exit.OK, r.code);
+            Assert.isTrue(!backend.enabledValue, "setEnabled(false) reached the backend");
+            Assert.contains(r.out, "enabled=off");
+            r = run(of(backend), "enabled", "on");
+            Assert.isTrue(backend.enabledValue, "setEnabled(true) reached the backend");
+            Assert.contains(r.out, "enabled=on");
+        });
+
+        suite.test("driver: enabled json output", () -> {
+            FakeBackend backend = new FakeBackend();
+            backend.enabledValue = false;
+            Result r = run(of(backend), "enabled", "--json");
+            Assert.eq(Exit.OK, r.code);
+            Assert.contains(r.out, "\"enabled\":false");
+        });
+
+        suite.test("driver: invalid enabled value is a usage error", () ->
+                Assert.eq(Exit.USAGE, run(of(new FakeBackend()), "enabled", "bogus").code));
+
+        suite.test("driver: enabled remote failure exits 4", () -> {
+            FakeBackend backend = new FakeBackend();
+            backend.setEnabledStatus = -1006;
+            Result r = run(of(backend), "enabled", "off");
+            Assert.eq(Exit.REMOTE, r.code);
+        });
 
         suite.test("driver: policy list", () -> {
             Result r = run(of(new FakeBackend()), "policy", "list");

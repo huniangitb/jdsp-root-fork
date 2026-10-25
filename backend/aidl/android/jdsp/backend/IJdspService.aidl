@@ -45,6 +45,34 @@ interface IJdspService {
     /** 0=auto (framework postprocess creates, jdspd attaches) 1=backend (jdspd creates). */
     int setMode(int mode);
     int getMode();
+
+    // ---- global master switch ------------------------------------------
+    /**
+     * Master switch for the whole backend.
+     *
+     * <p>false: every session loses its effect (the daemon disables and releases the handles),
+     * and parameter writes are rejected with a negative status until it is turned on again.
+     * true: the daemon re-attaches the sessions it is allowed to touch.
+     *
+     * <p>This is a daemon side switch only: no engine parameter is written, so it works with
+     * every engine build. 0 = ok, negative = error.
+     */
     /** Runtime statistics as JSON. */
     String stats();
+
+    // ---- global master switch (appended: the transaction numbers of the
+    //      methods above stay stable) ---------------------------------------
+    /**
+     * Master switch for the whole backend.
+     *
+     * <p>false: every session loses its effect (the daemon disables and releases the handles),
+     * and parameter writes are rejected with a negative status until it is turned on again.
+     * true: the daemon re-attaches the sessions it is allowed to touch.
+     *
+     * <p>This is a daemon side switch only: no engine parameter is written, so it works with
+     * every engine build. 0 = ok, negative = error.
+     */
+    int setEnabled(boolean enabled);
+    /** Current state of the master switch. */
+    boolean getEnabled();
 }

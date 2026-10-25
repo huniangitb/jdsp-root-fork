@@ -91,6 +91,9 @@ public final class CommandRunner {
         if ("mode".equals(command)) {
             return mode(cmd);
         }
+        if ("enabled".equals(command)) {
+            return enabled(cmd);
+        }
         if ("policy".equals(command)) {
             return policy(cmd);
         }
@@ -250,6 +253,33 @@ public final class CommandRunner {
                     + "\",\"modeId\":" + requested + "}");
         } else {
             out.println("mode=" + Format.modeName(requested));
+        }
+        return Exit.OK;
+    }
+
+    /**
+     * The global master switch: "jdspcli enabled" shows the state, "jdspcli enabled on|off"
+     * changes it. The daemon bypasses every session's effect while it is off.
+     */
+    private int enabled(ParsedCommand cmd) throws CliException {
+        requireArgs(cmd, 0, 1);
+        rejectValueOptions(cmd);
+        if (cmd.argCount() == 0) {
+            boolean current = backend().getEnabled();
+            if (cmd.json()) {
+                out.println("{\"enabled\":" + current + "}");
+            } else {
+                out.println(current ? "on" : "off");
+            }
+            return Exit.OK;
+        }
+        boolean requested = parseEnabled(cmd.arg(0));
+        int status = backend().setEnabled(requested);
+        expectOk("setEnabled(" + requested + ")", status);
+        if (cmd.json()) {
+            out.println("{\"ok\":true,\"enabled\":" + requested + "}");
+        } else {
+            out.println("enabled=" + (requested ? "on" : "off"));
         }
         return Exit.OK;
     }
@@ -417,6 +447,21 @@ public final class CommandRunner {
             return 1;
         }
         throw new CliException(Exit.USAGE, "mode must be auto or backend, got '" + text + "'");
+    }
+
+    /** "on"/"true"/"1" and "off"/"false"/"0" for the global master switch. */
+    private static boolean parseEnabled(String text) throws CliException {
+        String value = text == null ? "" : text.trim().toLowerCase(java.util.Locale.ROOT);
+        if ("on".equals(value) || "true".equals(value) || "1".equals(value)
+                || "enable".equals(value) || "enabled".equals(value)) {
+            return true;
+        }
+        if ("off".equals(value) || "false".equals(value) || "0".equals(value)
+                || "disable".equals(value) || "disabled".equals(value)) {
+            return false;
+        }
+        throw new CliException(Exit.USAGE,
+                "enabled must be on or off, got '" + text + "'");
     }
 
     private static int parsePolicy(String text) throws CliException {

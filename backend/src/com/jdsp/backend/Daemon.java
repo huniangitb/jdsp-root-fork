@@ -177,6 +177,8 @@ public final class Daemon {
         tcp.start();
         // The watcher re-creates the App's port/token files when they disappear (App reinstall).
         watcher.setTcpService(tcp);
+        // The watcher applies a rate limited "on" transition of the global switch.
+        watcher.setCoreApi(api);
 
         // ---- watcher ---------------------------------------------------------
         watcher.start();

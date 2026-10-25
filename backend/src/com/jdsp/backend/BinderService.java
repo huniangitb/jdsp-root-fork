@@ -4,6 +4,7 @@ import android.jdsp.backend.IJdspService;
 import android.jdsp.backend.JdspSession;
 import android.os.IBinder;
 
+import com.jdsp.common.EnableErrors;
 import com.jdsp.common.JdspConst;
 
 import java.lang.reflect.Method;
@@ -272,6 +273,28 @@ public final class BinderService extends IJdspService.Stub {
         } catch (Throwable t) {
             Log.e("getMode failed", t);
             return JdspConst.MODE_AUTO;
+        }
+    }
+
+    @Override
+    public int setEnabled(boolean enabled) {
+        try {
+            // Never report "disabled" here: the client would wait for a re-enable that may
+            // never come (see EnableErrors).
+            return EnableErrors.forEnableCommand(api.setEnabled(enabled));
+        } catch (Throwable t) {
+            Log.e("setEnabled failed", t);
+            return EffectManager.ERR_INTERNAL;
+        }
+    }
+
+    @Override
+    public boolean getEnabled() {
+        try {
+            return api.getEnabled();
+        } catch (Throwable t) {
+            Log.e("getEnabled failed", t);
+            return false;
         }
     }
 
