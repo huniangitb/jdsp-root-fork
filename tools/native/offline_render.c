@@ -37,30 +37,18 @@ typedef int32_t effect_uuid_t;
 typedef struct effect_buffer_config_s {
     uint32_t bufferCount;
     uint32_t frameCount;
-    uint32_t channelMask;
+    uint32_t mask;
+    uint32_t channels;
     uint32_t sampleRate;
     uint32_t format;
     uint32_t dataOffset;
     uint32_t frameSize;
+    uint32_t accessMode;
 } effect_buffer_config_t;
 
 typedef struct effect_config_s {
-    effect_buffer_config_t inputBuffer;
-    effect_buffer_config_t outputBuffer;
-    int32_t accessMode;
-    int32_t mixRate;
-    uint32_t channelMixCount;
-    uint32_t channelMixerChannelCount;
-    int32_t channelMixerFlags;
-    int32_t volume;
-    uint32_t scalarCount;
-    int32_t *scalars;
-    int32_t effectClient;
-    int32_t playEnable;
-    int32_t auth2_0;
-    int32_t threadId;
-    int32_t priority;
-    int32_t state;
+    effect_buffer_config_t inputCfg;
+    effect_buffer_config_t outputCfg;
 } effect_config_t;
 
 typedef struct audio_buffer_s {
@@ -86,6 +74,10 @@ typedef struct effect_param_s {
 #define EFFECT_CMD_GET_PARAM 6
 
 #define AUDIO_FORMAT_PCM_16BIT 1
+#define EFFECT_CONFIG_SMP_RATE 0x00000002
+#define EFFECT_CONFIG_CHANNELS 0x00000004
+#define EFFECT_CONFIG_FORMAT   0x00000008
+#define AUDIO_CHANNEL_OUT_STEREO 0x0000000c
 #define EFFECT_BUFFER_ACCESS_RW 1
 #define EFFECT_TYPE_CONFIG 0
 #define EFFECT_TYPE_PARAM 1
@@ -106,8 +98,7 @@ typedef int32_t (*create_fn)(const effect_uuid_t *uuid, int32_t session, int32_t
                              effect_handle_t *pHandle);
 typedef int32_t (*engine_command_fn)(void *engine, uint32_t cmd, uint32_t size,
                                     void *data, uint32_t *replySize, void *reply);
-typedef int32_t (*engine_process_fn)(void *engine, int32_t *offset, int32_t *frames,
-                                    int32_t *config, void *buffer);
+typedef int32_t (*engine_process_fn)(effect_handle_t self, audio_buffer_t *in, audio_buffer_t *out);
 /* the handle is a pointer to a structure whose first member is the vtable */
 
 static void *g_lib = NULL;
@@ -129,7 +120,7 @@ static int load_engine(const char *path) {
 static int create_effect(void) {
     create_fn create = (create_fn)dlsym(g_lib, "EffectCreate");
     if (create == NULL) {
-        fprintf(stderr, "offline_render: EffectCreate missing\n");
+        fprintf(stderr, "offline_render: EffectCreate missing\n"); fflush(stderr);
         return -1;
     }
     effect_uuid_t uuid[16];
@@ -139,7 +130,7 @@ static int create_effect(void) {
     memcpy(uuid, raw, sizeof(raw));
     effect_handle_t out = 0;
     int32_t rc = create(uuid, 0, 0, &out);
-    fprintf(stderr, "offline_render: EffectCreate rc=%d out=%p\n", rc, out);
+    fprintf(stderr, "offline_render: EffectCreate rc=%d out=%p\n", rc, out); fflush(stderr);
     if (out != 0) {
         g_handle = out;
     } else if ((uintptr_t)rc > 0x1000) {
@@ -147,21 +138,21 @@ static int create_effect(void) {
         g_handle = (effect_handle_t)(uintptr_t)rc;
     }
     if (g_handle == NULL) {
-        fprintf(stderr, "offline_render: no handle\n");
+        fprintf(stderr, "offline_render: no handle\n"); fflush(stderr);
         return -1;
     }
     g_command = (engine_command_fn)dlsym(g_lib, "EffectDSPMainCommand");
     g_process = (engine_process_fn)dlsym(g_lib, "EffectDSPMainProcess");
     if (g_command == NULL || g_process == NULL) {
-        fprintf(stderr, "offline_render: EffectDSPMainCommand/Process missing\n");
+        fprintf(stderr, "offline_render: EffectDSPMainCommand/Process missing\n"); fflush(stderr);
         return -1;
     }
     g_engine = *(void **)((char *)g_handle + 0x08);
-    fprintf(stderr, "offline_render: engine=%p\n", g_engine);
+    fprintf(stderr, "offline_render: engine=%p\n", g_engine); fflush(stderr);
     g_itf = *(effect_interface_t **)g_handle;
     fprintf(stderr, "offline_render: handle=%p vtable=%p\n", g_handle, (void *)g_itf);
     if (g_itf == NULL) {
-        fprintf(stderr, "offline_render: no interface vtable\n");
+        fprintf(stderr, "offline_render: no interface vtable\n"); fflush(stderr);
         return -1;
     }
     fprintf(stderr, "offline_render: get=%p set=%p process=%p release=%p desc=%p\n",
@@ -173,33 +164,34 @@ static int create_effect(void) {
 static int apply_config(uint32_t frames) {
     effect_config_t config;
     memset(&config, 0, sizeof(config));
-    config.inputBuffer.bufferCount = 1;
-    config.inputBuffer.frameCount = frames;
-    config.inputBuffer.channelMask = 0x3; /* stereo */
-    config.inputBuffer.sampleRate = SAMPLE_RATE;
-    config.inputBuffer.format = AUDIO_FORMAT_PCM_16BIT;
-    config.inputBuffer.dataOffset = 0;
-    config.inputBuffer.frameSize = 0;
-    config.outputBuffer = config.inputBuffer;
-    config.accessMode = EFFECT_BUFFER_ACCESS_RW;
-    config.mixRate = SAMPLE_RATE;
-    config.channelMixCount = CHANNELS;
-    config.channelMixerChannelCount = CHANNELS;
-    config.volume = 0x10000; /* unity in the 16.16 scale */
+    memset(&config, 0, sizeof(config));
+    config.inputCfg.bufferCount = 1;
+    config.inputCfg.frameCount = frames;
+    config.inputCfg.mask = EFFECT_CONFIG_SMP_RATE | EFFECT_CONFIG_CHANNELS | EFFECT_CONFIG_FORMAT;
+    config.inputCfg.channels = AUDIO_CHANNEL_OUT_STEREO;
+    config.inputCfg.sampleRate = SAMPLE_RATE;
+    config.inputCfg.format = AUDIO_FORMAT_PCM_16BIT;
+    config.inputCfg.accessMode = EFFECT_BUFFER_ACCESS_RW;
+    config.outputCfg = config.inputCfg;
 
     int32_t reply = 0;
     uint32_t replySize = sizeof(reply);
-    int32_t rc = g_command(g_engine, EFFECT_CMD_SET_CONFIG, sizeof(config), &config,
-                           &replySize, &reply);
-    fprintf(stderr, "offline_render: set config rc=%d\n", rc);
+    fprintf(stderr, "offline_render: entering apply_config\n"); fflush(stderr);
+    /* Use the standard effect interface (vtable->set) instead of calling the
+     * engine command symbol directly: the generic wrapper keeps the handle
+     * context the engine expects. */
+    int32_t value = (int32_t)sizeof(config);
+    int32_t rc = g_itf->set(g_handle, EFFECT_CMD_SET_CONFIG, &value, &config);
+    fprintf(stderr, "offline_render: set config rc=%d\n", rc); fflush(stderr);
     if (rc != 0) {
         return -1;
     }
-    rc = g_command(g_engine, EFFECT_CMD_INIT, sizeof(config), &config, &replySize, &reply);
-    fprintf(stderr, "offline_render: init rc=%d\n", rc);
-    int32_t enable = 1;
-    rc = g_command(g_engine, EFFECT_CMD_ENABLE, sizeof(enable), &enable, &replySize, &reply);
-    fprintf(stderr, "offline_render: enable rc=%d\n", rc);
+    value = (int32_t)sizeof(config);
+    rc = g_itf->set(g_handle, EFFECT_CMD_INIT, &value, &config);
+    fprintf(stderr, "offline_render: init rc=%d\n", rc); fflush(stderr);
+    value = 1;
+    rc = g_itf->set(g_handle, EFFECT_CMD_ENABLE, &value, NULL);
+    fprintf(stderr, "offline_render: enable rc=%d\n", rc); fflush(stderr);
     return rc == 0 ? 0 : -1;
 }
 
@@ -218,7 +210,7 @@ static int apply_param(int32_t param_id, const float *values, int32_t count) {
     uint32_t replySize = sizeof(reply);
     int32_t rc = g_command(g_engine, EFFECT_CMD_SET_PARAM, (uint32_t)sizeof(effect_param_t) + psize + vsize,
                            payload, &replySize, &reply);
-    fprintf(stderr, "offline_render: set param %d rc=%d\n", param_id, rc);
+    fprintf(stderr, "offline_render: set param %d rc=%d\n", param_id, rc); fflush(stderr);
     return rc == 0 ? 0 : -1;
 }
 
@@ -237,8 +229,10 @@ static double render_rms(const int16_t *input, int16_t *output, uint32_t frames)
     int32_t nframes = (int32_t)frames;
     effect_config_t config;
     memset(&config, 0, sizeof(config));
-    int32_t rc = g_process(g_engine, &offset, &nframes, (int32_t *)&config, &inBuf);
-    fprintf(stderr, "offline_render: process rc=%d offset=%d nframes=%d\n", rc, offset, nframes);
+    (void)offset; (void)nframes; (void)config;
+    fprintf(stderr, "offline_render: calling process\n"); fflush(stderr); fflush(stderr);
+    int32_t rc = g_process(g_handle, &inBuf, &outBuf);
+    fprintf(stderr, "offline_render: process rc=%d offset=%d nframes=%d\n", rc, offset, nframes); fflush(stderr);
     if (rc != 0) {
         return -1.0;
     }

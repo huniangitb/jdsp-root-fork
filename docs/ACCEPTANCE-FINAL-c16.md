@@ -61,3 +61,21 @@
 4. 72 小时长稳未跑（最长连续运行约 5 小时，watcherFailures=0）。
 5. 多设备仅 2 台（xaga Android 15、本机 Android 16），PLAN-v2 P6 要求的三台未齐。
 6. 早期 system_server 崩溃 2 次由 churn 引发（已修），但修复后未做长时间回归确认零复发。
+
+## 3.1 离线渲染排查的精确阻塞点（补充）
+
+在判据 B 上继续投入排查后，得到以下确定事实与最终阻塞点：
+
+已确认：
+- 引擎 SET_CONFIG 使用标准 effect_config_t（inputCfg / outputCfg，各含 mask），不是私有结构
+  （源码 jamesdsp.c:124 configure() 直接读 cfg->inputCfg / cfg->outputCfg）。
+- 引擎使用标准 AOSP 命令号：SET_PARAM=5、GET_PARAM=8（logcat 实测 cmdCode 5 / 8）；INIT=0、SET_CONFIG=1、ENABLE=3。
+- 引擎库可 dlopen，EffectCreate 返回 rc=0 且 handle/vtable 可解析（get/set/process/descriptor 地址均有效）。
+
+最终阻塞点：
+- 调用 SET_CONFIG（无论直接调用导出符号 EffectDSPMainCommand，还是走标准 vtable 的 set 接口）均立即段错误（rc=137，被 Killed）。
+- 崩溃发生在 apply_config 的第一条 SET_CONFIG 调用处（分步打印与 fflush 确认到最后一行 entering apply_config）。
+- 推断：引擎的 generic_command 包装需要 AudioFlinger 提供的运行期上下文（如 buffer provider 或框架先写入的字段），离线直接驱动缺少该上下文。
+
+结论：离线渲染路径未能打通，判据 B 维持 SKIP。继续逆向厂商运行期上下文的成本高于收益，已停止。
+若要确判据 B，建议：在支持 REMOTE_SUBMIX 回采的设备或 ROM 上重跑，或人工听音验证。
