@@ -152,5 +152,22 @@ jdsp_state_prepare() {
 	fi
 	jdsp_state_log "state dir $JDSP_STATE_DIR owner=$(jdsp_state_meta '%u:%g' "$JDSP_STATE_DIR") mode=$(jdsp_state_meta '%a' "$JDSP_STATE_DIR") label=$(jdsp_state_label "$JDSP_STATE_DIR")"
 
+	# Engine write key mirror (jdspd generates/keeps the canonical copy in
+	# /data/adb/jdspd/engine.key and mirrors it here; see jdsp_writelock.h in
+	# the engine patch set). The HAL must be able to READ this file, so fix
+	# owner/mode/label whenever the daemon has placed it. When the daemon has
+	# not run yet there is nothing to do; the engine only needs the key at the
+	# first unlock attempt, which always happens after jdspd started.
+	JDSP_KEY_MIRROR=$JDSP_STATE_DIR/jamesdsp_engine.key
+	if [ -f "$JDSP_KEY_MIRROR" ]; then
+		chown "$jdsp_state_owner" "$JDSP_KEY_MIRROR" 2>/dev/null
+		chmod 0640 "$JDSP_KEY_MIRROR" 2>/dev/null
+		chcon u:object_r:vendor_audio_data_file:s0 "$JDSP_KEY_MIRROR" 2>/dev/null ||
+			jdsp_state_log "WARN chcon $JDSP_KEY_MIRROR failed (engine cannot read the write key?)"
+		jdsp_state_log "engine key mirror EXISTS $JDSP_KEY_MIRROR size=$(jdsp_state_meta '%s' "$JDSP_KEY_MIRROR") owner=$(jdsp_state_meta '%u:%g' "$JDSP_KEY_MIRROR") mode=$(jdsp_state_meta '%a' "$JDSP_KEY_MIRROR") label=$(jdsp_state_label "$JDSP_KEY_MIRROR")"
+	else
+		jdsp_state_log "engine key mirror ABSENT $JDSP_KEY_MIRROR (jdspd creates it on first start)"
+	fi
+
 	return 0
 }

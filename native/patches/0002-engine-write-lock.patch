@@ -1,0 +1,578 @@
+diff -ruN '--exclude=*.o' src-baseline/Main/libjamesdsp/jni/jamesdsp/Android.mk src/Main/libjamesdsp/jni/jamesdsp/Android.mk
+--- src-baseline/Main/libjamesdsp/jni/jamesdsp/Android.mk	2026-10-25 10:42:29.497052287 +0800
++++ src/Main/libjamesdsp/jni/jamesdsp/Android.mk	2026-10-25 10:37:23.336716376 +0800
+@@ -95,6 +95,8 @@
+ 	jdsp/binaryBlobs.c \
+ 	jdsp/jdspController.c \
+ 	peq_loudness.c \
++	jdsp_state.c \
++	jdsp_writelock.c \
+ 	jamesdsp.c \
+ # terminator
+ LOCAL_LDLIBS := -llog
+diff -ruN '--exclude=*.o' src-baseline/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c src/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c
+--- src-baseline/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c	2026-10-25 10:42:29.416051100 +0800
++++ src/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c	2026-10-25 10:36:41.806156471 +0800
+@@ -14,6 +14,7 @@
+ #include "jdsp/jdsp_header.h"
+ #include "peq_loudness.h"
+ #include "jdsp_state.h"
++#include "jdsp_writelock.h"
+ typedef struct
+ {
+ 	unsigned long long initializeForFirst;
+@@ -59,11 +60,19 @@
+ 	(EFFECT_CMD_ENABLE == JDSP_STATE_CMD_ENABLE &&
+ 	 EFFECT_CMD_DISABLE == JDSP_STATE_CMD_DISABLE &&
+ 	 EFFECT_CMD_SET_PARAM == JDSP_STATE_CMD_SET_PARAM) ? 1 : -1];
++/* jdsp_writelock.h mirrors the one command code it gates on; same guarantee. */
++typedef char jdsp_writelock_cmd_code_match[
++	(EFFECT_CMD_SET_PARAM == 5) ? 1 : -1];
+ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t cmdSize,
+ 	void* pCmdData, uint32_t* replySize, void* pReplyData);
+ static int32_t jdsp_state_dispatch(void *engine, uint32_t cmdCode, uint32_t cmdSize,
+ 	const void *cmdData)
+ {
++	/* Recorded state never contains an unlock command (generic_command filters
++	 * it out); skip one anyway in case a foreign or hand edited state file
++	 * carries it, so a replay can never unlock an instance. */
++	if (jdsp_writelock_is_unlock_cmd(cmdSize, cmdData))
++		return 0;
+ 	uint32_t replySize = (uint32_t)sizeof(int32_t);
+ 	int32_t reply = -1;
+ 	return EffectDSPMainCommand((EffectDSPMain *)engine, cmdCode, cmdSize, (void *)cmdData,
+@@ -1208,6 +1217,11 @@
+ 	 * reset.  Allocated once per instance, never on the render path. */
+ 	void *xscratch;
+ 	size_t xscratch_bytes;
++	/* Caller write protection (see jdsp_writelock.h): non-zero until the daemon
++	 * presents the engine key through the reserved SET_PARAM id.  Written from
++	 * the command path (binder threads of the HAL), read from the same path, so
++	 * plain int + the gate's own ordering is enough. */
++	int write_locked;
+ };
+ 
+ #define JDSP_XFADE_MAX_FRAMES 8192
+@@ -1434,6 +1448,16 @@
+ static int32_t generic_command(effect_handle_t self, uint32_t cmdCode, uint32_t cmdSize, void *pCmdData, uint32_t *replySize, void *pReplyData)
+ {
+ 	struct effect_module_s *e = (struct effect_module_s *) self;
++	/* Caller write protection: while the instance is locked every parameter
++	 * write is refused here, before the engine (and the state recorder) ever
++	 * sees it.  An unlock handshake is consumed by the gate itself and never
++	 * reaches the engine either. */
++	{
++		int32_t wl = jdsp_writelock_gate(&e->write_locked, cmdCode, cmdSize,
++			pCmdData, pReplyData, replySize);
++		if (wl != JDSP_WL_PROCEED)
++			return wl;
++	}
+ 	int32_t ret = EffectDSPMainCommand(e->cur, cmdCode, cmdSize, pCmdData, replySize, pReplyData);
+ 	/* Persist every state changing command that the engine accepted. Recording is
+ 	 * disabled while a recorded sequence is being replayed, otherwise a replay
+@@ -1446,12 +1470,17 @@
+ 			if (pReplyData != NULL && cmdSize >= sizeof(effect_param_t) &&
+ 				*(const int32_t *)pReplyData == 0)
+ 			{
+-				jdsp_state_record(cmdCode, cmdSize, pCmdData);
+-				/* This instance applied it to its own engine already: mark the
+-				 * generation as current so the builder does not rebuild it for a
+-				 * change it has just made itself.  Other instances still see the
+-				 * new generation and get a rebuilt engine. */
+-				e->cur_gen = jdsp_state_generation();
++				/* The unlock handshake must never enter the persisted state:
++				 * it is a capability of the calling process, not DSP state. */
++				if (!jdsp_writelock_is_unlock_cmd(cmdSize, pCmdData))
++				{
++					jdsp_state_record(cmdCode, cmdSize, pCmdData);
++					/* This instance applied it to its own engine already: mark the
++					 * generation as current so the builder does not rebuild it for a
++					 * change it has just made itself.  Other instances still see the
++					 * new generation and get a rebuilt engine. */
++					e->cur_gen = jdsp_state_generation();
++				}
+ 			}
+ 		}
+ 		else if (cmdCode == EFFECT_CMD_ENABLE || cmdCode == EFFECT_CMD_DISABLE)
+@@ -1483,6 +1512,9 @@
+ 	if (e == NULL)
+ 		return -ENOMEM;
+ 	e->itfe = &generic_interface;
++	/* Every fresh instance starts locked: only jdspd, presenting the engine key,
++	 * opens the write window (see jdsp_writelock.h). */
++	e->write_locked = 1;
+ #ifdef DEBUG
+ 	LOGI("JamesDSP: Creating effect with %d sessionId", sessionId);
+ #endif
+diff -ruN '--exclude=*.o' src-baseline/Main/libjamesdsp/jni/jamesdsp/jdsp_writelock.c src/Main/libjamesdsp/jni/jamesdsp/jdsp_writelock.c
+--- src-baseline/Main/libjamesdsp/jni/jamesdsp/jdsp_writelock.c	1970-01-01 08:00:00.000000000 +0800
++++ src/Main/libjamesdsp/jni/jamesdsp/jdsp_writelock.c	2026-10-25 10:39:51.686777002 +0800
+@@ -0,0 +1,365 @@
++/*
++ * jdsp_writelock.c - caller write protection for the JamesDSP effect library.
++ * See jdsp_writelock.h for the protocol and the threat model.
++ */
++#include <fcntl.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++
++#include "jdsp_writelock.h"
++
++/* Effect command code this module gates on; mirrored like jdsp_state.h does.
++ * The compile time check against the real effect_command_e lives in
++ * jamesdsp.c. */
++#define WL_CMD_SET_PARAM 5u
++
++#if JDSP_WRITELOCK_ENABLE
++
++/* ------------------------------------------------------------------------- */
++/* logging                                                                    */
++/* ------------------------------------------------------------------------- */
++
++#if defined(__ANDROID__)
++#include <android/log.h>
++#define WL_TAG "JamesDSPWriteLock"
++#define WL_LOGI(...) __android_log_print(ANDROID_LOG_INFO, WL_TAG, __VA_ARGS__)
++#define WL_LOGW(...) __android_log_print(ANDROID_LOG_WARN, WL_TAG, __VA_ARGS__)
++#else /* host build: used by the off-device unit test */
++static int wl_debug_enabled(void);
++#define WL_LOGI(...)                                                          \
++    do {                                                                      \
++        if (wl_debug_enabled()) {                                             \
++            fprintf(stderr, "[jdsp-writelock] " __VA_ARGS__);                 \
++            fputc('\n', stderr);                                              \
++        }                                                                     \
++    } while (0)
++#define WL_LOGW(...)                                                          \
++    do {                                                                      \
++        fprintf(stderr, "[jdsp-writelock] WARN: " __VA_ARGS__);               \
++        fputc('\n', stderr);                                                  \
++    } while (0)
++#endif
++
++/* ------------------------------------------------------------------------- */
++/* expected key                                                               */
++/* ------------------------------------------------------------------------- */
++
++#ifdef JDSP_WRITELOCK_BUILTIN_KEY_HEX
++static const char wl_builtin_hex[] = JDSP_WRITELOCK_BUILTIN_KEY_HEX;
++#define WL_HAVE_BUILTIN 1
++#else
++#define WL_HAVE_BUILTIN 0
++#endif
++
++static pthread_mutex_t wl_key_lock = PTHREAD_MUTEX_INITIALIZER;
++static uint8_t wl_expected[JDSP_WRITELOCK_TOKEN_LEN];
++static int wl_have_expected;
++
++static int hexval(char c)
++{
++	if (c >= '0' && c <= '9')
++		return c - '0';
++	if (c >= 'a' && c <= 'f')
++		return c - 'a' + 10;
++	if (c >= 'A' && c <= 'F')
++		return c - 'A' + 10;
++	return -1;
++}
++
++static int wl_all_zero(const uint8_t *buf)
++{
++	return buf[0] == 0 && memcmp(buf, buf + 1, JDSP_WRITELOCK_TOKEN_LEN - 1) == 0;
++}
++
++/* Caller holds wl_key_lock. Returns 0 when the builtin key was installed. */
++static int wl_load_builtin_locked(void)
++{
++#if WL_HAVE_BUILTIN
++	int i;
++	if (strlen(wl_builtin_hex) != 2u * JDSP_WRITELOCK_TOKEN_LEN)
++	{
++		WL_LOGW("JDSP_WRITELOCK_BUILTIN_KEY_HEX has the wrong length, ignored");
++		return -1;
++	}
++	for (i = 0; i < JDSP_WRITELOCK_TOKEN_LEN; i++)
++	{
++		int hi = hexval(wl_builtin_hex[2 * i]);
++		int lo = hexval(wl_builtin_hex[2 * i + 1]);
++		if (hi < 0 || lo < 0)
++			return -1;
++		wl_expected[i] = (uint8_t)((hi << 4) | lo);
++	}
++	if (wl_all_zero(wl_expected))
++	{
++		WL_LOGW("builtin key is all zero, ignored");
++		return -1;
++	}
++	wl_have_expected = 1;
++	WL_LOGI("engine key loaded (builtin)");
++	return 0;
++#else
++	(void)hexval;
++	return -1;
++#endif
++}
++
++/* Caller holds wl_key_lock. Returns 0 and installs the key when path yields
++ * exactly JDSP_WRITELOCK_TOKEN_LEN bytes. */
++static int wl_load_file_locked(const char *path)
++{
++	uint8_t buf[JDSP_WRITELOCK_TOKEN_LEN];
++	ssize_t n;
++	int fd = open(path, O_RDONLY | O_CLOEXEC);
++	if (fd < 0)
++		return -1;
++	n = read(fd, buf, sizeof(buf));
++	close(fd);
++	if (n != (ssize_t)sizeof(buf))
++	{
++		WL_LOGW("key file %s: expected %d bytes, got %zd", path,
++				JDSP_WRITELOCK_TOKEN_LEN, (ssize_t)n);
++		return -1;
++	}
++	if (wl_all_zero(buf))
++	{
++		WL_LOGW("key file %s: all-zero key rejected", path);
++		return -1;
++	}
++	memcpy(wl_expected, buf, sizeof(buf));
++	wl_have_expected = 1;
++	WL_LOGI("engine key loaded from %s", path);
++	return 0;
++}
++
++/* Caller holds wl_key_lock. */
++static int wl_ensure_loaded_locked(void)
++{
++	const char *override = getenv("JDSP_WRITELOCK_KEYFILE");
++	if (wl_have_expected)
++		return 1;
++	if (override != NULL && override[0] != '\0')
++	{
++		if (wl_load_file_locked(override) == 0)
++			return 1;
++		WL_LOGW("JDSP_WRITELOCK_KEYFILE=%s unreadable", override);
++	}
++	if (wl_load_file_locked(JDSP_WRITELOCK_KEY_FILE_VENDOR) == 0)
++		return 1;
++	if (wl_load_file_locked(JDSP_WRITELOCK_KEY_FILE_ADB) == 0)
++		return 1;
++	(void)wl_load_builtin_locked();
++	return wl_have_expected;
++}
++
++/* Constant-time comparison; both operands are fixed length secrets. */
++static int wl_token_matches(const uint8_t *a, const uint8_t *b)
++{
++	volatile uint8_t diff = 0;
++	int i;
++	for (i = 0; i < JDSP_WRITELOCK_TOKEN_LEN; i++)
++		diff |= (uint8_t)(a[i] ^ b[i]);
++	return diff == 0;
++}
++
++/* Returns 1 and fills out with the expected token, possibly re-reading the key
++ * files when the cached one does not match (key rotation support). */
++static int wl_expect_with_retry(const uint8_t *token, uint8_t out[JDSP_WRITELOCK_TOKEN_LEN])
++{
++	int have;
++	pthread_mutex_lock(&wl_key_lock);
++	have = wl_ensure_loaded_locked();
++	if (have)
++		memcpy(out, wl_expected, JDSP_WRITELOCK_TOKEN_LEN);
++	if (have && !wl_token_matches(out, token))
++	{
++		/* Stale cache (the daemon regenerated the key while we were
++		 * unlocked)?  Re-read both files once before rejecting. */
++		wl_have_expected = 0;
++		have = wl_ensure_loaded_locked();
++		if (have)
++			memcpy(out, wl_expected, JDSP_WRITELOCK_TOKEN_LEN);
++	}
++	pthread_mutex_unlock(&wl_key_lock);
++	return have;
++}
++
++/* ------------------------------------------------------------------------- */
++/* gate                                                                       */
++/* ------------------------------------------------------------------------- */
++
++int32_t jdsp_writelock_gate(int *locked, uint32_t cmd_code, uint32_t cmd_size,
++							const void *cmd_data, void *reply_data,
++							uint32_t *reply_size)
++{
++	const int32_t *words;
++	int32_t cmd;
++	uint32_t vsize;
++	const uint8_t *token;
++	int32_t status;
++	uint8_t expected[JDSP_WRITELOCK_TOKEN_LEN];
++	int have;
++
++	if (locked == NULL || cmd_code != WL_CMD_SET_PARAM)
++		return JDSP_WL_PROCEED;
++	if (cmd_size < 16u || cmd_data == NULL)
++		return JDSP_WL_PROCEED; /* malformed: the engine's own handler rejects it */
++
++	words = (const int32_t *)cmd_data;
++	cmd = words[3];
++	vsize = (uint32_t)words[2];
++
++	if (cmd != (int32_t)JDSP_WRITELOCK_PARAM_ID)
++	{
++		if (!*locked)
++			return JDSP_WL_PROCEED;
++		/* Reject without touching the engine.  Both channels carry the error:
++		 * the command return value and the reply status, because different
++		 * framework paths check different ones. */
++		status = -1; /* -EPERM */
++		if (reply_data != NULL)
++			*(int32_t *)reply_data = status;
++		if (reply_size != NULL)
++			*reply_size = sizeof(int32_t);
++		WL_LOGW("SET_PARAM param=%d rejected: instance is locked", cmd);
++		return status;
++	}
++
++	/* Unlock handshake: always consumed, never recorded, never forwarded to
++	 * the DSP. */
++	if (cmd_size < (16u + JDSP_WRITELOCK_TOKEN_LEN))
++	{
++		status = -1; /* -EPERM: token truncated */
++		WL_LOGW("unlock rejected: token truncated (%u bytes)", cmd_size);
++		if (reply_data != NULL)
++			*(int32_t *)reply_data = status;
++		if (reply_size != NULL)
++			*reply_size = sizeof(int32_t);
++		return status;
++	}
++	token = (const uint8_t *)&words[4];
++	have = wl_expect_with_retry(token, expected);
++	if (!have || vsize != JDSP_WRITELOCK_TOKEN_LEN ||
++		!wl_token_matches(expected, token))
++	{
++		status = -1; /* -EPERM: stays locked */
++		WL_LOGW("unlock rejected (%s)", have ? "token mismatch" : "no key available");
++	}
++	else
++	{
++		*locked = 0;
++		status = 0;
++		WL_LOGI("instance unlocked by daemon");
++	}
++	if (reply_data != NULL)
++		*(int32_t *)reply_data = status;
++	if (reply_size != NULL)
++		*reply_size = sizeof(int32_t);
++	return status;
++}
++
++int jdsp_writelock_is_unlock_cmd(uint32_t cmd_size, const void *cmd_data)
++{
++	const int32_t *words;
++	if (cmd_size < 16u || cmd_data == NULL)
++		return 0;
++	words = (const int32_t *)cmd_data;
++	return words[3] == (int32_t)JDSP_WRITELOCK_PARAM_ID;
++}
++
++int jdsp_writelock_expected(uint8_t out[JDSP_WRITELOCK_TOKEN_LEN])
++{
++	int have;
++	pthread_mutex_lock(&wl_key_lock);
++	have = wl_ensure_loaded_locked();
++	if (have)
++		memcpy(out, wl_expected, JDSP_WRITELOCK_TOKEN_LEN);
++	pthread_mutex_unlock(&wl_key_lock);
++	return have ? 0 : -1;
++}
++
++int jdsp_writelock_has_expected(void)
++{
++	int have;
++	pthread_mutex_lock(&wl_key_lock);
++	have = wl_ensure_loaded_locked();
++	pthread_mutex_unlock(&wl_key_lock);
++	return have;
++}
++
++void jdsp_writelock_forget_key(void)
++{
++	pthread_mutex_lock(&wl_key_lock);
++	wl_have_expected = 0;
++	memset(wl_expected, 0, sizeof(wl_expected));
++	pthread_mutex_unlock(&wl_key_lock);
++}
++
++int jdsp_writelock_set_expected_for_test(const uint8_t *token, uint32_t len)
++{
++	if (token == NULL || len != JDSP_WRITELOCK_TOKEN_LEN)
++		return -1;
++	pthread_mutex_lock(&wl_key_lock);
++	memcpy(wl_expected, token, len);
++	wl_have_expected = 1;
++	pthread_mutex_unlock(&wl_key_lock);
++	return 0;
++}
++
++#else /* JDSP_WRITELOCK_ENABLE == 0 */
++
++int32_t jdsp_writelock_gate(int *locked, uint32_t cmd_code, uint32_t cmd_size,
++							const void *cmd_data, void *reply_data,
++							uint32_t *reply_size)
++{
++	(void)locked;
++	(void)cmd_code;
++	(void)cmd_size;
++	(void)cmd_data;
++	(void)reply_data;
++	(void)reply_size;
++	return JDSP_WL_PROCEED;
++}
++
++int jdsp_writelock_is_unlock_cmd(uint32_t cmd_size, const void *cmd_data)
++{
++	(void)cmd_size;
++	(void)cmd_data;
++	return 0;
++}
++
++int jdsp_writelock_expected(uint8_t out[JDSP_WRITELOCK_TOKEN_LEN])
++{
++	(void)out;
++	return -1;
++}
++
++int jdsp_writelock_has_expected(void)
++{
++	return 0;
++}
++
++void jdsp_writelock_forget_key(void)
++{
++}
++
++int jdsp_writelock_set_expected_for_test(const uint8_t *token, uint32_t len)
++{
++	(void)token;
++	(void)len;
++	return -1;
++}
++
++#endif /* JDSP_WRITELOCK_ENABLE */
++
++#ifndef __ANDROID__
++static int wl_debug_enabled(void)
++{
++	static int cached = -1;
++	if (cached < 0)
++		cached = getenv("JDSP_WRITELOCK_DEBUG") != NULL;
++	return cached;
++}
++#endif
+diff -ruN '--exclude=*.o' src-baseline/Main/libjamesdsp/jni/jamesdsp/jdsp_writelock.h src/Main/libjamesdsp/jni/jamesdsp/jdsp_writelock.h
+--- src-baseline/Main/libjamesdsp/jni/jamesdsp/jdsp_writelock.h	1970-01-01 08:00:00.000000000 +0800
++++ src/Main/libjamesdsp/jni/jamesdsp/jdsp_writelock.h	2026-10-25 10:33:21.032585029 +0800
+@@ -0,0 +1,99 @@
++/*
++ * jdsp_writelock.h - caller write protection for the JamesDSP effect library.
++ *
++ * The effect library exposes setParameter() to every process that manages to
++ * open an AudioEffect handle for it (the app does, even in mode=auto where
++ * jdspd adopts the framework instance).  A caller-side write policy inside
++ * jdspd cannot stop that, so the engine itself refuses parameter writes
++ * (EFFECT_CMD_SET_PARAM) until the daemon unlocks the instance:
++ *
++ *   1. every freshly created effect instance starts "locked";
++ *   2. jdspd sends one SET_PARAM carrying the reserved parameter id
++ *      JDSP_WRITELOCK_PARAM_ID (0x7A00, unused upstream) with the 32 byte
++ *      engine key as the value;
++ *   3. the engine compares the token with the key file the daemon generated
++ *      (root only) and, on a match, opens the write window for this instance;
++ *   4. every SET_PARAM that arrives while the instance is locked is rejected
++ *      with a nonzero status without touching the DSP, so the app's
++ *      AudioEffect.setParameter() returns an error through AudioFlinger.
++ *
++ * The handshake is a capability, not cryptography: the key is readable only by
++ * root (and the audio HAL, which needs it to verify the daemon) and never
++ * leaves the device.  The engine never sends anything to the caller.
++ *
++ * Interaction with jdsp_state (state.bin): the unlock command is NOT recorded,
++ * and a replayed state never contains one, so a rebuilt engine stays locked
++ * until jdspd unlocks it again; the daemon unlocks before every applyAll and
++ * whenever a handle (re)attaches.  A locked instance therefore never executes
++ * recorded parameters on its own - replay runs on a fresh engine through the
++ * internal dispatch path that bypasses this gate on purpose.
++ *
++ * Environment overrides (tests only; the audio HAL does not inherit the
++ * caller's environment):
++ *     JDSP_WRITELOCK_KEYFILE=/some/file   read the key from this file first
++ *
++ * Compile time switches:
++ *     -DJDSP_WRITELOCK_ENABLE=0           compile the whole feature out
++ *                                         (behaves like permanently unlocked)
++ *     -DJDSP_WRITELOCK_BUILTIN_KEY_HEX=<64 hex chars>
++ *                                         last-resort key baked into the .so,
++ *                                         used only when no key file is
++ *                                         readable (see docs in native/README)
++ */
++#ifndef JDSP_WRITELOCK_H
++#define JDSP_WRITELOCK_H
++
++#include <stddef.h>
++#include <stdint.h>
++
++#ifndef JDSP_WRITELOCK_ENABLE
++#define JDSP_WRITELOCK_ENABLE 1
++#endif
++
++/* Reserved SET_PARAM parameter id for the unlock handshake.  Upstream uses
++ * 112..1307, 8888, 9999, 10004..10010, 12000/12001, 19998..20002, 25000..25003
++ * and 30000..30003; 0x7A00 = 31232 collides with none of them. */
++#define JDSP_WRITELOCK_PARAM_ID 31232
++#define JDSP_WRITELOCK_TOKEN_LEN 32
++
++/* Key files tried in order.  /data/vendor/audio/jamesdsp_engine.key is the one
++ * the audio HAL can read (vendor_audio_data_file, already covered by the
++ * sepolicy.rule of the state file); /data/adb/jdspd/engine.key is the daemon's
++ * canonical copy, tried in case the vendor path could not be prepared. */
++#define JDSP_WRITELOCK_KEY_FILE_VENDOR "/data/vendor/audio/jamesdsp_engine.key"
++#define JDSP_WRITELOCK_KEY_FILE_ADB "/data/adb/jdspd/engine.key"
++
++#if defined(__GNUC__)
++#define JDSP_WRITELOCK_HIDDEN __attribute__((visibility("hidden")))
++#else
++#define JDSP_WRITELOCK_HIDDEN
++#endif
++
++/* gate() return values. */
++#define JDSP_WL_PROCEED 0 /* not our business: continue normal command handling */
++
++JDSP_WRITELOCK_HIDDEN int32_t jdsp_writelock_gate(int *locked, uint32_t cmd_code,
++                                              uint32_t cmd_size, const void *cmd_data,
++                                              void *reply_data, uint32_t *reply_size);
++
++/* True when cmd_data is a SET_PARAM carrying the unlock handshake.  Used to
++ * keep the unlock command out of the persisted state and to skip it during a
++ * defensive replay. */
++JDSP_WRITELOCK_HIDDEN int jdsp_writelock_is_unlock_cmd(uint32_t cmd_size,
++                                                   const void *cmd_data);
++
++/* Copies the currently expected token; returns 0 when one is loaded. */
++JDSP_WRITELOCK_HIDDEN int jdsp_writelock_expected(uint8_t out[JDSP_WRITELOCK_TOKEN_LEN]);
++
++/* Non-zero when a key is loaded (file or builtin). */
++JDSP_WRITELOCK_HIDDEN int jdsp_writelock_has_expected(void);
++
++/* Forget the cached key so the next unlock attempt re-reads the key files.
++ * Tests and key rotation support. */
++JDSP_WRITELOCK_HIDDEN void jdsp_writelock_forget_key(void);
++
++/* Tests only: install a token directly, bypassing the key files. */
++JDSP_WRITELOCK_HIDDEN int jdsp_writelock_set_expected_for_test(const uint8_t *token,
++                                                           uint32_t len);
++
++#endif /* JDSP_WRITELOCK_H */

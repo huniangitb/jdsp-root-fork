@@ -75,4 +75,15 @@ interface IJdspService {
     int setEnabled(boolean enabled);
     /** Current state of the master switch. */
     boolean getEnabled();
+
+    // ---- canonical baseline (appended: the transaction numbers of the methods
+    //      above stay stable) ---------------------------------------------
+    /**
+     * Restores the canonical parameter baseline: replaces globalParams with the embedded
+     * known-good set, optionally clears every perAppParams scope, persists the config and
+     * broadcasts the new values to every currently mounted session.
+     *
+     * @return the number of engine writes applied to mounted sessions (>= 0), negative on error
+     */
+    int applyBaseline(boolean clearPerApp);
 }

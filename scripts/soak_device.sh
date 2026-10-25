@@ -23,7 +23,12 @@ fi
 TONE_EVERY=$(( 6 * 3600 ))
 
 mkdir -p "$DIR"
-[ -f "$OUT" ] || echo "time\tprocs\tpid\tuptimeMs\twatcherFail\tsetParams\tparamErrors\tfatal\tanr\taudiotrackCrash\tlogTcpErr" > "$OUT"
+# 2026-10-26 加固（旧栈 soak 复盘结论）：fatal/anr/audiotrackCrash 三列取的是 logcat 环形缓冲
+# 的**当前内容**（会被 logcat -c / 轮转清空而变小），只能当参考；真正的 JDSP 判据是
+#   bootid     -> 设备是否重启过（跨重启无法直接比较 uptimeMs）
+#   devuptime  -> 设备开机秒数（daemon uptimeMs 归零 + devuptime 不回零 = daemon 重启，不是设备重启）
+#   jdsphits   -> dropbox 里提到 james.dsp / jdspd / libjamesdsp 的条目数（JDSP 定向崩溃证据）
+[ -f "$OUT" ] || echo "time\tprocs\tpid\tuptimeMs\twatcherFail\tsetParams\tparamErrors\tfatal\tanr\taudiotrackCrash\tlogTcpErr\tbootid\tdevuptime\tjdsphits" > "$OUT"
 
 START=$(date +%s)
 END=$(( START + TOTAL_S ))
@@ -43,8 +48,11 @@ while [ "$(date +%s)" -lt "$END" ]; do
     ANR=$(logcat -d -b events 2>/dev/null | grep -c "am_anr.*james\|am_anr.*jdsp")
     ATCRASH=$(logcat -d 2>/dev/null | grep -c "FATAL EXCEPTION.*AudioTrack\|AudioTrack.*FATAL")
     TCPERR=$(grep -c "tcp.*cannot write\|tcp: cannot create" /data/adb/jdspd/jdspd.log 2>/dev/null)
+    BOOTID=$(cut -c1-8 /proc/sys/kernel/random/boot_id 2>/dev/null)
+    DEVTUP=$(awk '{printf "%d", $1}' /proc/uptime 2>/dev/null)
+    JDSPHITS=$(grep -l -E 'james\.dsp|jdspd|libjamesdsp' /data/system/dropbox/*.txt 2>/dev/null | wc -l | tr -d ' ')
 
-    echo "$(date '+%m-%d %H:%M:%S')\t${PROCS}\t${PID}\t${UPT:-x}\t${WFAIL:-x}\t${SSET:-x}\t${PERR:-x}\t${FATAL}\t${ANR}\t${ATCRASH}\t${TCPERR}" >> "$OUT"
+    echo "$(date '+%m-%d %H:%M:%S')\t${PROCS}\t${PID}\t${UPT:-x}\t${WFAIL:-x}\t${SSET:-x}\t${PERR:-x}\t${FATAL}\t${ANR}\t${ATCRASH}\t${TCPERR}\t${BOOTID:-x}\t${DEVTUP:-x}\t${JDSPHITS:-x}" >> "$OUT"
 
     # 每 6 h 放 5 s tone（驱动 session attach / 参数回放）
     if [ $(( NOW - LAST_TONE )) -ge $TONE_EVERY ] && [ -f "$TONE_DEX" ]; then

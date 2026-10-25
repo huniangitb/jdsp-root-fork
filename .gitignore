@@ -7,3 +7,6 @@ backend/.build.lock
 module/src/backend/
 app/p5/out/
 app/p5/selftest/out/
+out/
+native/out/
+tools/build-multiapi/

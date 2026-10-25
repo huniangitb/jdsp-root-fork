@@ -63,6 +63,26 @@ public final class DumpsysParserTest {
             + "    Type     Id Active Client Session Port Id S  Flags   Format Chn mask  SRate\n"
             + "           519     no    4818    8274       9 A  0x000 00000005 00000003  48000\n";
 
+    /**
+     * ColorOS 16 track table (OnePlus OPD2404 / Android 16, captured 2026-10-26 while a probe
+     * tone was audibly playing): the client pid and uid are fused into one
+     * {@code Client(pid/uid)} column instead of AOSP's two columns. Before the fix the row did
+     * not match TRACK_ROW, so jdspd reported {@code sessions=[]} with the track live and backend
+     * mode never attached on that ROM.
+     */
+    private static final String COLOROS_OUTPUT_THREAD =
+            "Output thread 0xb4000075d8aaf680, name AudioOut_15, tid 3858, type 0 (MIXER):\n"
+            + "  Standby: no\n"
+            + "  No FastMixer\n"
+            + "  1 Tracks of which 1 are active\n"
+            + "    Type     Id Active Client(pid/uid) Session Port Id S  Flags   Format Chn mask  SRate\n"
+            + "             57    yes   15080/   1000     105      32 A  0x000 00000001 00000003  48000\n";
+
+    private static final String COLOROS_REFS =
+            "Global session refs:\n"
+            + "  session  cnt     pid    uid  name\n"
+            + "      105    1   15080   1000  root\n";
+
     private static final String GLOBAL_REFS =
             "Global session refs:\n"
             + "  session  cnt     pid    uid  name\n"
@@ -172,6 +192,42 @@ public final class DumpsysParserTest {
                         + "             59     no  14218     145      33 I  0x000 00000005 00000003  48000\n";
                 List<SessionInfo> out = DumpsysParser.parse(old);
                 Assert.isTrue(indexOf(out, 145) >= 0, "old-style output thread parsed");
+            }
+        });
+        suite.test("dumpsys: ColorOS 16 fused Client(pid/uid) track rows are parsed",
+                new com.jdsp.cli.Body() {
+            public void run() {
+                Log.setLogcat(false);
+                List<SessionInfo> out = DumpsysParser.parse(COLOROS_REFS + "\n" + COLOROS_OUTPUT_THREAD);
+                int at = indexOf(out, 105);
+                Assert.isTrue(at >= 0, "ColorOS track row must produce session 105");
+                SessionInfo s = out.get(at);
+                Assert.eq(15080, s.pid, "pid from the fused Client(pid/uid) column");
+                Assert.isTrue(s.active, "track is active");
+                Assert.eq(1000, s.uid, "uid from the refs table");
+            }
+        });
+        suite.test("dumpsys: our own JamesDSP chain alone never creates a session",
+                new com.jdsp.cli.Body() {
+            public void run() {
+                Log.setLogcat(false);
+                // ColorOS 16 keeps a session reference for an attached effect, so the chain of a
+                // finished track outlives its track table row. If the chain created the session,
+                // the watcher saw it as "present" forever and leaked one instance per track.
+                String chainOnly = "Global session refs:\n"
+                        + "  session  cnt     pid    uid  name\n"
+                        + "      145    1    2338      0  root\n"
+                        + "Output thread 0xb400007995874700, name AudioOut_D, tid 2502, type 0 (MIXER):\n"
+                        + "  0 Tracks of which 0 are active\n"
+                        + "  1 Effect Chains\n"
+                        + "    1 effects for session 145\n"
+                        + "\tEffect ID 83:\n"
+                        + "\t\tSession State Registered Internal Enabled Suspended:\n"
+                        + "\t\t00145   002   y          n        y       n\n"
+                        + "\t\tDescriptor:\n"
+                        + "\t\t- UUID: f27317f4-c984-4de6-9a90-545759495bf2\n";
+                List<SessionInfo> out = DumpsysParser.parse(chainOnly);
+                Assert.eq(-1, indexOf(out, 145), "chain-only session must not be created");
             }
         });
         suite.test("dumpsys: never throws, null/empty/garbage yield an empty list",

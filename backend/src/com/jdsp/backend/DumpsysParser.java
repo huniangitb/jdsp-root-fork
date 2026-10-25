@@ -67,9 +67,20 @@ public final class DumpsysParser {
     private static final Pattern UUID_LINE = Pattern.compile(
             "^\\s*-\\s*UUID:\\s*([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\\s*$");
 
-    /** One track row: Id Active Client Session PortId S Flags Format ChnMask SRate ... */
+    /**
+     * One track row: Id Active Client[(pid/uid)] Session PortId S Flags Format ChnMask SRate ...
+     *
+     * <p>Two column layouts exist in the wild. AOSP prints three numbers (client pid, session,
+     * port id): {@code "59 no 14218 145 33 I 0x000 ..."}. ColorOS 16 (OnePlus OPD2404 / Android
+     * 16, verified 2026-10-26) fuses the client pid and uid into one
+     * {@code Client(pid/uid)} column ({@code "57 yes 15080/   1000 105 32 A 0x000 ..."}). The
+     * optional {@code /uid} group keeps both families parseable: without it every ColorOS track
+     * row failed to match, the watcher saw zero sessions while a track was audibly playing, and
+     * backend mode never attached (the on-device symptom is an empty {@code jdspcli sessions}).
+     */
     private static final Pattern TRACK_ROW = Pattern.compile(
-            "^\\s+(?:\\S+\\s+)?(\\d+)\\s+(yes|no)\\s+(\\d+)\\s+(\\d+)\\s+(\\d+)\\s+[A-Za-z]{1,3}"
+            "^\\s+(?:\\S+\\s+)?(\\d+)\\s+(yes|no)\\s+(\\d+)(?:/\\s*\\d+)?\\s+(\\d+)\\s+(\\d+)"
+                    + "\\s+[A-Za-z]{1,3}"
                     + "\\s+0x[0-9A-Fa-f]{3,8}\\s+[0-9A-Fa-f]{8}\\s+[0-9A-Fa-f]{8}\\s+\\d+");
 
     private static final String GLOBAL_REFS_HEADER = "Global session refs:";
@@ -353,7 +364,15 @@ public final class DumpsysParser {
         return refs.get(0);
     }
 
-    /** Record a finished effect block when it is the JamesDSP instance of its session. */
+    /**
+     * Record a finished effect block when it is the JamesDSP instance of its session.
+     *
+     * <p>Enrichment only: the session must already have been discovered from an <b>output track
+     * table</b>. Creating it here would let the daemon's own chain keep the session "present"
+     * forever on ROMs where an attached effect holds a session reference (measured on ColorOS 16 /
+     * OPD2404): every finished track leaked one effect instance because the watcher never saw the
+     * session vanish. The track table, not our chain, is the liveness source of truth.
+     */
     private static void finishEffect(Map<Integer, SessionInfo> sessions, int chainSession,
                                      int effectId, String uuid, boolean enabled, boolean inEffect) {
         if (!inEffect || chainSession < 0 || effectId < 0 || uuid == null) {
@@ -362,7 +381,10 @@ public final class DumpsysParser {
         if (!uuid.equals(JDSP_UUID)) {
             return;
         }
-        SessionInfo info = session(sessions, chainSession);
+        SessionInfo info = sessions.get(Integer.valueOf(chainSession));
+        if (info == null) {
+            return;
+        }
         info.effectId = effectId;
         info.jdspPresent = true;
         info.jdspEnabled = enabled;

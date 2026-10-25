@@ -6,6 +6,9 @@ public class Tone {
     public static void main(String[] args) throws Exception {
         int sr = 48000;
         int secs = args.length > 0 ? Integer.parseInt(args[0]) : 20;
+        // Optional amplitude (int16 peak, default 8000 = -12.2 dBFS). The soak script passes a
+        // label as argv[1] ("Tone 5 soak"), so the amplitude lives in argv[2].
+        int amp = args.length > 2 ? Integer.parseInt(args[2]) : 8000;
         AudioAttributes attrs = new AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_MEDIA)
                 .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
@@ -23,7 +26,7 @@ public class Tone {
                 .setBufferSizeInBytes(minBuf * 4)
                 .setTransferMode(AudioTrack.MODE_STREAM)
                 .build();
-        System.out.println("SESSION=" + t.getAudioSessionId() + " minBuf=" + minBuf);
+        System.out.println("SESSION=" + t.getAudioSessionId() + " minBuf=" + minBuf + " amp=" + amp);
         t.play();
         short[] buf = new short[2048];
         double phase = 0.0;
@@ -31,7 +34,7 @@ public class Tone {
         long written = 0;
         while (written < total) {
             for (int i = 0; i < 1024; i++) {
-                short v = (short) (Math.sin(phase) * 8000);
+                short v = (short) (Math.sin(phase) * amp);
                 buf[2 * i] = v;
                 buf[2 * i + 1] = v;
                 phase += 2.0 * Math.PI * 440.0 / sr;

@@ -205,19 +205,32 @@ public class DualSession {
         System.exit(h > 0 ? 0 : 4);
     }
 
-    static void miccap(int secs) throws Exception {
+    /**
+     * Audibility ground truth. {@code source} selects the capture source:
+     * "mic" (default, processed: ROM AGC/noise suppression can compress the A/B dynamics),
+     * "unprocessed" (raw mic, no AGC - the honest RMS meter), "camcorder", "voice".
+     */
+    static int micSource(String source) {
+        if (source == null) return MediaRecorder.AudioSource.MIC;
+        if (source.equals("unprocessed")) return MediaRecorder.AudioSource.UNPROCESSED;
+        if (source.equals("camcorder")) return MediaRecorder.AudioSource.CAMCORDER;
+        if (source.equals("voice")) return MediaRecorder.AudioSource.VOICE_RECOGNITION;
+        return MediaRecorder.AudioSource.MIC;
+    }
+
+    static void miccap(int secs, String source) throws Exception {
         int min = AudioRecord.getMinBufferSize(SR,
                 AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT);
-        AudioRecord rec = new AudioRecord(MediaRecorder.AudioSource.MIC, SR,
+        AudioRecord rec = new AudioRecord(micSource(source), SR,
                 AudioFormat.CHANNEL_IN_STEREO,
                 AudioFormat.ENCODING_PCM_16BIT, min * 4);
-        System.out.println("CAPTURE state=" + rec.getState());
+        System.out.println("CAPTURE state=" + rec.getState() + " source=" + source);
         if (rec.getState() != AudioRecord.STATE_INITIALIZED) {
             System.out.println("CAPTURE_UNAVAILABLE");
             System.exit(2);
         }
         rec.startRecording();
-        short[] buf = new short[SR]; // 1 s stereo
+        short[] buf = new short[SR * 2]; // exactly 1 s of stereo (SR frames * 2 channels)
         for (int s = 0; s < secs; s++) {
             int read = 0;
             long t0 = System.currentTimeMillis();
@@ -279,7 +292,8 @@ public class DualSession {
         String mode = args.length > 0 ? args[0] : "dual";
         if (mode.equals("dual")) dual(args);
         else if (mode.equals("tone")) tone(args);
-        else if (mode.equals("miccap")) miccap(args.length > 1 ? Integer.parseInt(args[1]) : 10);
+        else if (mode.equals("miccap")) miccap(args.length > 1 ? Integer.parseInt(args[1]) : 10,
+                args.length > 2 ? args[2] : "mic");
         else if (mode.equals("micrec")) micrec(args.length > 1 ? Integer.parseInt(args[1]) : 10,
                 args.length > 2 ? args[2] : "/data/local/tmp/p05.pcm");
         else { System.out.println("unknown mode " + mode); System.exit(1); }

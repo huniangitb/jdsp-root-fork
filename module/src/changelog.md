@@ -1,3 +1,24 @@
+### v2.1.2-fork（ColorOS 16 会话泄漏修复；后端 jdspd 2.1.3）
+
+* **后端 jdspd 2.1.3（P0，新设备实测发现）**：ColorOS 16 会给已 attach 的 effect 保留 session
+  引用，于是一条曲目结束后，我们的效果链比它的 track 行活得更久。`DumpsysParser` 过去会用
+  **自己的效果链**反推会话（`finishEffect` 里调 `session()`），watcher 因此永远认为该死会话"仍在"，
+  `released session=` 永不触发——每播完一首歌泄漏一个 effect 实例（实测：tone 结束 50s+ 后
+  flinger 里只剩 daemon 自己的 session ref + 效果链，`jdspcli sessions` 仍显示 attached）。
+  现在效果链只做**富化**（`sessions.get`，不创建），会话存活一律以输出线程的 track 表为准；
+  重复播放不再累积实例。
+* 其余组件与 v2.1.1 / v2.1.0 相同（引擎 0003-0006 未改、App 1.6.16-62 未改）。
+
+### v2.1.1-fork（ColorOS 16 会话发现修复；后端 jdspd 2.1.2）
+
+* **后端 jdspd 2.1.2（P0，新设备实测发现）**：`DumpsysParser` 的 track 行正则不认识 ColorOS 16
+  的 `Client(pid/uid)` 合列格式（`57 yes 15080/   1000 105 32 A 0x000 …`，AOSP 是 pid/uid 两列）。
+  后果：backend 模式下 watcher 恒解析出 0 个会话——音频确实在播、`jdspcli sessions` 却始终为空，
+  效果永不 attach，整机静默。现在行正则接受可选的 `/uid` 复合列，AOSP 与 ColorOS 两种表头都能解析；
+  `DumpsysParserTest` 增加真实 dump 摘录回归样例（OnePlus OPD2404 / Android 16）。
+* 其余组件与 v2.1.0 相同：引擎 0003-0006 未改（arm64 `265544f5` / arm `6a5ad413`），
+  内置 App 仍为 1.6.16（versionCode 62，`b7ff6461`）。
+
 ### v2.1.0-fork（引擎 0003-0006 + 后端 2.1.0 + 源码改造版 App）
 
 * **引擎 0003（高频调参噪声根修）**：SET_PARAM 不再从命令线程原地改写渲染中的引擎（系数撕裂读），

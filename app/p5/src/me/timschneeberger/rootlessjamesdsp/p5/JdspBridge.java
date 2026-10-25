@@ -326,6 +326,7 @@ public final class JdspBridge {
             return json;
         } catch (Throwable th) {
             lastError = th.getClass().getSimpleName() + ": " + th.getMessage();
+            Log.w("JdspP5", "dumpConfig transport error: " + lastError);
             return null;
         }
     }
@@ -668,7 +669,11 @@ public final class JdspBridge {
             if (dir == null) return null;
             int port = readInt(new File(dir, "jdsp.port"), 0);
             String token = readLine(new File(dir, "jdsp.token"));
-            if (port <= 0 || token.isEmpty()) return null;
+            if (port <= 0 || token.isEmpty()) {
+                Log.w("JdspP5", "tcp endpoint missing in " + dir + ": port=" + port
+                        + " tokenLen=" + token.length());
+                return null;
+            }
             return new TcpTransport("127.0.0.1", port, token);
         }
         if ("socket".equals(kind)) {

@@ -80,6 +80,8 @@ public final class TcpTransport implements JdspTransport {
             }
             return ping() >= 0;
         } catch (Throwable t) {
+            android.util.Log.w("JdspP5", "tcp connect failed (" + host + ":" + port + "): "
+                    + t.getClass().getName() + ": " + t.getMessage());
             close();
             return false;
         }

@@ -74,9 +74,11 @@ public final class JdspBackendSharedPreferences implements SharedPreferences {
             if (context != null) {
                 JdspBackendPreferences.init(context);
             }
+            android.util.Log.i("JdspP5", "wrap namespace=" + namespace);
             return new JdspBackendSharedPreferences(real, namespace);
         } catch (Throwable t) {
             // 任何异常都不能让 App 崩：退回原 SharedPreferences。
+            android.util.Log.w("JdspP5", "wrap failed, falling back", t);
             return real;
         }
     }
@@ -90,13 +92,19 @@ public final class JdspBackendSharedPreferences implements SharedPreferences {
         }
         JdspConfigSnapshot snapshot = JdspBackendPreferences.snapshot();
         if (snapshot == null) {
+            android.util.Log.w("JdspP5", "read " + namespace + "/" + key + ": backend unreachable, local");
             return null;
         }
         byte[] bytes = snapshot.param(entry.paramId);
         if (bytes == null) {
+            android.util.Log.i("JdspP5", "read " + namespace + "/" + key
+                    + ": param " + entry.paramId + " not in backend, local");
             return null;
         }
-        return JdspParamMapping.coerce(entry, bytes, def);
+        Object v = JdspParamMapping.coerce(entry, bytes, def);
+        android.util.Log.i("JdspP5", "read " + namespace + "/" + key
+                + ": backend hit (param " + entry.paramId + ")");
+        return v;
     }
 
     @Override

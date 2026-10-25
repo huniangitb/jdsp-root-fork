@@ -36,6 +36,16 @@ public final class JdspBackendPreferences {
     /** 本 App 的包名（用于 per-app 作用域）。 */
     private static volatile String packageName;
 
+    /**
+     * 内存里的后端配置快照。UI 线程只读它，网络刷新永远在后台线程——
+     * 主线程碰 socket 会直接 NetworkOnMainThreadException（loopback 也不例外，
+     * 这是系统强制的，不是 StrictMode 选项），所以 snapshot() 绝不能同步建连。
+     */
+    private static volatile JdspConfigSnapshot cached;
+    private static volatile boolean refreshRunning;
+    private static volatile long lastRefreshAt;
+    private static java.util.concurrent.ExecutorService refreshExecutor;
+
     /** 登记包名（App 启动时调一次）。 */
     public static void init(Context context) {
         if (context == null) return;
@@ -84,11 +94,56 @@ public final class JdspBackendPreferences {
         return value;
     }
 
-    /** 后端当前配置快照；读不到返回 null。 */
+    /**
+     * 后端当前配置快照；没有可用快照返回 null（调用方回落本地偏好）。
+     *
+     * <p>只读内存缓存，同时安排一次后台刷新——网络往返在后台线程做。
+     * 这意味着冷启动后的第一次读可能还没有快照（显示本地值），
+     * 后台拉到之后下一次界面刷新就会显示后端的值。
+     */
     public static JdspConfigSnapshot snapshot() {
-        String json = JdspBridge.dumpConfig();
-        if (json == null) return null;
-        return JdspConfigSnapshot.parse(json, packageName);
+        scheduleBackgroundRefresh();
+        return cached;
+    }
+
+    /** 丢掉内存快照并立刻后台重拉（写完参数后调用，保证 UI 不显示旧的后端值）。 */
+    public static void invalidateSnapshot() {
+        cached = null;
+        scheduleBackgroundRefresh();
+    }
+
+    private static void scheduleBackgroundRefresh() {
+        long now = System.currentTimeMillis();
+        if (now - lastRefreshAt < 250L) return;
+        lastRefreshAt = now;
+        if (refreshRunning) return;
+        synchronized (JdspBackendPreferences.class) {
+            if (refreshRunning) return;
+            refreshRunning = true;
+            if (refreshExecutor == null) {
+                refreshExecutor = java.util.concurrent.Executors.newSingleThreadExecutor(
+                        r -> {
+                            Thread t = new Thread(r, "jdsp-p5-config-refresh");
+                            t.setDaemon(true);
+                            return t;
+                        });
+            }
+        }
+        final String pkg = packageName;
+        refreshExecutor.execute(() -> {
+            try {
+                String json = JdspBridge.dumpConfig();
+                JdspConfigSnapshot fresh =
+                        json == null ? null : JdspConfigSnapshot.parse(json, pkg);
+                if (fresh != null) {
+                    cached = fresh;
+                }
+            } catch (Throwable ignored) {
+                // 刷新失败：保留旧快照（比回落本地更接近后端真相）。
+            } finally {
+                refreshRunning = false;
+            }
+        });
     }
 
     /** 读 App 本地偏好（回落路径）。 */

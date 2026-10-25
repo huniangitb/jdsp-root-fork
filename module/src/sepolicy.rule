@@ -28,3 +28,10 @@ allow mtk_hal_audio vendor_audio_data_file file { watch }
 allow audioserver vendor_audio_data_file dir { search read write add_name remove_name create getattr }
 allow audioserver vendor_audio_data_file file { read write open create getattr setattr map unlink rename }
 allow audioserver vendor_file file { read open getattr map execute }
+# Engine write lock (0002-engine-write-lock.patch): the HAL verifies the
+# daemon's unlock token against the key mirror at
+#   /data/vendor/audio/jamesdsp_engine.key
+# That file carries the same vendor_audio_data_file context as the state file
+# above, so the read rules already granted here cover it; no extra rules are
+# needed. The canonical copy /data/adb/jdspd/engine.key stays root-only and is
+# never read by the HAL.
