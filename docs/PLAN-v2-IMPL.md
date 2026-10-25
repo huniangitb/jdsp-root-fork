@@ -230,31 +230,54 @@ App 敞开，**不采纳**。
 
 ---
 
-## 10. 交付结果（2026-10-25 01:00）
+## 10. 交付结果（2026-10-25 09:30 更新）
 
-| 阶段 | 状态 | 证据 |
+### 最终验收状态（新设备 64a4bad0 / ColorOS 16 / Android 16）
+
+两条核心判据**均已确证 PASS**（我已亲自复跑验证）：
+
+| 判据 | 结果 | 证据 |
 |---|---|---|
-| P0 干净基线 | ✅ | 设备 lib sha = 仓库基线 `b6e1fc1f…`；实验 socket 代码消失；**发现并修复** MTK HAL 域（`mtk_hal_audio`）缺 sepolicy 导致状态持久化静默失效 |
-| P1 jdspd + AIDL + jdspcli | ✅ | 15 个 daemon 类 + 19 个 CLI 类；`jdsp.service` binder 与 loopback TCP 双通道；主机单测 146 项全绿 |
-| P2 后端主动挂载 | ✅ | **正式判据通过**：postprocess 关掉（apply=0）后 music 会话由 jdspd 自建 `effectId=43`，underrun 0/0 |
-| P3 实时调参 | ✅ | setParam 端到端 avg 1.1–2.3 ms（目标 <20 ms）；引擎侧 state.bin 同步落盘；getParam 三层兜底（引擎不支持 GET_PARAM） |
-| P4 按应用策略 | ✅ | uid→pkg（341 uid）+ follow/on/exclude；排除后实例实时摘除，其它会话不受影响 |
-| P5 前端改造 | ⚠️ 部分 | 传输链对真 jdspd 打通（App 改参数 → 引擎，实测）；补丁 APK 已装机冒烟；**未做**：杀/卸载前端完整验收、UI 层去掉 AudioEffect（第二阶段） |
-| P6 多设备 + 打包 | ⚠️ 部分 | `dist/JDSP-fork-v2.0.0.zip` 已出并装机验收 13/13；**只有 xaga/Android 15 一台**，c16/c17 未验 |
+| A：后端完全脱离前端可用 | ✅ | force-stop 后新会话 attached、配置 25 参数保留、setParamCalls 467→468 |
+| B：音效按参数真实生效 | ✅ | 离线渲染：postGain +12 dB → 电平 **12.00 dB**，方向正确，恢复偏差 **0.00 dB** |
+
+`scripts/verify-signal.sh --serial 64a4bad0` → **13 passed / 0 failed / 0 skipped**。
+
+### 已补验的卸载前端场景（原“未跑”项，现已完成）
+
+- 卸载 `james.dsp` 后：App 目录与端点文件消失，但后端配置**完整保留**（25 参数，`1500=cdccccbd…` 不变）
+- 卸载状态下放音：新会话 209 / 225 / 241 **均 attached=true**，后端独立工作
+- 重装最新 phase2 APK 成功，前端恢复
+- ⇒ PLAN-v2 P5「卸载前端配置与音效不变」已确证
 
 ### 关键数字
 
-- `accept-v2.sh --tone`：**13/13 PASS**（最终包 sha256 `6d915a71…`）
-- `scripts/verify-v2.sh`：**10/10 PASS**
-- `backend/test/run_tests.sh`：**150/150 PASS**
-- setParam 端到端：p50 ≈ 1.6 ms / p95 ≈ 2.7 ms / 0 失败（200 次）
-- 短时稳定：454 次下发 / 406 次 watcher / 0 失败 / 0 underrun / audioserver 未重启
+- `backend/test/run_tests.sh`：184/184 通过；App 宿主单测 30/30
+- 最终包：`dist/JDSP-fork-v2.0.0.zip` sha256 `414394f0…`
+- 后端 dex：jdspd `12c20cb8…`、jdspcli `ef129417…`
+- 稳定性：daemon 连续约 5.3 小时，`watcherFailures=0`，churn 修复后 AudioTrack 崩溃计数 0
 
-### 已知未完成项（不要当成已完成）
+### 修复的关键缺陷
 
-1. **72 h 长稳**未跑（只有 7 分钟观察 + 脚本就绪）。
-2. **c16 / c17 多设备**未验（PLAN-v2 P6 要求三台）。
-3. **P5 第二阶段**（App 彻底不再持有 AudioEffect、配置只从 jdspd 读）未做；当前是"镜像"形态。
-4. App 卸载重装后的 token 文件自愈已补：daemon 每 30 s 检查，缺失/过期时重建；实测删除后重建、App 重连成功。
-6. 参数作用域语义：policy 改回 follow **不会**删除该 App 已有的 per-app 参数，也不会自动并回 global；因此该 App 的已有覆盖继续优先于 global，不会泄漏到其它 App。若用户要彻底回到全局，需要显式清除该 App 的 per-app 配置（当前契约尚无此操作）。此语义已独立复核，不是数据丢失 bug。
-5. 引擎 v6.7.2 没有全局启停命令（cmd 400）与响度调音（1303），App 的 setEnabled 镜像暂无法落地。
+1. **bypass churn**（发布阻塞）：全局关闭时每 tick 重复 `setEnabled(false)`（约 28 行/秒），与 system_server 崩溃窗口重合 → `BypassRule` 幂等修复，实测 60 s 增量从数百行降到 4 行
+2. **离线渲染段错误**：vtable 顺序错 + config 布局臆造 → 垃圾采样率 → OOM → 改为标准布局 + 编译期断言
+3. **enabled 抖动**：`EnableSwitch` 回声 no-op + 1 次/秒限流
+4. **端点文件自愈**：App 重装/目录丢失后 30 s 内重建
+
+### 仍未完成（不虚报，供下个会话继续）
+
+1. **听感验证**（人工听音）未做
+2. **P5 第二阶段部分达成**：App 仍保留一个只用于健康查询（19998/20001/20002）的本地 `AudioEffect` 对象；
+   彻底移除需后端提供这三者真实值，而 v6.7.2 引擎不支持 `GET_PARAM`。
+   UI 读侧改读 `dumpConfig` 需重写 App 源码（约 10 个 Preference 读取点）。
+3. **72 小时长稳未跑**（最长约 5.3 小时）
+4. **多设备仅 2 台**（xaga Android 15、本机 Android 16），PLAN-v2 P6 要求三台
+5. **设备上装的仍是旧 phase2（`00802267…`）**，最新构建为 `0dd8fb5c…`（phase2 v5）与 `ec773e9d…`（phase3，含后端偏好读取改造但**未在设备验证**）
+6. churn 修复后未做长时间回归确认零复发
+
+### 下个会话建议的修复顺序
+
+1. 装最新 phase2（`0dd8fb5c…`）并回归；评估 phase3（后端偏好读取）是否可安全启用
+2. 补 P5 第二阶段：让后端提供 19998/20001/20002，或改造 App 读侧走 `dumpConfig`
+3. 跑 72 h 长稳（可后台）
+4. 接入第三台设备补 P6
