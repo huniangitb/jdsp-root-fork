@@ -358,7 +358,10 @@ public final class EffectManager {
                 h.paramCount++;
             }
         } else if (!unlockWrite) {
-            Log.w("setParam session=" + sessionId + " param=" + paramId
+            // The value length in the log: the engine's SET_PARAM classifier rejects malformed
+            // writes with -1 (observed: an App sending 1307 with a payload that is not the 44
+            // bytes the handler expects - indistinguishable from a lock rejection without it).
+            Log.w("setParam session=" + sessionId + " param=" + paramId + " vsize=" + value.length
                     + " engine status=" + status + " (handshake retried on the next write)");
         }
         return status;

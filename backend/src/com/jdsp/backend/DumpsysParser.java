@@ -33,6 +33,12 @@ import java.util.regex.Pattern;
  *     session  cnt     pid    uid  name
  *         153    1   17432      0  root
  * </pre>
+ *
+ * <p>Only output threads contribute sessions: once a thread header ("Output thread 0x...",
+ * "Input thread 0x..., type N (RECORD)" ...) is seen, track rows are parsed only inside an
+ * output thread section, and the "Global session refs" table only enriches sessions that an
+ * output track already produced. Input/record sessions (e.g. the session of a mic stream) can
+ * therefore never become attach targets - attaching to one fails on every watcher tick.
  */
 public final class DumpsysParser {
     /** JamesDSP implementation UUID (audio_effects.xml, same value as JdspConst.EFFECT_UUID). */
@@ -67,6 +73,35 @@ public final class DumpsysParser {
                     + "\\s+0x[0-9A-Fa-f]{3,8}\\s+[0-9A-Fa-f]{8}\\s+[0-9A-Fa-f]{8}\\s+\\d+");
 
     private static final String GLOBAL_REFS_HEADER = "Global session refs:";
+
+    /**
+     * A thread section header. Only output threads are relevant: their track tables list the
+     * playback sessions jdspd may attach to. Everything else (Input/Record/Capture thread, Mmap
+     * thread) holds recording sessions that AudioEffect.attach can never serve - parsing them
+     * made the watcher retry a doomed attach every tick (binder calls + log spam at the 500 ms
+     * poll rate). Keyword based: "Output thread 0xb400... (MIXER):" (Android 15) as well as
+     * "- Output thread 0xf4483800:" (older AOSP) match; "FastMixer", "RT thread: yes" and
+     * "thread count: 15" do not.
+     */
+    private static final Pattern THREAD_HEADER = Pattern.compile(
+            "^\\s*-?\\s*(Output|Input|Record|Capture|Mmap|Mixer|Playback|Direct|Duplicate"
+                    + "|Duplicating|Offload)\\s+[Tt]hread\\s+0x[0-9A-Fa-f]+");
+
+    /** "type 0 (MIXER)" - printed on the header line and/or a detail line of the section. */
+    private static final Pattern TYPE_ANNOTATION = Pattern.compile(
+            "\\btype\\s*:?\\s*(\\d+)\\s*(?:\\(\\s*([A-Za-z_ ]+?)\\s*\\))?");
+
+    /** Thread section kinds. */
+    private static final int THREAD_UNKNOWN = -1;
+    private static final int THREAD_OUTPUT = 0;
+    private static final int THREAD_NOT_OUTPUT = 1;
+
+    /** True when the type label names an input (record/capture/mmap) thread. */
+    private static boolean isInputTypeLabel(String label) {
+        String l = label == null ? "" : label.trim().toUpperCase(Locale.ROOT);
+        return l.equals("RECORD") || l.equals("INPUT") || l.equals("CAPTURE")
+                || l.startsWith("MMAP");
+    }
 
     /** "    153    1   17432      0  root" */
     private static final Pattern REF_ROW = Pattern.compile(
@@ -123,12 +158,55 @@ public final class DumpsysParser {
         boolean expectState = false;
         boolean effectEnabled = false;
         boolean inEffect = false;
+        // Thread section tracking: once a thread header has been seen, track rows are only
+        // accepted inside an output thread section. Before any header (ROMs whose dump has no
+        // thread headers at all) the legacy behaviour keeps working, so an unknown format can
+        // never silently produce zero sessions.
+        boolean sawThreadHeader = false;
+        int threadKind = THREAD_UNKNOWN;
 
         for (int i = 0; i < lines.length; i++) {
             String line = lines[i];
             String trimmed = line.trim();
             if (trimmed.length() == 0) {
                 continue;
+            }
+
+            // ---- thread section tracking -----------------------------------
+            Matcher thm = THREAD_HEADER.matcher(line);
+            if (thm.find()) {
+                sawThreadHeader = true;
+                String keyword = thm.group(1).toLowerCase(Locale.ROOT);
+                boolean outputKeyword = keyword.equals("output") || keyword.equals("mixer")
+                        || keyword.equals("playback") || keyword.equals("direct")
+                        || keyword.equals("duplicate") || keyword.equals("duplicating")
+                        || keyword.equals("offload");
+                threadKind = outputKeyword ? THREAD_OUTPUT : THREAD_NOT_OUTPUT;
+                // The type annotation can override the keyword (defence against ROMs whose
+                // header wording differs): "type 3 (RECORD)" is an input thread even when the
+                // header keyword was not recognised here.
+                Matcher tym = TYPE_ANNOTATION.matcher(trimmed);
+                if (tym.find()) {
+                    String label = tym.group(2);
+                    if (label != null) {
+                        threadKind = isInputTypeLabel(label)
+                                ? THREAD_NOT_OUTPUT : THREAD_OUTPUT;
+                    }
+                }
+                continue;
+            }
+            if (sawThreadHeader && threadKind != THREAD_OUTPUT) {
+                // A bare "type N (LABEL)" detail line can still flip the section to an output
+                // thread (older AOSP prints the type below the header); everything else in a
+                // non-output section is skipped.
+                Matcher tym = TYPE_ANNOTATION.matcher(trimmed);
+                if (tym.find() && tym.group(2) != null) {
+                    threadKind = isInputTypeLabel(tym.group(2))
+                            ? THREAD_NOT_OUTPUT : THREAD_OUTPUT;
+                }
+                if (threadKind != THREAD_OUTPUT) {
+                    continue;
+                }
             }
 
             // ---- "Global session refs" table -------------------------------
@@ -218,8 +296,15 @@ public final class DumpsysParser {
         finishEffect(sessions, chainSession, effectId, effectUuid, effectEnabled, inEffect);
 
         // ---- uid / owner name from the global session refs -----------------
+        // The refs table also lists recording sessions and stale refs of dead tracks; it must
+        // only enrich sessions that a live output track table (or a JamesDSP effect chain)
+        // already produced, never create new attachable ones. Otherwise every input session
+        // looked attachable and the watcher retried a doomed attach on every tick.
         for (Map.Entry<Integer, List<SessionRef>> e : refs.entrySet()) {
-            SessionInfo info = session(sessions, e.getKey().intValue());
+            SessionInfo info = sessions.get(e.getKey());
+            if (info == null) {
+                continue;
+            }
             SessionRef best = pickRef(e.getValue(), info.pid);
             if (best != null) {
                 info.uid = best.uid;

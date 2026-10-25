@@ -88,6 +88,15 @@ public final class SessionWatcher {
     private volatile int stormDeaths;
     /** Worker pool for the per-session attach tasks (bounded, shared with EffectManager). */
     private final java.util.concurrent.ExecutorService attachPool = EffectManager.sharedPool();
+    /**
+     * Sessions whose parallel attach task has been submitted and has not finished yet. While the
+     * marker is set, the reconcile pass must not take the "already attached" re-enable path
+     * (applyAll + setEnabled): the attach task itself replays the parameters right after
+     * publishing the handle, and a watcher tick slipping in between the two otherwise repeats
+     * the whole replay (harmless - every write is idempotent - but pointless work and duplicate
+     * log lines).
+     */
+    private final Set<Integer> attachInFlight = new HashSet<Integer>();
 
     public SessionWatcher(ConfigStore config, PolicyEngine policy, EffectManager effects,
                           ParamBus bus) {
@@ -435,6 +444,7 @@ public final class SessionWatcher {
                     // never blocks on audioserver.
                     final SessionInfo taskSession = s;
                     final PolicyEngine.Decision taskDecision = d;
+                    markAttachInFlight(s.sessionId);
                     attachTasks.add(new Runnable() {
                         @Override
                         public void run() {
@@ -442,6 +452,11 @@ public final class SessionWatcher {
                         }
                     });
                 } else {
+                    // The attach task is still running (handle published, replay pending):
+                    // skip the re-enable path entirely, the task applies and enables.
+                    if (isAttachInFlight(s.sessionId)) {
+                        continue;
+                    }
                     effects.setOwner(s.sessionId, s.uid, s.pkg, s.pid);
                     // Idempotence rule: the framework is only called when the enable state
                     // really changes (a redundant setEnabled() per tick reaches the audio HAL
@@ -490,18 +505,45 @@ public final class SessionWatcher {
         }
     }
 
+    /** Marks a session's attach as in flight (package private, host tested). */
+    void markAttachInFlight(int sessionId) {
+        synchronized (attachInFlight) {
+            attachInFlight.add(Integer.valueOf(sessionId));
+        }
+    }
+
+    /** Clears the in-flight marker when the attach task finished (package private). */
+    void clearAttachInFlight(int sessionId) {
+        synchronized (attachInFlight) {
+            attachInFlight.remove(Integer.valueOf(sessionId));
+        }
+    }
+
+    /** True while the parallel attach task of this session has not finished yet. */
+    boolean isAttachInFlight(int sessionId) {
+        synchronized (attachInFlight) {
+            return attachInFlight.contains(Integer.valueOf(sessionId));
+        }
+    }
+
     /** One session's attach work (runs on the shared pool): create, replay, enable. */
-    private void attachSession(SessionInfo s, PolicyEngine.Decision d) {
-        int rc = effects.attach(s.sessionId, s.effectId);
-        if (rc == EffectManager.OK) {
-            effects.setOwner(s.sessionId, s.uid, s.pkg, s.pid);
-            bus.applyAll(s.sessionId, d.params);
-            effects.setEnabled(s.sessionId, true);
-            Log.i("attached session=" + s.sessionId + " uid=" + s.uid
-                    + " pkg=" + s.pkg + " (" + d.reason + ")");
-        } else if (rc != EffectManager.ERR_BUSY) {
-            // BUSY means another task is already attaching this session: silent, it will be.
-            Log.w("attach session=" + s.sessionId + " failed rc=" + rc);
+    void attachSession(SessionInfo s, PolicyEngine.Decision d) {
+        try {
+            int rc = effects.attach(s.sessionId, s.effectId);
+            if (rc == EffectManager.OK) {
+                effects.setOwner(s.sessionId, s.uid, s.pkg, s.pid);
+                bus.applyAll(s.sessionId, d.params);
+                effects.setEnabled(s.sessionId, true);
+                Log.i("attached session=" + s.sessionId + " uid=" + s.uid
+                        + " pkg=" + s.pkg + " (" + d.reason + ")");
+            } else if (rc != EffectManager.ERR_BUSY) {
+                // BUSY means another task is already attaching this session: silent, it will be.
+                Log.w("attach session=" + s.sessionId + " failed rc=" + rc);
+            }
+        } finally {
+            // The in-flight marker must go away whatever the outcome, otherwise the reconcile
+            // pass would skip this session's re-enable path forever.
+            clearAttachInFlight(s.sessionId);
         }
     }
 

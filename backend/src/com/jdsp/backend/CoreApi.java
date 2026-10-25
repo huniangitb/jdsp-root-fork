@@ -54,6 +54,32 @@ public final class CoreApi {
     private volatile ShutdownHook shutdownHook;
     /** Rate limits the global master switch (see {@link EnableSwitch}). */
     private final EnableSwitch enableSwitch = new EnableSwitch();
+    /**
+     * Background persist for the hot parameter path. A config save is an atomic write
+     * (tmp + fsync + rename, plus the mode mirror) and one fsync on /data/adb costs 35-50 ms
+     * on the target device: performed inline by {@link #setParam} it was exactly the burst
+     * tail latency (p95 ~50 ms at 100 writes/s - the ~5 saves/s landed on ~5% of the requests).
+     * The save still happens at most once per throttle interval (the interval itself is the
+     * "落盘去抖" that keeps a slider drag from fsyncing per event), it just no longer blocks
+     * the caller; the watcher tick's saveIfDirty stays as the safety net.
+     */
+    private final AsyncPersister persister = new AsyncPersister(new Runnable() {
+        @Override
+        public void run() {
+            long t0 = System.currentTimeMillis();
+            try {
+                config.saveThrottled(200L);
+            } catch (Throwable t) {
+                Log.e("async config persist failed", t);
+            }
+            long took = System.currentTimeMillis() - t0;
+            if (took >= 20L) {
+                // One line per slow save (at most 5/s by the throttle): makes the flash
+                // cost visible without ever spamming the log.
+                Log.i("config saved in background in " + took + " ms");
+            }
+        }
+    });
     private volatile String instanceLockFile = "";
     private volatile long instanceStartedAt;
     private volatile boolean binderPublished;
@@ -318,8 +344,10 @@ public final class CoreApi {
             // own per app parameters or an explicit policy entry.
             config.setParamFor(pkg, paramId, value);
             // Visible on disk almost immediately, but throttled so a slider drag does not fsync
-            // on every event; anything throttled here is flushed by the next watcher tick.
-            config.saveThrottled(200L);
+            // on every event - and, since the async persist, never on the caller's thread
+            // (one fsync on /data/adb is 35-50 ms, which used to be the burst p95). Anything
+            // throttled here is flushed by the next watcher tick.
+            persister.request();
         }
         return status;
     }

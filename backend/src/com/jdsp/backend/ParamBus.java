@@ -25,6 +25,13 @@ import java.util.concurrent.TimeUnit;
 public final class ParamBus {
     /** Coalescing window. */
     public static final long BATCH_MS = 2L;
+    /**
+     * Window in which repeated applyAll logs of one session are collapsed into the first one.
+     * A watcher tick that slips in between the parallel attach task's handle publication and
+     * its applyAll replays the parameters a second time (harmless, every write is idempotent),
+     * but the identical "applyAll session=X: N parameter(s) applied" lines spammed the log.
+     */
+    public static final long LOG_DEDUP_MS = 2000L;
     /** Parameter ids that must never be merged or reordered. */
     private static final int[] NO_COALESCE = {
             8888, 9999, 12000, 12001, 10004, 10006, 10009, 10010, 25000, 25001, 25002, 25003
@@ -71,6 +78,32 @@ public final class ParamBus {
     private final Map<String, byte[]> lastValues = new LinkedHashMap<String, byte[]>();
     private final Stats stats = new Stats();
     private ScheduledFuture<?> flushTask;
+    /** sessionId -> wall clock of the last applyAll log line (log dedup, see LOG_DEDUP_MS). */
+    private final Map<Integer, Long> lastApplyLog = new LinkedHashMap<Integer, Long>();
+
+    /**
+     * Pure decision helper for the applyAll log dedup (host-testable): the second and later
+     * applyAll of the same session within {@link #LOG_DEDUP_MS} stay silent.
+     */
+    static boolean applyLogAllowed(Long lastLoggedAt, long now) {
+        return lastLoggedAt == null || now - lastLoggedAt.longValue() >= LOG_DEDUP_MS;
+    }
+
+    /** True (and records the stamp) when this session's applyAll may log right now. */
+    private boolean markApplyLog(int sessionId, long now) {
+        Integer key = Integer.valueOf(sessionId);
+        synchronized (lastApplyLog) {
+            if (lastApplyLog.size() > 256) {
+                lastApplyLog.clear();
+            }
+            Long last = lastApplyLog.get(key);
+            if (!applyLogAllowed(last, now)) {
+                return false;
+            }
+            lastApplyLog.put(key, Long.valueOf(now));
+            return true;
+        }
+    }
 
     public ParamBus(EffectManager effects) {
         this.effects = effects;
@@ -206,10 +239,14 @@ public final class ParamBus {
         synchronized (stats) {
             stats.bulkApplied += ok;
         }
-        if (failed > 0) {
-            Log.w("applyAll session=" + sessionId + ": " + ok + " ok, " + failed + " failed");
-        } else {
-            Log.i("applyAll session=" + sessionId + ": " + ok + " parameter(s) applied");
+        // The application itself is NOT deduplicated (it must stay exactly as before); only the
+        // log line of a repeated applyAll within the window is dropped.
+        if (markApplyLog(sessionId, System.currentTimeMillis())) {
+            if (failed > 0) {
+                Log.w("applyAll session=" + sessionId + ": " + ok + " ok, " + failed + " failed");
+            } else {
+                Log.i("applyAll session=" + sessionId + ": " + ok + " parameter(s) applied");
+            }
         }
         return ok;
     }

@@ -16,6 +16,9 @@ public final class AllTests {
         com.jdsp.backend.EffectManagerDetachTest.run(suite);
         com.jdsp.backend.AttachDebounceTest.run(suite);
         com.jdsp.backend.EffectManagerParallelTest.run(suite);
+        com.jdsp.backend.DumpsysParserTest.run(suite);
+        com.jdsp.backend.ApplyAllDedupTest.run(suite);
+        com.jdsp.backend.AsyncPersisterTest.run(suite);
         ParserTest.run(suite);
         ValueCodecTest.run(suite);
         FormatTest.run(suite);
