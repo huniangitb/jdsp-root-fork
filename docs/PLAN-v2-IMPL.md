@@ -281,3 +281,60 @@ App 敞开，**不采纳**。
 2. 补 P5 第二阶段：让后端提供 19998/20001/20002，或改造 App 读侧走 `dumpConfig`
 3. 跑 72 h 长稳（可后台）
 4. 接入第三台设备补 P6
+
+---
+
+## 11. 2026-10-25 下午：路线切换 smali 补丁 → App 源码直改（终态架构）
+
+### 11.1 路线变更的原因
+
+phase3 smali 补丁路线在真机暴露三类不可修（或修起来比换路更贵）的问题：
+
+1. **补丁插错分支**：`PreferenceManager.getSharedPreferences()` 的第一个 `return-object v0`
+   是 "dataStore != null → return null" 的早退分支，wrap 被插在那里且入参为 null，任何路径都不生效；
+2. **App 主界面的读值路径根本不走 androidx PreferenceManager**，而是它自己的
+   `PreferenceCache$Companion.getPreferences()`（直调 `Context.getSharedPreferences`）——
+   需要第二处补丁；Kotlin 编译器复用参数寄存器（p2 先被 null-check 消息覆盖）还需手工备份 namespace；
+3. **UI 主线程严禁 socket**（`NetworkOnMainThreadException`，loopback 也不例外，系统强制），
+   smali 层无法优雅地把同步读改成后台快照。
+
+而 `/home/bdy/work/loundess_git` 就是 App 完整源码（rootlessjamesdsp fork，v1.6.15-58，
+与预编译 APK 同基线）——直接改源码 + gradle 构建 + 原 keystore 重签，一步到位。
+
+### 11.2 终态架构（用户 2026-10-25 逐条确认）
+
+1. **App 零 AudioEffect 对象**：`JamesDspRemoteEngine.effect` 换成 `JdspParamSink`
+   （方法面与 `AudioEffectHidden` 一致、字节编码逐字节相同），写全走 `JdspBridge`（TCP→jdspd）。
+   设备实测：dumpsys audio_flinger 全部 effect owner/client 中 App pid **0 命中**。
+2. **配置只存后端**：读走 `PreferenceDataStore`（androidx 官方替换点，`PreferenceGroupFragment`
+   注入）→ `JdspBackendSharedPreferences` → 后端 `dumpConfig` 内存快照（后台线程刷新，
+   冷启 Application.onCreate 预热，UI 首帧最多自旋等 200ms）；
+   写直达 `submitParam` → jdspd `config.json`（本地 SharedPreferences 退役，sync 全量链移除）。
+3. **浮层权限（SYSTEM_ALERT_WINDOW）申请逻辑已删**（MainActivity.onResume 的引导跳转 +
+   Onboarding 的 Shizuku 授予）：App 只在自己 UI 显示，无申请必要。
+4. **引擎写锁（纵深防御，已实现待修）**：native 补丁 `0002-engine-write-lock`
+   （解锁参数 0x7A00 + 32 字节 key，key 由 jdspd 生成并镜像到
+   `/data/vendor/audio/jamesdsp_engine.key`，复用现有 vendor_audio_data_file 标签，零新增 SELinux 规则）。
+   **Android 16 实测阻塞点**：引擎侧解锁成功（"instance unlocked by daemon" 日志、写窗口实际打开），
+   但解锁命令的返回值在 framework 层（AudioFlinger/AudioEffect 链）被改写为 -1，daemon
+   不信任 → 所有参数写被自身 gate 拦截。**当前设备已回滚到无锁引擎**（so `b6e1fc1f` +
+   dex `691a6dbd`），写锁代码保留在工作区（`native/patches/0002-*`、
+   `backend/.../EngineWriteKey|EngineUnlockGate`、192/0 单测），待查清 framework 返回值路径后启用。
+   在此之前，隔离靠第 1 条（App 物理无引擎 API）已成立。
+
+### 11.3 已确证的验收数据（源码版 App，设备 64a4bad0）
+
+| 项 | 结果 |
+|---|---|
+| verify-signal.sh（源码版 v1 `ab259a46`） | **13 passed / 0 failed**（postGain +12dB → 电平 12.00dB，恢复 0.00dB，underrun 0） |
+| 读侧后端权威（v2 `e999dd94`） | CLI 改后端 1500 = (-2.0, 25.0, 1.5) → 冷启 UI 显示 **-2.00dB / 25.00ms / 1.50dB**，本地 xml 仍旧值；冷启 sync 读后端快照原样发回，不再覆盖 |
+| 浮层引导 | v2 冷启直接 MainActivity 聚焦，不再弹 OverlaySettingsActivity |
+| 高频提交（用户快速拖滑条场景） | `scripts/bench-burst.py`：2000 条连续变值 100% 受理、最终值精确匹配（保序）、放音中 underruns=0；设备内单条 ~1.3–2ms（adb forward 链路 p50 10ms 是 USB 抖动，App 不经过） |
+| 降级 | 杀 jdspd 后 App 存活（回落本地首帧显示） |
+
+### 11.4 遗留问题
+
+1. **App 侧稳态 ~85/s 的无意义提交**（v2 实测 30s +2558；音效面无影响）——
+   嫌疑：协程周期任务触发参数下发 / sync 全量链。终态改造（写直达、sync 退役）中一并处理。
+2. 写锁 framework 返回值问题（§11.2.4）。
+3. 72h soak 未起（等终态 APK）；PLAN-v2 P6 第三台设备仍未接入。
