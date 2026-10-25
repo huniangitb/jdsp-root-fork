@@ -53,6 +53,11 @@ $CC -std=gnu99 -O1 -g -Wall -Wextra -Wno-unused-parameter -I"$SRC" \
     "$ROOT/test/test_paramq.c" "$SRC/jdsp_paramq.c" -o "$OUT/test_paramq" -lpthread
 "$OUT/test_paramq"
 
+echo "== build test_accum (ACCESS_ACCUMULATE helper, 0005)"
+$CC -std=gnu99 -O1 -g -Wall -Wextra -Wno-unused-parameter -I"$SRC" \
+    "$ROOT/test/test_accum.c" "$SRC/jdsp_accum.c" -o "$OUT/test_accum"
+"$OUT/test_accum"
+
 echo "== build test_async_save (debounced writer thread, 0004)"
 $CC -std=gnu99 -O1 -g -Wall -Wextra -Wno-unused-parameter -I"$SRC" \
     "$ROOT/test/test_async_save.c" "$SRC/jdsp_state.c" -o "$OUT/test_async_save" -lpthread

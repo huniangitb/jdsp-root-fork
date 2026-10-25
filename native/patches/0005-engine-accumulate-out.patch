@@ -1,0 +1,360 @@
+From: JamesDSP root fork - 0005
+Subject: [PATCH 0005] engine: honour EFFECT_BUFFER_ACCESS_ACCUMULATE on the
+ process output buffer
+
+Root cause of the "session-level JamesDSP chain mutes the output" family on
+ROMs whose AudioFlinger gives session effects a real output buffer mapping
+(measured on MTK HyperOS / Android 15, xaga):
+
+AudioFlinger configures an effect with EFFECT_BUFFER_ACCESS_ACCUMULATE
+whenever its input and output buffers differ (EffectModule::
+requiredEffectBufferAccessMode).  For a per-session chain the output buffer
+maps the output thread's shared mix, which already carries the contribution
+of every other track and chain of that thread.  The contract is therefore
+"ADD your rendered output to the out buffer"; all process paths of this
+engine stored over it instead.  Consequences on xaga (all reproduced and
+instrumented):
+
+  - one enabled JamesDSP instance mounted on ANY session whose track
+    delivers pure digital silence replaced the shared mix with silence:
+    the whole output thread went mute ("threadLoop_write write muted data
+    to hw") and stayed mute while the chain existed;
+  - with several mounted instances only the last processed chain's audio
+    survived (the earlier chains' contributions were overwritten);
+  - single-session playback kept working because the chain input and
+    output buffers alias there (ACCESS_WRITE, in-place transform).
+
+Vendor insert effects mounted the same way (MiSound) accumulate and are
+unaffected, which is what kept system effects working on the same ROM.
+
+The fix renders into a private per-engine scratch buffer and adds the
+result to the out buffer (saturating for int16/int32/int8_24), keeping the
+historical replace behaviour for aliased buffers (ACCESS_WRITE), for
+packed 24 bit, and when the scratch cannot be provided.  The engine-swap
+crossfade path stops rendering into the shared buffer as well: it
+crossfades the two engines' private outputs and adds the result.
+
+Host tests: test_accum.c covers the accumulator modes and fallbacks;
+native/test/run_tests.sh stays green.
+---
+--- a/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c
++++ b/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c
+@@ -23,6 +23,7 @@
+ #include "jdsp_state.h"
+ #include "jdsp_writelock.h"
+ #include "jdsp_paramq.h"
++#include "jdsp_accum.h"
+ typedef struct
+ {
+ 	unsigned long long initializeForFirst;
+@@ -32,6 +33,17 @@
+ 	JamesDSPLib jdsp;
+     float mSamplingRate;
+     int formatFloatModeInt32Mode;
++	/* 0005: the framework configures this instance with
++	 * EFFECT_BUFFER_ACCESS_ACCUMULATE whenever its input and output buffers
++	 * differ (per-session chain whose output buffer maps the shared mix).
++	 * The process paths must then ADD their output to the out buffer instead
++	 * of replacing it; see EffectDSPMainProcess. */
++	int outAccumulate;
++	/* 0005: private render target for the accumulate path, byte scratch large
++	 * enough for one buffer of any supported stereo format (int32 is the
++	 * widest).  Allocated in the constructor, grown on demand. */
++	void *accScratch;
++	size_t accScratchFrames;
+ 	char *stringEq;
+ 	float *tempImpulseIncoming;
+ 	float drcAtkRel[4];
+@@ -115,6 +127,13 @@
+ 	JamesDSPInit(&dspmain->jdsp, 128, 48000.0f);
+ 	peq_cascade_init(&dspmain->peq);
+ 	loudness_init(&dspmain->loudness);
++	/* 0005: preallocate the accumulate scratch (4096 frames, 32 KB, int32
++	 * sized so every format fits).  If this fails the process path will try
++	 * to grow it on demand; if that fails too it falls back to the
++	 * historical replace behaviour (never worse than 0004). */
++	dspmain->outAccumulate = 0;
++	dspmain->accScratchFrames = 4096u;
++	dspmain->accScratch = malloc(dspmain->accScratchFrames * 2u * sizeof(int32_t));
+ 	/* 0004: preallocate the PEQ/loudness scratch (32 KB).  If this fails the
+ 	 * process path will try to grow it on demand. */
+ 	dspmain->peqScratchSamples = 8192u;
+@@ -122,6 +141,8 @@
+ }
+ void EffectDSPMainDestructor(EffectDSPMain *dspmain)
+ {
++	free(dspmain->accScratch);
++	dspmain->accScratch = NULL;
+ 	free(dspmain->peqScratch);
+ 	dspmain->peqScratch = NULL;
+ 	dspmain->peqScratchSamples = 0;
+@@ -208,7 +229,13 @@
+ 	LOGW("I/O FMT = { %u, %u }", in.format, out.format);
+ #endif
+     if (out.mask & EFFECT_CONFIG_ACC_MODE)
++    {
+         *mAccessMode = (effect_buffer_access_e) out.accessMode;
++        /* 0005: remember the framework's access mode.  ACCUMULATE means the
++         * out buffer is shared (it maps the thread's mix) and the process
++         * paths must add to it instead of replacing its content. */
++        dspmain->outAccumulate = (out.accessMode == EFFECT_BUFFER_ACCESS_ACCUMULATE);
++    }
+     return 0;
+ }
+ int32_t EffectDSPMainCommand(EffectDSPMain *dspmain, uint32_t cmdCode, uint32_t cmdSize, void* pCmdData, uint32_t* replySize, void* pReplyData)
+@@ -1108,7 +1135,10 @@
+     return 0;
+ }
+ 
+-int32_t EffectDSPMainProcess(EffectDSPMain *dspmain, audio_buffer_t *in, audio_buffer_t *out)
++/* 0005: replace-semantics render, the historical EffectDSPMainProcess body.
++ * Writes the rendered (and PEQ/loudness corrected) output over whatever the
++ * out buffer holds. */
++static int32_t EffectDSPMainRender(EffectDSPMain *dspmain, audio_buffer_t *in, audio_buffer_t *out)
+ {
+ 	size_t actualFrameCount = in->frameCount;
+ 	switch (dspmain->formatFloatModeInt32Mode)
+@@ -1221,6 +1251,68 @@
+ 	return 0;
+ }
+ 
++/* 0005: framework entry.  When the framework configured this instance with
++ * EFFECT_BUFFER_ACCESS_ACCUMULATE (it does that whenever the effect's input
++ * and output buffers differ - for a per-session chain the output buffer maps
++ * the output thread's shared mix, which already carries the contribution of
++ * the other tracks and chains), the rendered output must be ADDED to the out
++ * buffer.  Every render path of this engine stores its samples instead,
++ * which on such ROMs wipes the shared mix: a single enabled instance mounted
++ * on a session whose track delivers pure silence zeroed the whole output
++ * thread ("threadLoop_write write muted data to hw"), and with several
++ * mounted instances only the last processed chain stayed audible.
++ *
++ * The render therefore goes into a private scratch buffer first and is added
++ * to the out buffer afterwards (saturating for the integer formats).  When
++ * the buffers alias, or the framework asked for plain ACCESS_WRITE, or the
++ * scratch cannot be provided, the historical replace behaviour is kept - it
++ * is the correct contract for an aliased in/out pair.  Packed 24 bit has no
++ * accumulator and keeps the historical behaviour (a format no HAL here uses
++ * for effect chains). */
++int32_t EffectDSPMainProcess(EffectDSPMain *dspmain, audio_buffer_t *in, audio_buffer_t *out)
++{
++	size_t frames = in->frameCount;
++	int accumulate = dspmain->outAccumulate && frames > 0u && out->raw != in->raw
++		&& dspmain->formatFloatModeInt32Mode != JDSP_ACCUM_MODE_PACKED24;
++	audio_buffer_t renderBuf;
++
++	if (accumulate)
++	{
++		size_t needBytes = frames * 2u * sizeof(int32_t);
++		if (dspmain->accScratch == NULL || dspmain->accScratchFrames < frames)
++		{
++			size_t wantBytes = dspmain->accScratchFrames * 2u * sizeof(int32_t);
++			void *grown;
++			if (wantBytes < needBytes)
++				wantBytes = needBytes;
++			grown = realloc(dspmain->accScratch, wantBytes);
++			if (grown != NULL)
++			{
++				dspmain->accScratch = grown;
++				dspmain->accScratchFrames = wantBytes / (2u * sizeof(int32_t));
++			}
++			else
++			{
++				accumulate = 0; /* OOM: keep the historical replace behaviour */
++			}
++		}
++	}
++	if (accumulate)
++	{
++		renderBuf = *out;
++		renderBuf.raw = dspmain->accScratch;
++		renderBuf.frameCount = frames;
++		EffectDSPMainRender(dspmain, in, &renderBuf);
++		if (jdsp_accum_add(out->raw, dspmain->accScratch, frames,
++			dspmain->formatFloatModeInt32Mode) != 0)
++		{
++			/* unreachable for the modes accepted above; replace is the only
++			 * possible fallback and matches the historical behaviour */
++		}
++		return 0;
++	}
++	return EffectDSPMainRender(dspmain, in, out);
++}
+ // Effect section end
+ static effect_descriptor_t jamesdsp_descriptor =
+ {
+@@ -1329,6 +1421,10 @@
+ 	{
+ 		eng->mSamplingRate = like->mSamplingRate;
+ 		eng->formatFloatModeInt32Mode = like->formatFloatModeInt32Mode;
++		/* 0005: the replacement engine must keep rendering with the access
++		 * mode the framework last configured; it is not re-sent after a
++		 * builder swap. */
++		eng->outAccumulate = like->outAccumulate;
+ 		if (like->mSamplingRate > 0.0f)
+ 			JamesDSPSetSampleRate(&eng->jdsp, like->mSamplingRate, 0);
+ 	}
+@@ -1535,18 +1631,28 @@
+ 		 * rendering (draining into the retiring one would lose values whose
+ 		 * store record the fresh engine predates). */
+ 		jdsp_paramq_drain(&e->pq, fresh, jdsp_apply_deferred_param);
+-		if (old != NULL && frames > 0u && need <= e->xscratch_bytes)
++		if (old != NULL && frames > 0u && need <= e->xscratch_bytes
++			&& fresh->accScratch != NULL && fresh->accScratchFrames >= frames)
+ 		{
+-			audio_buffer_t scratch = *in;
++			/* 0005: crossfade the two engines' own outputs in private buffers
++			 * and add the crossfaded result to the shared out buffer, instead
++			 * of rendering into it (the old code crossfaded in place and
++			 * replaced the shared mix content; see EffectDSPMainProcess). */
++			audio_buffer_t oldBuf = *in;
++			audio_buffer_t newBuf = *in;
+ 			int32_t rc_new;
+ 
+-			scratch.raw = e->xscratch;
+-			scratch.frameCount = frames;
+-			(void)EffectDSPMainProcess(old, in, &scratch);
+-			rc_new = EffectDSPMainProcess(fresh, in, out);
+-			jdsp_crossfade(out, &scratch, frames, mode);
++			oldBuf.raw = e->xscratch;
++			oldBuf.frameCount = frames;
++			newBuf.raw = fresh->accScratch;
++			newBuf.frameCount = frames;
++			(void)EffectDSPMainRender(old, in, &oldBuf);
++			EffectDSPMainRender(fresh, in, &newBuf);
++			jdsp_crossfade(&oldBuf, &newBuf, frames, mode);
++			rc_new = jdsp_accum_add(out->raw, e->xscratch, frames,
++				fresh->formatFloatModeInt32Mode);
+ 			jdsp_retire_push(old);
+-			return rc_new;
++			return rc_new == 0 ? 0 : rc_new;
+ 		}
+ 		if (old != NULL)
+ 			jdsp_retire_push(old);
+--- /dev/null
++++ b/Main/libjamesdsp/jni/jamesdsp/jdsp_accum.c
+@@ -0,0 +1,84 @@
++/*
++ * jdsp_accum.c - ACCESS_ACCUMULATE support for the JamesDSP effect library.
++ *
++ * Why this exists (0005): when AudioFlinger mounts a session effect whose
++ * input and output buffers differ (a per-session chain whose output buffer
++ * maps the output thread's shared mix), it configures the effect with
++ * EFFECT_BUFFER_ACCESS_ACCUMULATE.  The contract (frameworks/av
++ * services/audioflinger Effects.h, EffectModule::requiredEffectBufferAccessMode)
++ * is that the effect ADDS its rendered output to the existing content of the
++ * output buffer, because that buffer already carries the contribution of the
++ * other tracks and effect chains of the thread.
++ *
++ * Every process path of this engine used to write its output with plain
++ * stores.  On stock AudioFlinger where the chain output buffer aliases the
++ * chain input buffer that went unnoticed (replace == in-place transform), but
++ * on ROMs that give the effect a real output mapping (measured: MTK HyperOS
++ * Android 15, "Out(0x...) -> <main mix>") the store wiped the shared mix:
++ * one enabled JamesDSP instance on any session - even on a session whose
++ * track delivers pure digital silence - muted the whole output thread, and
++ * with several instances only the last processed chain stayed audible.
++ */
++#include "jdsp_accum.h"
++
++#include <stdint.h>
++
++static int32_t clamp_i32(int64_t v)
++{
++	if (v > INT32_MAX)
++		return INT32_MAX;
++	if (v < INT32_MIN)
++		return INT32_MIN;
++	return (int32_t)v;
++}
++
++int jdsp_accum_add(void *dst, const void *src, size_t frames, int mode)
++{
++	size_t i;
++	size_t n;
++
++	if (dst == NULL || src == NULL || frames == 0)
++		return -1;
++
++	/* stereo interleaved */
++	n = frames * 2u;
++
++	switch (mode)
++	{
++	case JDSP_ACCUM_MODE_INT16:
++		{
++			int16_t *d = (int16_t *)dst;
++			const int16_t *s = (const int16_t *)src;
++			for (i = 0; i < n; i++)
++			{
++				int32_t v = (int32_t)d[i] + (int32_t)s[i];
++				if (v > 32767)
++					v = 32767;
++				else if (v < -32768)
++					v = -32768;
++				d[i] = (int16_t)v;
++			}
++		}
++		break;
++	case JDSP_ACCUM_MODE_FLOAT:
++		{
++			float *d = (float *)dst;
++			const float *s = (const float *)src;
++			for (i = 0; i < n; i++)
++				d[i] += s[i];
++		}
++		break;
++	case JDSP_ACCUM_MODE_INT32:
++	case JDSP_ACCUM_MODE_INT8_24:
++		{
++			int32_t *d = (int32_t *)dst;
++			const int32_t *s = (const int32_t *)src;
++			for (i = 0; i < n; i++)
++				d[i] = clamp_i32((int64_t)d[i] + (int64_t)s[i]);
++		}
++		break;
++	default: /* packed 24 bit: not supported, caller keeps replace behaviour */
++		return -1;
++	}
++	return 0;
++}
+--- /dev/null
++++ b/Main/libjamesdsp/jni/jamesdsp/jdsp_accum.h
+@@ -0,0 +1,37 @@
++/*
++ * jdsp_accum.h - ACCESS_ACCUMULATE support for the JamesDSP effect library.
++ *
++ * See jdsp_accum.c for the rationale; 0005-engine-accumulate-out.patch is the
++ * complete story.
++ */
++#ifndef JDSP_ACCUM_H
++#define JDSP_ACCUM_H
++
++#include <stddef.h>
++
++/*
++ * Mode constants mirror the formatFloatModeInt32Mode encoding used by
++ * jamesdsp.c's process dispatch (derived from the SET_CONFIG format):
++ *   0 = int16 stereo interleaved
++ *   1 = float32 stereo interleaved
++ *   2 = int32 stereo interleaved (32 bit)
++ *   3 = packed 24 bit (not supported by the accumulator)
++ *   4 = int8_24 stereo interleaved (24 bit payload in the high bits of an
++ *       int32, same width as mode 2)
++ */
++#define JDSP_ACCUM_MODE_INT16    0
++#define JDSP_ACCUM_MODE_FLOAT    1
++#define JDSP_ACCUM_MODE_INT32    2
++#define JDSP_ACCUM_MODE_PACKED24 3
++#define JDSP_ACCUM_MODE_INT8_24  4
++
++/*
++ * Adds `frames` stereo interleaved frames of `src` (the freshly rendered
++ * effect output) into `dst` (the buffer the framework handed to the effect as
++ * its output), saturating for the integer formats.  Returns 0 on success and
++ * -1 when `mode` is not supported (the caller must then keep its historical
++ * replace behaviour).
++ */
++int jdsp_accum_add(void *dst, const void *src, size_t frames, int mode);
++
++#endif /* JDSP_ACCUM_H */
