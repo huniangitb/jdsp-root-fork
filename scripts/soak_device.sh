@@ -14,20 +14,26 @@ TONE_DEX=/data/local/tmp/jdsp-signal/tone.dex
 CLI="CLASSPATH=/data/adb/modules/ainur_jamesdsp/backend/jdspcli.dex app_process /system/bin com.jdsp.cli.Main"
 INTERVAL=${SOAK_INTERVAL_S:-600}
 HOURS=${SOAK_HOURS:-72}
+# SOAK_SECONDS 优先（$(( )) 不支持浮点，短窗口干跑用秒更方便）
+if [ -n "${SOAK_SECONDS:-}" ]; then
+    TOTAL_S=$SOAK_SECONDS
+else
+    TOTAL_S=$(( HOURS * 3600 ))
+fi
 TONE_EVERY=$(( 6 * 3600 ))
 
 mkdir -p "$DIR"
 [ -f "$OUT" ] || echo "time\tprocs\tpid\tuptimeMs\twatcherFail\tsetParams\tparamErrors\tfatal\tanr\taudiotrackCrash\tlogTcpErr" > "$OUT"
 
 START=$(date +%s)
-END=$(( START + HOURS * 3600 ))
+END=$(( START + TOTAL_S ))
 LAST_TONE=0
 
 while [ "$(date +%s)" -lt "$END" ]; do
     NOW=$(date +%s)
 
-    PROCS=$(pgrep -f "nice-name=jdspd" 2>/dev/null | wc -l)
-    PID=$(pgrep -f "nice-name=jdspd" 2>/dev/null | head -1)
+    PROCS=$(pgrep -c jdspd 2>/dev/null || echo 0)
+    PID=$(pgrep jdspd 2>/dev/null | head -1)
     STATS=$(su -c "$CLI stats" 2>/dev/null)
     UPT=$(printf '%s' "$STATS" | grep -o '"uptimeMs":[0-9]*' | cut -d: -f2)
     WFAIL=$(printf '%s' "$STATS" | grep -o '"watcherFailures":[0-9]*' | cut -d: -f2)
