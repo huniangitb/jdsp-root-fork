@@ -1,0 +1,292 @@
+From: JamesDSP root fork - 0006
+Subject: [PATCH 0006] engine: async initial engine build on EffectCreate
+ (passthrough priming, builder swap-in)
+
+The user-reported symptom this patch addresses (xaga, MTK HyperOS / Android 15):
+"音效生效有延迟，需要等几秒才能生效" together with switch glitches that grow
+with the number of mounted sessions.
+
+Root cause: EffectCreate built the initial engine synchronously on the
+creating thread - an audioserver binder thread for a factory create.  The
+build is jdsp_engine_new() PLUS the full jdsp_state_replay() of the persisted
+state (26 recorded commands on this device), which includes the
+InterpolatingEq minimum-phase FFT design and the convolver/impulse reloads.
+Every attach of every session therefore stalled a binder thread of
+audioserver for the whole replay (60-230 ms measured per attach on xaga, and
+N sessions attach serially), and the same work re-ran inside the HAL for the
+watcher's re-attach bursts when the global switch went on.
+
+Change (bounded by the machinery 0003/0005 already put in place):
+
+  - EffectCreate publishes the instance *pristine* (a freshly constructed
+    engine, no replay) when state persistence is active, and the builder
+    thread builds its real engine and publishes it through the existing
+    `pending` swap (crossfaded at a buffer boundary by the 0005 accumulate
+    path).  Without persistence (jdsp_state_enabled() == 0) the historical
+    synchronous path is kept verbatim.
+
+  - A pristine instance renders a raw passthrough (jdsp_passthrough mirrors
+    the 0005 accumulate contract but copies the input instead of running the
+    zeroed DSP, whose postGain/limiter are still unset and would not be safe
+    to run).
+
+  - While pristine, chunked transfers (impulse/string "done" commands: the
+    heavy FFT/parsing work) are recorded to the state store and replied with
+    success instead of being executed inline on the command thread; the
+    builder's replay applies them for real.  Value parameters keep queuing
+    through the 0003 deferred queue and are drained into the builder's
+    engine at the swap.
+
+  - The generation bookkeeping keeps pristine instances stale
+    (jdsp_sync_generations and the command-path cur_gen bumps skip them), so
+    the first parameter burst of an attach can never leave an instance in
+    passthrough forever.
+
+  - The builder's staleness check treats stateReplayed == 0 (pristine) as
+    always stale; a successful build/replay sets stateReplayed = 1 (also set
+    by the synchronous fallback path, so the flag is meaningful with and
+    without persistence).
+
+Semantics kept unchanged: 0003 queue semantics, 0005 accumulate semantics,
+the write lock, and the recorded state format are untouched; a swap still
+crossfades exactly one buffer, and the previous engine is retired to the
+builder thread for teardown.
+---
+--- a/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c	2026-10-25 20:16:09.762342930 +0800
++++ b/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c	2026-10-25 21:23:19.753060812 +0800
+@@ -1251,6 +1251,66 @@
+ 	return 0;
+ }
+ 
++/* 0006: raw passthrough for a *pristine* instance (see EffectCreate).  Mirrors the
++ * accumulate structure of EffectDSPMainProcess but copies the input instead of
++ * rendering it, so an instance whose engine has not been built yet contributes
++ * exactly its own track to the mix (or passes it through unchanged for the
++ * aliased/replace case) instead of running a zeroed DSP. */
++static size_t jdsp_frame_bytes(int mode)
++{
++	switch (mode)
++	{
++	case 0:  return 2u * 2u;       /* int16 stereo */
++	case 1:  return 4u * 2u;       /* float */
++	case 2:  return 4u * 2u;       /* int32 */
++	case 3:  return 3u * 2u;       /* packed 24 bit */
++	case 4:  return 4u * 2u;       /* 8.24 */
++	default: return 2u * 2u;
++	}
++}
++
++static void jdsp_copy_interleaved(const void *src, void *dst, size_t frames, int mode)
++{
++	memcpy(dst, src, frames * jdsp_frame_bytes(mode));
++}
++
++static int32_t jdsp_passthrough(EffectDSPMain *dspmain, audio_buffer_t *in, audio_buffer_t *out)
++{
++	size_t frames = in->frameCount;
++	int mode = dspmain->formatFloatModeInt32Mode;
++	int accumulate = dspmain->outAccumulate && frames > 0u && out->raw != in->raw
++		&& mode != JDSP_ACCUM_MODE_PACKED24;
++	if (accumulate)
++	{
++		size_t needBytes = frames * 2u * sizeof(int32_t);
++		if (dspmain->accScratch == NULL || dspmain->accScratchFrames < frames)
++		{
++			size_t wantBytes = dspmain->accScratchFrames * 2u * sizeof(int32_t);
++			void *grown;
++			if (wantBytes < needBytes)
++				wantBytes = needBytes;
++			grown = realloc(dspmain->accScratch, wantBytes);
++			if (grown != NULL)
++			{
++				dspmain->accScratch = grown;
++				dspmain->accScratchFrames = wantBytes / (2u * sizeof(int32_t));
++			}
++			else
++			{
++				accumulate = 0;
++			}
++		}
++	}
++	if (accumulate)
++	{
++		jdsp_copy_interleaved(in->raw, dspmain->accScratch, frames, mode);
++		return jdsp_accum_add(out->raw, dspmain->accScratch, frames, mode);
++	}
++	if (out->raw != in->raw)
++		jdsp_copy_interleaved(in->raw, out->raw, frames, mode);
++	return 0;
++}
++
+ /* 0005: framework entry.  When the framework configured this instance with
+  * EFFECT_BUFFER_ACCESS_ACCUMULATE (it does that whenever the effect's input
+  * and output buffers differ - for a per-session chain the output buffer maps
+@@ -1268,9 +1328,15 @@
+  * scratch cannot be provided, the historical replace behaviour is kept - it
+  * is the correct contract for an aliased in/out pair.  Packed 24 bit has no
+  * accumulator and keeps the historical behaviour (a format no HAL here uses
+- * for effect chains). */
++ * for effect chains).
++ *
++ * 0006: when the instance is still pristine (its engine has not been built
++ * yet, see EffectCreate), the render is a raw passthrough instead - a zeroed
++ * engine would not be safe to run (postGain/limiter are still unset). */
+ int32_t EffectDSPMainProcess(EffectDSPMain *dspmain, audio_buffer_t *in, audio_buffer_t *out)
+ {
++	if (dspmain->stateReplayed == 0)
++		return jdsp_passthrough(dspmain, in, out);
+ 	size_t frames = in->frameCount;
+ 	int accumulate = dspmain->outAccumulate && frames > 0u && out->raw != in->raw
+ 		&& dspmain->formatFloatModeInt32Mode != JDSP_ACCUM_MODE_PACKED24;
+@@ -1502,7 +1568,11 @@
+ 			if (__atomic_load_n(&inst->pending, __ATOMIC_ACQUIRE) != NULL)
+ 				continue; /* the render thread has not picked the last one up yet */
+ 
+-			stale = (inst->cur_gen != gen) ||
++			/* 0006: a pristine instance (published by EffectCreate, never built)
++			 * is always stale: it must get its full replayed engine even when
++			 * the store generation has not moved since its creation. */
++			stale = (inst->cur == NULL) || (inst->cur->stateReplayed == 0) ||
++			        (inst->cur_gen != gen) ||
+ 			        (inst->cur != NULL && inst->cur->mSamplingRate != inst->built_fs);
+ 			if (!stale)
+ 				continue;
+@@ -1513,6 +1583,7 @@
+ 			/* Full apply, on this thread: the render callback never sees a
+ 			 * partially configured engine. */
+ 			jdsp_state_replay(fresh, jdsp_state_dispatch);
++			fresh->stateReplayed = 1;
+ 			inst->built_fs = fresh->mSamplingRate;
+ 			inst->cur_gen = gen;
+ 			__atomic_store_n(&inst->pending, fresh, __ATOMIC_RELEASE);
+@@ -1555,7 +1626,15 @@
+ 	struct effect_module_s *it;
+ 	pthread_mutex_lock(&g_inst_lock);
+ 	for (it = g_insts; it != NULL; it = it->next)
++	{
++		/* 0006: a pristine instance has not applied anything yet - it must stay
++		 * stale so the builder builds it.  Marking it current here (the daemon
++		 * delivers its first parameter burst right after create) would leave it
++		 * in passthrough forever. */
++		if (it->cur != NULL && it->cur->stateReplayed == 0)
++			continue;
+ 		it->cur_gen = gen;
++	}
+ 	pthread_mutex_unlock(&g_inst_lock);
+ }
+ 
+@@ -1646,7 +1725,13 @@
+ 			oldBuf.frameCount = frames;
+ 			newBuf.raw = fresh->accScratch;
+ 			newBuf.frameCount = frames;
+-			(void)EffectDSPMainRender(old, in, &oldBuf);
++			/* 0006: a pristine retiring engine has no built DSP - its
++			 * contribution to the crossfade is the raw input, not a zeroed
++			 * render. */
++			if (old->stateReplayed == 0)
++				jdsp_copy_interleaved(in->raw, oldBuf.raw, frames, mode);
++			else
++				(void)EffectDSPMainRender(old, in, &oldBuf);
+ 			EffectDSPMainRender(fresh, in, &newBuf);
+ 			jdsp_crossfade(&oldBuf, &newBuf, frames, mode);
+ 			rc_new = jdsp_accum_add(out->raw, e->xscratch, frames,
+@@ -1661,8 +1746,13 @@
+ 	{
+ 		/* Apply every parameter the command threads queued since the last
+ 		 * callback, before rendering: at this point the audio thread is the
+-		 * only user of e->cur, so the setters cannot race the render path. */
+-		jdsp_paramq_drain(&e->pq, e->cur, jdsp_apply_deferred_param);
++		 * only user of e->cur, so the setters cannot race the render path.
++		 * 0006: a pristine engine has nothing to apply to (and the setters
++		 * would start building DSP pieces on the audio thread) - the queued
++		 * values stay in the queue and are drained into the builder's engine
++		 * at the swap above. */
++		if (e->cur != NULL && e->cur->stateReplayed != 0)
++			jdsp_paramq_drain(&e->pq, e->cur, jdsp_apply_deferred_param);
+ 	}
+ 	return EffectDSPMainProcess(e->cur, in, out);
+ }
+@@ -1738,6 +1828,18 @@
+ 		}
+ 		if (cls == JDSP_PARAM_CLASS_INVALID)
+ 			return -1; /* same reply the engine handler gave for these before */
++		/* 0006: a pristine instance must not run the chunked-transfer work on
++		 * the command thread (the "done" commands do the impulse FFT reload and
++		 * the string parsing - exactly the stall the async create removes).
++		 * Record it so the builder's replay applies it for real, reply success
++		 * (the engine would have written status 0), and keep the instance stale. */
++		if (cls == JDSP_PARAM_CLASS_STREAM && e->cur->stateReplayed == 0)
++		{
++			if (pReplyData != NULL)
++				*(int32_t *)pReplyData = 0;
++			jdsp_state_record(cmdCode, cmdSize, pCmdData);
++			return 0;
++		}
+ 		/* JDSP_PARAM_CLASS_STREAM: fall through to the inline engine call. */
+ 	}
+ 	int32_t ret = EffectDSPMainCommand(e->cur, cmdCode, cmdSize, pCmdData, replySize, pReplyData);
+@@ -1762,15 +1864,21 @@
+ 					/* This instance applied it to its own engine already: mark the
+ 					 * generation as current so the builder does not rebuild it for a
+ 					 * change it has just made itself.  Other instances still see the
+-					 * new generation and get a rebuilt engine. */
+-					e->cur_gen = jdsp_state_generation();
++					 * new generation and get a rebuilt engine.  0006: a pristine
++					 * instance never applied it - it must stay stale. */
++					if (e->cur->stateReplayed != 0)
++						e->cur_gen = jdsp_state_generation();
+ 				}
+ 			}
+ 		}
+ 		else if (cmdCode == EFFECT_CMD_ENABLE || cmdCode == EFFECT_CMD_DISABLE)
+ 		{
+ 			jdsp_state_record(cmdCode, 0, NULL);
+-			e->cur_gen = jdsp_state_generation();
++			/* 0006: a pristine instance must stay stale (the builder still has to
++			 * build its real engine); the enable state itself is part of the
++			 * recorded sequence, so the replay restores it. */
++			if (e->cur->stateReplayed != 0)
++				e->cur_gen = jdsp_state_generation();
+ 		}
+ 	}
+ 	return ret;
+@@ -1805,17 +1913,34 @@
+ #ifdef DEBUG
+ 	LOGI("JamesDSP: Creating effect with %d sessionId", sessionId);
+ #endif
+-	/* Build the first engine with the persisted state already applied.  This runs
+-	 * on the creating thread (never the render thread), and the instance is not
+-	 * published to the builder until it is complete. */
++	/* Build the first engine.  0006: when state persistence is active the full
++	 * build (jdsp_state_replay, which includes the expensive EQ/convolver
++	 * designs) moves OFF the creating thread (an audioserver binder thread for
++	 * a factory create): the instance is published *pristine* - a freshly
++	 * constructed, zeroed engine - and renders a raw passthrough (see
++	 * jdsp_passthrough) until the builder thread has replayed the store into a
++	 * complete engine and published it in `pending` (the render thread then
++	 * crossfades it in, exactly like every other builder swap).  This bounds
++	 * the create call to the cheap constructor instead of stalling the binder
++	 * thread for the whole replay.  Without persistence the historical
++	 * synchronous path is kept (there is nothing to replay, and the builder
++	 * would have no generation to key a rebuild on). */
+ 	e->cur = jdsp_engine_new(NULL);
+ 	if (e->cur == NULL)
+ 	{
+ 		free(e);
+ 		return -ENOMEM;
+ 	}
+-	jdsp_state_replay(e->cur, jdsp_state_dispatch);
+-	e->cur_gen = jdsp_state_generation();
++	if (jdsp_state_enabled())
++	{
++		e->cur_gen = 0; /* pristine: the builder must build it */
++	}
++	else
++	{
++		jdsp_state_replay(e->cur, jdsp_state_dispatch);
++		e->cur->stateReplayed = 1;
++		e->cur_gen = jdsp_state_generation();
++	}
+ 	e->built_fs = e->cur->mSamplingRate;
+ 	/* One buffer of stereo int32 is enough for every supported format. */
+ 	e->xscratch_bytes = (size_t)JDSP_XFADE_MAX_FRAMES * 2u * sizeof(int32_t);

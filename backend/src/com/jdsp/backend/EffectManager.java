@@ -9,9 +9,19 @@ import com.jdsp.common.JdspConst;
 import java.lang.reflect.Constructor;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Future;
+import java.util.concurrent.LinkedBlockingQueue;
+import java.util.concurrent.ThreadFactory;
+import java.util.concurrent.ThreadPoolExecutor;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Owns one {@link AudioEffect} control handle per playback session.
@@ -41,6 +51,37 @@ public final class EffectManager {
     public static final int ERR_INTERNAL = -1004;
     /** The held instance does not report control (another client owns it). */
     public static final int ERR_NO_CONTROL = -1005;
+    /**
+     * An attach for that session is already running on another thread (the watcher's bounded
+     * attach pool). Not an error for the caller: the session will be attached by the task that
+     * is in flight; the watcher simply skips it this tick.
+     */
+    public static final int ERR_BUSY = -1007;
+
+    /**
+     * Shared bounded worker pool for the framework calls whose latency is dominated by the
+     * binder round trip into audioserver (per attach 60-230 ms measured on the target device):
+     * the watcher's per-session attach tasks and the parallel disable+release of
+     * {@link #detachAll}. Four workers: enough to overlap the per-session costs, few enough to
+     * keep the audioserver binder pressure bounded.
+     */
+    private static final ExecutorService OPS = new ThreadPoolExecutor(
+            4, 4, 15L, TimeUnit.SECONDS, new LinkedBlockingQueue<Runnable>(),
+            new ThreadFactory() {
+                private final AtomicInteger n = new AtomicInteger(1);
+
+                @Override
+                public Thread newThread(Runnable r) {
+                    Thread t = new Thread(r, "jdspd-ops-" + n.getAndIncrement());
+                    t.setDaemon(true);
+                    return t;
+                }
+            });
+
+    /** The shared worker pool (package private; the watcher submits its attach tasks here). */
+    static ExecutorService sharedPool() {
+        return OPS;
+    }
 
     private static Constructor<AudioEffect> ctor;
     private static Method methodSetParameter;
@@ -93,6 +134,13 @@ public final class EffectManager {
     }
 
     private final Map<Integer, Handle> handles = new LinkedHashMap<Integer, Handle>();
+    /**
+     * Sessions with an attach currently in flight (the AudioEffect constructor is the one
+     * expensive framework call, 60-230 ms measured; it runs OUTSIDE the monitor so that the
+     * watcher's parallel attach tasks really overlap, but its result is published under the
+     * monitor). Guards against a double instance when two tasks race on the same session.
+     */
+    private final Set<Integer> attaching = new HashSet<Integer>();
 
     /**
      * Engine write lock (jdsp_writelock), optimistic form: some engine builds refuse
@@ -148,18 +196,32 @@ public final class EffectManager {
         return reflectionReady ? "ok" : ("failed: " + reflectionError);
     }
 
-    /** Creates or adopts a handle for {@code sessionId}. {@code knownEffectId} may be -1. */
-    public synchronized int attach(int sessionId, int knownEffectId) {
+    /**
+     * Creates or adopts a handle for {@code sessionId}. {@code knownEffectId} may be -1.
+     *
+     * <p>The expensive part (the AudioEffect constructor binder round trip, which includes the
+     * HAL EffectCreate) runs OUTSIDE the monitor: the watcher attaches sessions in parallel, and
+     * a monitor held across the constructor would serialise them again. Bookkeeping (the
+     * in-flight set, publishing the handle) stays under the monitor; the in-flight set makes a
+     * same-session double attach return {@link #ERR_BUSY} instead of creating a second instance.
+     */
+    public int attach(int sessionId, int knownEffectId) {
         if (sessionId <= 0) {
             Log.w("attach: refusing session " + sessionId);
             return ERR_BAD_ARG;
         }
-        Handle existing = handles.get(Integer.valueOf(sessionId));
-        if (existing != null) {
-            return OK;
-        }
-        if (!initReflection()) {
-            return ERR_INTERNAL;
+        Integer key = Integer.valueOf(sessionId);
+        synchronized (this) {
+            if (handles.containsKey(key)) {
+                return OK;
+            }
+            if (attaching.contains(key)) {
+                return ERR_BUSY;
+            }
+            if (!initReflection()) {
+                return ERR_INTERNAL;
+            }
+            attaching.add(key);
         }
         long t0 = System.nanoTime();
         try {
@@ -167,20 +229,36 @@ public final class EffectManager {
                     Integer.valueOf(0), Integer.valueOf(sessionId));
             int id = safeEffectId(fx);
             Handle h = new Handle(sessionId, fx, id, System.currentTimeMillis());
-            handles.put(Integer.valueOf(sessionId), h);
-            long us = (System.nanoTime() - t0) / 1000L;
-            Log.i("attach session=" + sessionId + " effectId=" + id
-                    + " (dump said " + knownEffectId + ")"
-                    + " enabled=" + safeEnabled(fx) + " hasControl=" + safeHasControl(fx)
-                    + " in " + us + "us");
-            if (knownEffectId > 0 && id != knownEffectId) {
-                Log.w("attach session=" + sessionId + ": effectId " + id
-                        + " differs from dumpsys " + knownEffectId);
+            synchronized (this) {
+                if (handles.containsKey(key)) {
+                    // Lost a race that the in-flight set should have prevented; keep exactly
+                    // one instance and drop ours.
+                    try {
+                        fx.release();
+                    } catch (Throwable ignored) {
+                        // best effort
+                    }
+                    return OK;
+                }
+                handles.put(key, h);
+                long us = (System.nanoTime() - t0) / 1000L;
+                Log.i("attach session=" + sessionId + " effectId=" + id
+                        + " (dump said " + knownEffectId + ")"
+                        + " enabled=" + safeEnabled(fx) + " hasControl=" + safeHasControl(fx)
+                        + " in " + us + "us");
+                if (knownEffectId > 0 && id != knownEffectId) {
+                    Log.w("attach session=" + sessionId + ": effectId " + id
+                            + " differs from dumpsys " + knownEffectId);
+                }
+                return OK;
             }
-            return OK;
         } catch (Throwable t) {
             Log.w("attach session=" + sessionId + " failed: " + describe(t), t);
             return ERR_INTERNAL;
+        } finally {
+            synchronized (this) {
+                attaching.remove(key);
+            }
         }
     }
 
@@ -199,13 +277,19 @@ public final class EffectManager {
      * at least be left disabled: enabled=n means zero audio processing. Release is attempted
      * either way.
      */
-    public synchronized int detach(int sessionId) {
-        Handle h = handles.remove(Integer.valueOf(sessionId));
-        if (h == null) {
-            return OK;
+    public int detach(int sessionId) {
+        Handle h;
+        synchronized (this) {
+            h = handles.remove(Integer.valueOf(sessionId));
+            if (h == null) {
+                return OK;
+            }
+            /* The engine instance will be gone (or re-created fresh and locked). */
+            gate.forget(sessionId);
         }
-        /* The engine instance will be gone (or re-created fresh and locked). */
-        gate.forget(sessionId);
+        /* The disable (bypass) and the release are binder round trips; they run outside the
+         * monitor so a parallel detachAll overlaps them. The handle is already unpublished:
+         * no other method can reach it, and a racing setParam correctly reports NO_HANDLE. */
         try {
             if (safeEnabled(h.effect)) {
                 h.effect.setEnabled(false);
@@ -404,29 +488,55 @@ public final class EffectManager {
      * through {@link #detach} (disable = immediate bypass, then release; the unlock state
      * is forgotten per session, see {@link EngineUnlockGate#forget}). Returns the number of
      * handles that were held.
+     *
+     * <p>The per-session disable+release binder calls run in parallel on the shared bounded
+     * pool (they were serial before, which made the global "off" grow linearly with the
+     * session count); this method returns once every detach has completed, so the caller's
+     * "everything is unloaded" contract is unchanged.
      */
-    public synchronized int detachAll() {
-        int n = handles.size();
-        List<Integer> ids = new ArrayList<Integer>(handles.keySet());
-        for (int i = 0; i < ids.size(); i++) {
-            detach(ids.get(i).intValue());
-        }
-        if (n > 0) {
-            Log.i("detached all " + n + " effect handle(s)");
-        }
-        return n;
+    public int detachAll() {
+        return detachAllParallel(true);
     }
 
     /** Releases every handle (used on shutdown and when switching modes). */
-    public synchronized int releaseAll() {
-        int n = handles.size();
-        List<Integer> ids = new ArrayList<Integer>(handles.keySet());
-        for (int i = 0; i < ids.size(); i++) {
-            detach(ids.get(i).intValue());
+    public int releaseAll() {
+        return detachAllParallel(true);
+    }
+
+    private int detachAllParallel(boolean parallel) {
+        List<Integer> ids;
+        synchronized (this) {
+            ids = new ArrayList<Integer>(handles.keySet());
         }
-        if (n > 0) {
-            Log.i("released " + n + " effect handle(s)");
+        int n = ids.size();
+        if (n == 0) {
+            return 0;
         }
+        if (parallel && n > 1) {
+            List<Future<Integer>> futures = new ArrayList<Future<Integer>>(n);
+            for (int i = 0; i < n; i++) {
+                final int id = ids.get(i).intValue();
+                futures.add(OPS.submit(new Callable<Integer>() {
+                    @Override
+                    public Integer call() {
+                        return detach(id);
+                    }
+                }));
+            }
+            for (int i = 0; i < futures.size(); i++) {
+                try {
+                    futures.get(i).get(5L, TimeUnit.SECONDS);
+                } catch (Throwable t) {
+                    Log.w("parallel detach of session " + ids.get(i) + " did not finish: "
+                            + describe(t));
+                }
+            }
+        } else {
+            for (int i = 0; i < n; i++) {
+                detach(ids.get(i).intValue());
+            }
+        }
+        Log.i("detached all " + n + " effect handle(s)");
         return n;
     }
 

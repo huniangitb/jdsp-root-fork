@@ -44,6 +44,9 @@ public class AudioEffect {
     public AudioEffect(UUID type, UUID uuid, int priority, int sessionId) {
         this.id = nextId++;
         this.sessionId = sessionId;
+        synchronized (EVENTS) {
+            EVENTS.add(sessionId + ":construct");
+        }
     }
 
     public int getId() {

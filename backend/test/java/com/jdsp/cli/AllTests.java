@@ -15,6 +15,7 @@ public final class AllTests {
         com.jdsp.common.EngineWriteLockTest.run(suite);
         com.jdsp.backend.EffectManagerDetachTest.run(suite);
         com.jdsp.backend.AttachDebounceTest.run(suite);
+        com.jdsp.backend.EffectManagerParallelTest.run(suite);
         ParserTest.run(suite);
         ValueCodecTest.run(suite);
         FormatTest.run(suite);

@@ -40,8 +40,15 @@ public final class EnableSwitch {
     /** The new value was accepted but is rate limited; it is applied on a later poll. */
     public static final int DEFER = 2;
 
-    /** Default rate limit for transitions (ms). */
-    public static final long DEFAULT_MIN_INTERVAL_MS = 1000L;
+    /**
+     * Default rate limit for transitions (ms).
+     *
+     * <p>Was 1000 ms; every "on" then waited up to a full second before the first instance was
+     * even created, which the user reported as "the switch takes seconds".  300 ms still caps
+     * the transition rate at ~3.3/s (the measured crash needed ~28 framework calls per second)
+     * while keeping the whole on-transition inside the 1 s budget.
+     */
+    public static final long DEFAULT_MIN_INTERVAL_MS = 300L;
 
     private boolean applied = true;
     /** True while the transition to the opposite state waits for the rate limit. */

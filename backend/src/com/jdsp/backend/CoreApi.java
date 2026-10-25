@@ -27,7 +27,7 @@ import org.json.JSONObject;
  */
 public final class CoreApi {
     /** Reported by getVersion / ping. */
-    public static final String VERSION = "jdspd 2.0.0";
+    public static final String VERSION = "jdspd 2.1.0";
     /** Returned by ping(). */
     public static final int PING_OK = 1;
     /**
@@ -669,6 +669,7 @@ public final class CoreApi {
                     : System.currentTimeMillis() - watcher.lastTickAt());
             o.put("dumpsysChars", watcher.lastDumpBytes());
             o.put("watcherError", watcher.lastError());
+            o.put("stormDeaths", watcher.stormDeathCount());
             o.put("mode", config.getMode());
             o.put("modeName", config.getMode() == JdspConst.MODE_BACKEND ? "backend" : "auto");
             o.put("enabled", config.isEnabled());
