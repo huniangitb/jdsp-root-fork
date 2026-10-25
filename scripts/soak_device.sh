@@ -32,8 +32,8 @@ LAST_TONE=0
 while [ "$(date +%s)" -lt "$END" ]; do
     NOW=$(date +%s)
 
-    PROCS=$(pgrep -c jdspd 2>/dev/null || echo 0)
-    PID=$(pgrep jdspd 2>/dev/null | head -1)
+    PROCS=$(pidof jdspd 2>/dev/null | wc -w)
+    PID=$(pidof jdspd 2>/dev/null | awk '{print $1}')
     STATS=$(su -c "$CLI stats" 2>/dev/null)
     UPT=$(printf '%s' "$STATS" | grep -o '"uptimeMs":[0-9]*' | cut -d: -f2)
     WFAIL=$(printf '%s' "$STATS" | grep -o '"watcherFailures":[0-9]*' | cut -d: -f2)

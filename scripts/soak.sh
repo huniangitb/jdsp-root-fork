@@ -6,7 +6,7 @@
 # soak_device.sh 在设备上 setsid 脱离 adb 会话运行，不依赖 USB 一直连着；
 # 报告持续追加在 /data/local/tmp/jdsp-soak/report.tsv，随时可以：
 #   adb shell su -c 'tail -5 /data/local/tmp/jdsp-soak/report.tsv'
-# 停止：adb shell su -c 'pkill -f soak_device.sh'
+# 停止：adb shell su -c 'pkill -f '[s]oak_device.sh''
 # 汇总：scripts/soak.sh --report
 set -uo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -28,7 +28,7 @@ if [ "$REPORT" = 1 ]; then
 fi
 
 $ADB push "$HERE/soak_device.sh" /data/local/tmp/jdsp-soak_device.sh || exit 1
-$ADB shell "su -c 'mkdir -p /data/local/tmp/jdsp-soak; pkill -f soak_device.sh; sleep 1; SOAK_HOURS=$HOURS SOAK_INTERVAL_S=$INTERVAL setsid sh /data/local/tmp/jdsp-soak_device.sh < /dev/null > /data/local/tmp/jdsp-soak/launcher.log 2>&1 &'" || exit 1
+$ADB shell "su -c 'mkdir -p /data/local/tmp/jdsp-soak; pkill -f '[s]oak_device.sh'; sleep 1; SOAK_HOURS=$HOURS SOAK_INTERVAL_S=$INTERVAL setsid sh /data/local/tmp/jdsp-soak_device.sh < /dev/null > /data/local/tmp/jdsp-soak/launcher.log 2>&1 &'" || exit 1
 sleep 3
 echo "soak started (hours=$HOURS interval=${INTERVAL}s)"
 $ADB shell "su -c 'pgrep -lf soak_device | head -2; head -2 /data/local/tmp/jdsp-soak/report.tsv'"
