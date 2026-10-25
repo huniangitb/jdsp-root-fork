@@ -319,8 +319,15 @@ DualSession dual normal normal 12 6 <ampA> 440 880      # 双会话 + 双频
 
 ### 9.4 观察与遗留
 
-- 07:38:02 出现过一次**非计划重启**（`ro.boot.bootreason=reboot,shell`，无 crash 记录，打断了当时的模块安装）；
-  07:40:19 受控重启后重装/校验全部通过。再出现按 `docs/COLOROS-v2.0.0-SOAK-REPORT.md` 的非预期重启流程取证。
+- **07:38:43 与 07:41:45 出现两次非计划重启**（`ro.boot.bootreason=reboot,shell`，`shutdown-checkpoints` 无记录、
+  无 tombstone/crash；即"有人从 shell 直接 reboot"，不是 PMS 有序关机）。07:40:19 那次是受控重启（本会话发起）。
+  这两次打断了当时的模块安装与 soak；重装/校验已全部通过，且设备随后 3 分钟稳定（uptime 单调、无新 SYSTEM_BOOT）。
+  设备上装有 `com.omarea.vtools`(Scene) 与 `com.coloros.sceneservice`（带定时任务），是否为外部定时/人工重启未定论，
+  再出现按 `docs/COLOROS-v2.0.0-SOAK-REPORT.md` 的非预期重启流程取证。
+- **为此给 soak 加了开机自启**：`/data/adb/service.d/99-jdsp-soak-autostart.sh`（源码 `scripts/soak_autostart.sh`，
+  `system_file` 标签 + 0755）：重启后等 `jdspd` 起来（≤60 s）再幂等拉起 `soak_device.sh`，并把
+  `autostart soak (boot)` 写进 `launcher.log`；report.tsv 里 `bootid/devuptime` 会暴露每次重启。
+  **最终 soak 窗口：2026-10-26 07:45:22 起 → 10-29 07:45**（首行 bootid `0d4ffc14`、jdsphits=0）。
 - AGP Lint 在本机**离线不可用**（缺 `com.android.tools.lint:lint-gradle:31.7.3` 缓存），见 §9.5 替代检查。
 - `JdspPrefWriter` 的逐写 `Timber.i` 保留便于下轮排查，生产可降到 `Timber.d`。
 
