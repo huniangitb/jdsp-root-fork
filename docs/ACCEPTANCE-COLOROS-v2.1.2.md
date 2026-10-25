@@ -187,7 +187,9 @@ flinger 播放线程 `underruns=0`、`Normal mixer raw underrun counters partial
 ## 5. soak
 
 - 启跑：**2026-10-26 06:32:15**（干净基线、App 已 force-stop），计划 72 h → **10-29 06:32**；
-  首行 `report.tsv`：`10-26 06:32:15  1  20845  289877  0  156  0  2  0  0  0  da961fdb  17664  0`
+  首行 `report.tsv`：`10-26 06:32:15  1  20845  289877  0  156  0  2  0  0  0  da961fdb  17664  0`；
+  第二行 `10-26 06:42:17  1  20845  891001  0  208  0  2  0  0  0  da961fdb  18265  0`
+  （10 min 节奏正常、daemon pid 不变、`watcherFail=0`、`jdsphits=0`、`bootid` 不变而 `devuptime` 单调增）
 - 启动方式：`setsid sh /data/local/tmp/jdsp-soak/soak_device.sh`（KernelSU 下 su 会杀后台子进程，必须 setsid）
 - 说明：06:23 首次起跑后，为把被 App 污染过的配置换成干净基线，**有意** kill 了 daemon 两次
   （daemon 退出码 143 = SIGTERM，由看护 `jdspd.sh` 2 s 内拉起；设备未重启，`bootid` 不变、`devuptime` 单调）。
