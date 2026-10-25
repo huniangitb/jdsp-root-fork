@@ -281,3 +281,57 @@ DualSession dual normal normal 12 6 <ampA> 440 880      # 双会话 + 双频
 `dump-*.json`（配置快照，含 App 污染前后）、`app-dsp-screen.png`（App DSP 屏）；
 `out/verify/`（dist v2.1.0/v2.1.1/v2.1.2 的独立核验报告）；
 `out/oldstack-evidence/`（旧栈 soak/崩溃原始证据，已与设备解耦）。
+
+---
+
+## 9. 追加（2026-10-26 07:15-07:41）：App 侧 P1 修复 → 交付 v2.1.3-fork / App 1.6.17-63
+
+§6.3 的 App 写参问题已按用户要求重做：**"UI 不要有任何音效配置参数；先从后端拉取，再修改，避免干扰"**。
+本轮只改 App（源码构建），模块/引擎/jdspd 与 v2.1.2 相同。
+
+### 9.1 改了什么（App 源码：`/home/bdy/work/loundess_git`）
+
+| # | 位置 | 改动 |
+|---|---|---|
+| 1 | `JamesDspRemoteEngine.syncWithPreferences()` | **改为 no-op**：服务启动 / 每次 `ACTION_PREFERENCES_UPDATED` 不再把 ~30 个参数（含 UI 侧默认值）整批推给后端——这是 ColorOS 上 116/128/188/1307 被写入的主通道 |
+| 2 | `PreferenceGroupFragment.onCreatePreferences()` | 建屏/首次绑定窗口 2.5 s 内偏好写入**只落本地、不外发**：androidx 的 `ListPreference/EditTextPreference` 首次绑定会把刚读到的值再 persist 一次（ColorOS 实测即 1307/115/116/188 的来源） |
+| 3 | `JdspPrefWriter` | 写侧守卫：后端配置里没有的参数不写；无快照时只放行"规范基线 + 内容类"白名单；与后端当前值相同的写入直接丢弃 |
+| 4 | `MaterialSeekbarPreference` | 只有**用户真实拖动/输入**才落盘；程序化回填（绑定、后端刷新）只改显示 |
+| 5 | `JdspBackendPreferences` | 读侧 stale-while-revalidate：写完不再把快照置空，UI 不会"刚改一笔就回落本地值" |
+| 6 | `JdspPrefWriter.floatCountFor(1301)` | 6 → 5 个 float（20 字节；旧 24 字节被引擎按 size 拒绝） |
+| 7 | 版本 | `1.6.17 / versionCode 63`，同签名（debug cert `904ddf44…`）可直接覆盖升级 |
+
+### 9.2 真机证据（OPD2404 / Android 16；模块 v2.1.3 + App 1.6.17-63）
+
+| 测试 | 方法 | 结果 |
+|---|---|---|
+| T1 开屏+播放**零污染** | `pm clear` → 启动到 DSP 屏 → 播 tone 14 s → `dump-config` | **26/26 键与 `scripts/baseline.json` 逐字节相同**；无 128/188、1307 不动；logcat 中 `binding phase` 拦截 **68** 次 |
+| T2 **后端 → UI（先拉取）** | 播放中 CLI 把后端 `1500` postGain 改 +6 dB → 冷启 App | UI 显示 **6.00dB**；日志 `read dsp_output_control/output_postgain: backend hit (param 1500)` |
+| T3 **用户改 → 后端（再修改）** | DSP 屏上拖动"后增益"滑条 | 后端 `1500 = [-0.1, 60.0, 6.131]`、UI 显示 6.13dB、`extra keys=[]`；`baseline` 复位后逐字节回基线 |
+| 模块 §1/§2/§3 抽检 | boot.log / stats / tone | `[mode] service mode=backend … =0 OK`；`jdspd 2.1.3`、`watcherFailures=0`；tone 播中 `params=26 effectId≥0`、停后 5 s 内 `sessions=[]` |
+
+### 9.3 交付物
+
+- 新分发包：`dist/JDSP-fork-v2.1.3.zip`（sha256 `c16f14ec2e94c3a91f6f1fc1945c4709b283155e003bc54aa72ac647004b5231`）
+  - 模块 `v2.1.3-fork`（213）/ jdspd 2.1.3 `d584ba4c` / 引擎 `265544f5` / **App 1.6.17-63 `be5aa0ef`**
+- App 源码提交：`loundess_git 93ca762`
+- 设备现状：模块 v2.1.3 / App 1.6.17-63 / backend / 干净基线；**72h soak 07:40:50 起跑（→ 10-29 07:40）**
+
+### 9.4 观察与遗留
+
+- 07:38:02 出现过一次**非计划重启**（`ro.boot.bootreason=reboot,shell`，无 crash 记录，打断了当时的模块安装）；
+  07:40:19 受控重启后重装/校验全部通过。再出现按 `docs/COLOROS-v2.0.0-SOAK-REPORT.md` 的非预期重启流程取证。
+- AGP Lint 在本机**离线不可用**（缺 `com.android.tools.lint:lint-gradle:31.7.3` 缓存），见 §9.5 替代检查。
+- `JdspPrefWriter` 的逐写 `Timber.i` 保留便于下轮排查，生产可降到 `Timber.d`。
+
+### 9.5 静态检查结果（"自带的静态检查"）
+
+| 检查 | 结果 |
+|---|---|
+| Gradle `assembleRootFullRelease`（Kotlin/Java/KSP/dex 全量编译） | **BUILD SUCCESSFUL**；仅既有 deprecation 警告，无 error |
+| `./gradlew lintRootFullRelease` | ❌ 离线不可用：`No cached version of com.android.tools.lint:lint-gradle:31.7.3`（环境缺缓存，非代码问题） |
+| `backend/test/run_tests.sh`（自带单测） | **247 passed / 0 failed** + 设备选择 selftest 11 PASS |
+| `module/package.sh --check`（自带打包自检） | 全绿（versionCode=213、v2.1.3-fork、sepolicy、jdspd.sh、jdsp_mode.sh、service.sh） |
+| `git diff --check`（两仓库） | 无空白错误 / 冲突标记 |
+| 产物静态校验 | `unzip -t` 完整；APK badging = james.dsp / 1.6.17 / 63 / minSdk 26；`apksigner` 证书 `904ddf44…`（与原包一致，可覆盖升级）；包内 APK md5 = `be5aa0ef…` |
+

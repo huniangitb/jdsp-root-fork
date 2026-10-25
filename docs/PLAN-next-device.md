@@ -6,13 +6,14 @@
 > `Client(pid/uid)` 合列导致会话发现恒空、以及自有效果链造成会话泄漏）。详见
 > `docs/ACCEPTANCE-COLOROS-v2.1.2.md`。
 >
-> 现状（2026-10-26 06:28 起）：设备跑 **v2.1.2-fork / jdspd 2.1.3 / mode=backend**，72h soak 已起跑
-> （→ 10-29 06:28，report.tsv 已加 bootid/devuptime/jdsphits 三列）；**App 已 force-stop**
-> ——因为发现 App 1.6.16-62 在"有播放会话"时会回写默认参数（`116/128/188/1307`，并尝试写旧长度的
-> `1301/1304`），污染后端权威配置，见验收报告 §6.3。
+> 现状（2026-10-26 07:40 起）：设备跑 **v2.1.3-fork / jdspd 2.1.3 / App 1.6.17-63 / mode=backend**，
+> 72h soak 已起跑（→ 10-29 07:40，report.tsv 含 bootid/devuptime/jdsphits 三列）。
+> 验收报告 §6.3 的 App 写参 P1 已修复并真机验证：**UI 不持有任何音效配置参数，先从后端拉取，
+> 用户真实修改才写回**（T1 开屏+播放零污染 / T2 后端→UI 显示一致 / T3 拖动滑条只写该参数），
+> 详见 `docs/ACCEPTANCE-COLOROS-v2.1.2.md` §9。
 >
-> 第三台设备接上后，本手册 §1-§4 仍按原样执行；只需把 §3 项 2 的期望版本改成 **jdspd 2.1.3**，
-> §7 的产物坐标改成 v2.1.2（见文末）。
+> 第三台设备接上后，本手册 §1-§4 仍按原样执行；只需把 §3 项 2 的期望版本改成 **jdspd 2.1.3**、
+> App 期望 **1.6.17-63**，§7 的产物坐标改成 **v2.1.3**（见文末）。
 
 - 原日期：2026-10-26
 - 前置状态（撰写时）：xaga（小米 Pad，Android 15/MTK/KernelSU）已全项验证通过；所有修复已进入
@@ -105,8 +106,9 @@ CLI 前缀：`CLI="su -c 'CLASSPATH=/data/adb/modules/ainur_jamesdsp/backend/jds
 
 1. ~~ColorOS 机升级~~ **已完成（2026-10-26）**：升级到 dist v2.1.2，§3 清单 1-12 项通过，
    72h soak 06:28 起跑（详见 `docs/ACCEPTANCE-COLOROS-v2.1.2.md`）。
-1b. **P1：App 1.6.16-62 在有播放会话时回写默认参数**（116/128/188/1307，并尝试写旧长度的 1301/1304），
-   污染后端权威配置；soak 期间已 force-stop App。修复需改 App 源码（验收报告 §6.3）。
+1b. ~~P1：App 1.6.16-62 回写默认参数~~ **已修复（2026-10-26 07:15）**：App 1.6.17-63 改为
+   "UI 不持有参数、先拉取再修改"（停用全量 sync、绑定窗口不外发、写侧守卫、滑条只认用户输入、
+   读侧 stale-while-revalidate、1301 长度修正），真机三项测试通过，见验收报告 §9。
 1c. **第三台设备（P6）仍未接入**——接上后按本手册 §1-§4 执行。
 2. 写锁 framework 返回值问题（0002 引擎侧已编入但 ColorOS framework 把解锁 reply 改写为 -1；乐观门已绕过，留观察）。
 3. burst p95≈45ms 尾部：已定性在框架 binder/HAL 层（与 daemon 无关），不阻塞。
@@ -115,14 +117,14 @@ CLI 前缀：`CLI="su -c 'CLASSPATH=/data/adb/modules/ainur_jamesdsp/backend/jds
 
 ## 7. 关键产物坐标
 
-- 分发包（当前交付）：`dist/JDSP-fork-v2.1.2.zip`（sha256 `1419b9ee28c1d84186a9adaf2e2771a1be71ee79e10bacf2d780369348b7f841`；
-  jdspd `d584ba4c`（2.1.3）/ cli `2483ecd7` / 引擎 arm64 `265544f5` arm `6a5ad413` / App `b7ff6461`）
-  - 中间态留档：`dist/JDSP-fork-v2.1.0.zip`（sha256 `2beca565…`）、`dist/JDSP-fork-v2.1.1.zip`（sha256 `9449aea9…`）
+- 分发包（当前交付）：`dist/JDSP-fork-v2.1.3.zip`（sha256 `c16f14ec2e94c3a91f6f1fc1945c4709b283155e003bc54aa72ac647004b5231`；
+  模块 213 / jdspd `d584ba4c`（2.1.3）/ cli `2483ecd7` / 引擎 arm64 `265544f5` arm `6a5ad413` / **App 1.6.17-63 `be5aa0ef`**）
+  - 中间态留档：`dist/JDSP-fork-v2.1.0.zip`（`2beca565…`）、`v2.1.1`（`9449aea9…`）、`v2.1.2`（`1419b9ee…`，含 App 1.6.16-62）
 - 验证工具：`scripts/{dual-session-probe.sh,dual-session-fft.py,bench-burst.py,hal-crash-probe.sh,soak_device.sh,soak.sh}`；
   `tools/{DualSession.java,EffectCtl.java,MultiApi.java,Tone.java,TcpBurst.java}`；基线 `scripts/baseline.json`
   - `Tone.java` 现在支持第 3 参数为幅度（`Tone <secs> <tag> <amp>`）；
     `DualSession miccap <secs> [mic|unprocessed|voice]` 可选采集源；`TcpBurst` 为设备侧突发客户端（避开 adb forward 噪声）
 - 文档：`docs/MODE-SWITCH.md`（模式切换机理）、`docs/ACCEPTANCE-COLOROS-v2.1.2.md`（本机全量验收）、
   `docs/COLOROS-v2.0.0-SOAK-REPORT.md`（旧栈 soak/崩溃取证）、`module/src/changelog.md`（v2.1.2 全量变更）
-- 设备现状：ColorOS 机 = v2.1.2 / backend / 干净基线 / 72h soak 运行中（App 已 force-stop）；
-  xaga = v2.1.0 全修复在线（待随 v2.1.2 一起升级）
+- 设备现状：ColorOS 机 = v2.1.3 / App 1.6.17-63 / backend / 干净基线 / 72h soak 运行中（07:40 起）；
+  xaga = v2.1.0 全修复在线（待随 v2.1.3 一起升级）

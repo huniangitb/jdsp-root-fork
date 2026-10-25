@@ -1,3 +1,19 @@
+### v2.1.3-fork（App 1.6.17：UI 不持有任何音效配置参数，先拉取再修改）
+
+* **App 1.6.17（versionCode 63，源码构建，同签名可直接升级）**——按"UI 不持有参数、只从后端拉取，
+  取到之后才允许用户修改"重做写侧：
+  - **停用"App 偏好 → 引擎"全量下发链**（`JamesDspRemoteEngine.syncWithPreferences` 改为 no-op）：
+    服务启动与每次 `ACTION_PREFERENCES_UPDATED` 不再把 ~30 个参数（含 UI 侧默认值）整批推给后端。
+  - **建屏/首次绑定窗口（2.5 s）内的偏好写入只落本地、不外发**：androidx 的
+    `ListPreference`/`EditTextPreference` 在首次绑定会把刚读到的值再 persist 一次，
+    以前这就是"打开 DSP 屏就把 App 默认值写进后端"的通道（ColorOS 实测 1307/115/116/188）。
+  - `JdspPrefWriter` 写侧守卫：后端配置里没有的参数不写；没有快照时只放行"规范基线 + 内容类"
+    白名单；与后端当前值相同的写入直接丢弃。
+  - `MaterialSeekbarPreference` 只在**用户真实拖动/输入**时落盘，程序化回填（绑定、后端刷新）只改显示。
+  - 读侧改 stale-while-revalidate：写完参数不再把快照置空，UI 不会在"刚改一笔"后回落本地值。
+  - 修正 `1301`（loudness）参数长度 6→5 个 float（20 字节，与 fork 引擎一致；旧长度被引擎按 size 拒绝）。
+* 模块/引擎/jdspd 与 v2.1.2 完全相同（引擎 `265544f5`、jdspd `d584ba4c`(2.1.3)）。
+
 ### v2.1.2-fork（ColorOS 16 会话泄漏修复；后端 jdspd 2.1.3）
 
 * **后端 jdspd 2.1.3（P0，新设备实测发现）**：ColorOS 16 会给已 attach 的 effect 保留 session

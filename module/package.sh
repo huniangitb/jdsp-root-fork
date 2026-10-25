@@ -17,8 +17,8 @@ set -euo pipefail
 HERE=$(cd "$(dirname "$0")" && pwd)
 REPO=$(cd "$HERE/.." && pwd)
 SRC="$HERE/src"
-OUT="$REPO/dist/JDSP-fork-v2.1.2.zip"
-VER_EXPECT="versionCode=212"
+OUT="$REPO/dist/JDSP-fork-v2.1.3.zip"
+VER_EXPECT="versionCode=213"
 
 say() { printf '%s\n' "$*"; }
 die() { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
@@ -73,8 +73,8 @@ say "   OK   module.prop $VER_EXPECT"
 N=$(unzip -p "$OUT" sepolicy.rule | grep -c '^allow mtk_hal_audio')
 [ "$N" -ge 4 ] || die "sepolicy.rule 里 allow mtk_hal_audio 规则只有 $N 条（应 >=4）"
 say "   OK   sepolicy.rule allow mtk_hal_audio 规则 $N 条"
-unzip -p "$OUT" module.prop | grep -q '^version=v2\.1\.2' || die "module.prop version 不是 v2.1.2"
-say "   OK   module.prop version=v2.1.2-fork"
+unzip -p "$OUT" module.prop | grep -q '^version=v2\.1\.3' || die "module.prop version 不是 v2.1.3"
+say "   OK   module.prop version=v2.1.3-fork"
 unzip -p "$OUT" jdspd.sh | grep -q 'jdspd_normalize_state' || die "jdspd.sh 缺 state.bin 归一化"
 say "   OK   jdspd.sh 带 state.bin 归一化"
 unzip -p "$OUT" jdsp_mode.sh | grep -q 'jdsp_mode_config_get' || die "jdsp_mode.sh 缺 config.json 读取"
