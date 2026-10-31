@@ -330,3 +330,39 @@ sessions=0, 无残留测试播放器（Tone/Tone2/opensles/aaudio 均已退出�
 同时 uid 0 进程不受 hidden-API 黑名单约束（模块早已用同样方式反射 `AudioEffect` 的隐藏构造器）。
 因此 12-16 全区间只依赖「方法名 + 参数类型」这一稳定契约，缺失即降级。
 
+## 13. 发版安装与开机验证（2026-10-31）
+
+安装路径走 KernelSU 官方流程（不是手工替换文件）：
+
+```bash
+adb -s 64a4bad0 push dist/JDSP-fork-v2.1.9.zip /data/local/tmp/
+adb -s 64a4bad0 shell 'su -c "ksud module install /data/local/tmp/JDSP-fork-v2.1.9.zip"'
+#  -> Module installed successfully!（暂存到 /data/adb/modules_update/ainur_jamesdsp，versionCode=219）
+adb -s 64a4bad0 reboot   # 18:33:56，开机约 30 s 完成
+```
+
+开机后核对（全部通过）：
+
+| 项 | 结果 |
+|---|---|
+| 模块版本 | `version=v2.1.9-fork (2026-10-31)` / `versionCode=219`，`/data/adb/modules_update` 已空（更新已合并） |
+| 守护进程 | `jdspd 2.1.9`，`backend/jdspd.dex` md5 `c5efac5bbeb519de04d76de6f214870b`（与 `dist` 内一致） |
+| 配置 | `dump-config` 1299 B 与重启**前逐字节一致**（26 个全局参数、`mode=backend`、`enabled=true`） |
+| 探针 | `probeAvailable=true`；启动期 `IllegalStateException: audio service not found` 是 audioserver 注册前的正常重试（v2.1.8 修的就是不缓存这个失败） |
+| attach | 4 次新会话实测 **109.6 / 57.5 / 71.1 / 65.7 ms**（`attach session=… in …us`，全程 `mode=probe`，0 次 dump） |
+| 空转 CPU | 开机 8 min 后 60 s 窗口 **0.133 %**，同期 `dumpsys` **0 次** |
+| soak | `/data/adb/service.d/99-jdsp-soak-autostart.sh` 正常拉起（pid 3866），开机后 18:34:22 写出首行（bootid `8a69cce5`，`jdsphits=0`） |
+| App | `james.dsp` 1.6.20（versionCode 66） |
+
+### 13.1 一个观察：effect 链残留会话最长等一个交叉校验
+
+测试播放器被 `SIGTERM` 杀掉后，audioserver 侧 tracks 已为 0，但 dump 里仍有 `1 effects for session 113`
+（那是 jdspd 自己的 effect 句柄）。daemon 的 `dumpOnly` 保护策略规定「只有 dump 见过的会话不能被廉价 pass 摘掉」，
+因此该会话会一直保留到下一次 5 min 交叉校验：实测 `18:40:58 watcher pass reason=crosscheck mode=dumpsys sessions=0`
+→ `detach session=113` → `released session=113`。期间探针按 10 Hz 跑（CPU ≈0.95 %，正常空转是 0.13-0.22 %）。
+
+这是**有意的取舍**（宁可多留一个空 effect 到下一次交叉校验，也不要让廉价 pass 把原生播放器的会话摘掉）。
+若要进一步收紧，可在「已有会话 + `isStreamActive` 为假 + 探针无可用 sessionId」时提前触发一次确认 dump（预计改动 <30 行，
+留待 v2.1.10 评估）。
+
+
