@@ -563,3 +563,64 @@ p95 0.630 ms / max 8.572 ms，**400/400 返回 0**；同期 jdspd 日志无 erro
 | "一次 setParam 的 85% 花在 AudioEffect binder 上" | 实测（引擎耗时占比）+ 外部（AOSP 路径） |
 | "有 effect 的流不在 fast mixer 上" | 外部（AOSP 延迟设计文档） |
 | "createEffect 比 setEnabled 贵得多、且持播放线程锁" | 外部（AOSP Threads.cpp/Effects.cpp）+ 实测（52-112 ms vs 0.25 ms） |
+
+---
+
+## 11. 「一帧一批」参数写入落地与复测（App 1.6.19-65）
+
+> 落地：loundess_git commit `5d1b861`（App 侧）。daemon 侧没有改动（用到了 f3b72ee 引入的
+> `op=setparams` 与 `s=0` 全局写）。本节数字全部来自本机真机（adb `64a4bad0`）。
+
+### 11.1 改了什么
+
+| # | 改动 | 位置 | 说明 |
+|---|---|---|---|
+| 1 | **一帧一批**：可合并参数在一个窗口内合成一次 `op=setparams` | `JdspBridge`：`BATCH_WINDOW_MS=12 ms`、`BATCH_QUIET_MS=1 ms`、`BATCH_IMMEDIATE_COUNT=2`、`pushBatch()` | 窗口上限 12 ms（< 一帧 16.4 ms，不跨帧）；**静默 1 ms 就发**（单独一条写入不会硬等 12 ms）；已攒够 2 条立即发；单批上限 64 |
+| 2 | 保序参数**不合并** | `ORDERED_QUEUE`（8888/9999/12000/12001/10004/10006/10009/10010/25000-25003/115/116/1300/1305-1307） | 逐条 FIFO、立即发，保持分片/提交/级联的顺序语义 |
+| 3 | 全局参数**不再先查 sessions** | `JdspBridge.push()/pushBatch()`：`s=0` 直投 | 老 daemon（回 -1003）自动永久退回逐会话广播，不会丢参数 |
+| 4 | `setparams` 传输实现 | `TcpTransport`、`SocketTransport` | `JdspTransport` 默认实现逐条 `setParam`，binder/shell 协议一个字节没变 |
+| 5 | 唤醒与收尾 | `markBatchPending()`（unpark）、`flushNow()`；`MaterialSeekbarPreference.onStopTrackingTouch` | 入队即唤醒 worker（省掉最多 2 ms 轮询）；滑条松手强制 flush，**最后一次值一定落盘** |
+| 6 | 版本 | `buildSrc/.../AndroidConfig.kt` | 1.6.18 (64) → **1.6.19 (65)**；APK `JamesDSP-v1.6.19-65-root-full-universal-release.apk`（39 784 053 B） |
+
+语义不变量（逐条自检过）：拖动中 last-wins 合并允许；松手最后值必发；后端不可用时参数照旧
+回队重放（`retainForRetry` / `handleBatchFailure` 的 -1006、结构性拒绝、重试上限行为不变）；
+UI 线程只入队、不碰 socket。
+
+### 11.2 复测（同一测法：静音 tone + 设备侧 getParam 0.5 ms 网格 + logcat epoch 对齐）
+
+| 指标 | 改造前 1.6.18/64 | 改造后 1.6.19/65 |
+|---|---|---|
+| 匹配事件 | 72/72 | 100/101（另一次单会话复测 24/24） |
+| **p50** | 5.0 ms | **5.0 ms**（单会话复测 4.0 ms） |
+| **p95** | 11.0 ms | **10.0 ms**（单会话复测 13.0 ms，样本仅 24） |
+| max | 21 ms | 14 ms |
+| 每个 UI 事件的往返数 | 2（`sessions` + `setParam`，每会话再加一次） | **1**（`setparams`，s=0 由后端扇出） |
+
+其它已验证项：
+- EQ 路径（`submitPeqCascade` 一次写 1300+1214）：daemon `setParamCalls` 每次 +2（两个参数都到），
+  1300 走 ORDERED 单发、1214 进合并批次；1300 的值变化落在 tap 注入窗口内（窗口 95 ms，变化在窗口内 −20 ms 处）。
+- `setparams` / `s=0` 功能验证：`{"ok":true,"applied":2,"failed":0}`，getParam 读回新值；未知 op 仍 `-1003`。
+- 总开关回归：App 连点 3 次 FAB，后端按 on→off→on→off 正确翻转，收尾 `enabled` 读回正确，
+  `dump-config` 的 26 项参数与基线逐项相同（开关与参数互不污染）。
+
+### 11.3 为什么 p95 没进 8 ms（如实）
+
+1. **引擎已经不是瓶颈**：新引擎上 jdspd 自测 `avgLatencyUs` 只有 0.67-0.84 ms（上一版报告是 3.2-4.1 ms），
+   但端到端 p95 仍有 ~10 ms —— 剩下的尾巴在 **daemon 的请求处理/调度**（单连接串行 + `EffectManager` 监视器 +
+   watcher 每 500 ms 的 78 KB dumpsys），不在 App 侧。属评审 §6 档 B1（锁粒度），本次没有动 daemon。
+2. **测量本身有负载**：`watchparam` 以 ~1000 次/s 的 `getParam` 轮询（22 s 一轮 ~16k 次调用）与写入争同一个
+   daemon；同一窗口内还有另一个 teammate 在切前台应用、换引擎 .so、重启 audioserver。
+3. **ORDERED 不合并**：EQ 的 1300 是保序参数，所以 EQ 场景只省掉 `sessions` 那一次往返，收益天然小于滑条场景。
+4. **样本与环境**：本次窗口内设备被重启 3 次（13:31 / 13:54 / 13:55）、jdspd 多次重启，部分轮次在 2-3 个
+   已挂载会话下测量（s=0 会扇出到所有会话），尾部被放大；p95 的两次结果 10.0 / 13.0 也反映了这个抖动。
+
+结论：**一帧一批把每个 UI 事件的往返数从 2 降到 1、p50 稳定在 4-5 ms、p95 从 11 降到 10 ms、max 从 21 降到 14**；
+要真正进 8 ms 需要动 daemon 的请求处理路径（档 B1），本次不在范围内。
+
+### 11.4 未完成的验证（下次接手先做）
+
+- **EQ 拖动**：设备在本轮被反复重启、前台被别的任务占用，1.6.19 上只做了 11.2 里的协议级与开关级回归，
+  没有在参数均衡器图上真拖一个 band；建议设备空闲时用 uiautomator 取 band 坐标后重跑。
+- **总开关 <60 ms 的端到端数字**沿用本报告 §2.2 与 after-report（daemon 直驱 off 12 ms / on 14 ms）；
+  本次只做了「能正确翻转、参数不被污染」的回归。
+- 72 h soak，以及「拖动松手后最后值落盘」的专项压力测试（本次由 `flushNow()` 保证，逻辑上必然）。
