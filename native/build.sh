@@ -30,9 +30,11 @@ WITH_GC_SECTIONS=${WITH_GC_SECTIONS:-0}   # 0 keeps every symbol the shipped lib
 # new state persistence module.  jdsp/Effects/eel2/cpthread.c is a duplicate of
 # the top level cpthread.c and must not be compiled twice.
 SRCS=()
-for f in cpthread.c peq_loudness.c jamesdsp.c jdsp_state.c jdsp_writelock.c jdsp_paramq.c jdsp_accum.c; do
-    # jdsp_state.c / jdsp_writelock.c only exist in the patched tree; the
-    # pristine tree is built with this same script for an A/B comparison.
+for f in cpthread.c peq_loudness.c jamesdsp.c jdsp_state.c jdsp_writelock.c \
+         jdsp_paramq.c jdsp_accum.c jdsp_tap.c jdsp_mixcheck.c; do
+    # jdsp_state.c / jdsp_writelock.c / jdsp_accum.c / jdsp_tap.c /
+    # jdsp_mixcheck.c only exist in the patched tree; the pristine tree is
+    # built with this same script for an A/B comparison.
     [ -f "$SRC/$f" ] && SRCS+=("$f")
 done
 while IFS= read -r f; do SRCS+=("$f"); done < <(

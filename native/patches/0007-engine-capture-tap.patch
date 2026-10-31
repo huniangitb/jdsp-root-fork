@@ -1,0 +1,836 @@
+From: JamesDSP root fork - 0007
+Subject: [PATCH 0007] engine: capture tap (IN/OUT WAV lanes) for microphone-free
+ verification
+
+Every acceptance run of this module so far had to record the speaker with a
+microphone (docs/ACCEPTANCE-COLOROS-v2.1.2.md).  That path is acoustic: the
+microphone chain compresses the signal (~1.6:1 measured on this device) and
+adds the room, so it can prove "something audible came out" but never "this
+exact PCM reached the HAL".  The tap captures the samples the engine is about
+to hand to AudioFlinger instead.
+
+Two lanes are taken from the same render call, so a before/after pair is always
+frame aligned:
+
+  lane 0 (IN)  the effect input buffer  -> what AudioFlinger mixed for us
+  lane 1 (OUT) the rendered engine output -> the bytes generic_process()
+                                            returns to AudioFlinger, i.e. the
+                                            same object the vendor AF35 dump
+                                            records (bit-exact, see
+                                            docs/SPEAKER-TAP-RESEARCH.md)
+
+The render thread only does a bounds checked memcpy into a preallocated ring:
+no allocation, no lock, no syscall, no log.  A dedicated writer thread drains
+the ring into canonical WAV files (or leaves the data for jdsp_tap_read()); on
+overrun the ring drops the oldest frames and counts them, it never blocks the
+audio thread.
+
+Default state is OFF: the effect module holds tap == NULL, so the two hook
+calls in generic_process() are a NULL check each and nothing else happens - no
+allocation, no memcpy, no file, no log.  A capture is armed explicitly through
+the effect parameter channel (32001 with a jdsp_tap_config_t, 32002 reads a
+jdsp_tap_status_t), which is handled before the write-lock gate so it needs no
+engine key, is never queued into the deferred parameter path and never
+persisted into the state file.
+
+Interface: see jdsp_tap.h.  Device measurements, the -20 dB/1 kHz notch proof
+and the bit-exactness check against the shipped vendor library are in
+docs/SPEAKER-TAP-RESEARCH.md; the repo level usage is in
+docs/ENGINE-TAP-AND-MIX-CHECK.md.
+
+Host tests: native/test/test_tap.c (bit exact capture/read back for all five
+formats, overrun policy, limit_frames, WAV header, concurrent producer and
+consumer, NULL/unknown-format no-ops).
+---
+diff -Naur a/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c b/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c
+--- a/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c	2026-10-31 13:29:32.660639988 +0800
++++ b/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c	2026-10-31 13:29:32.661640003 +0800
+@@ -24,6 +24,7 @@
+ #include "jdsp_writelock.h"
+ #include "jdsp_paramq.h"
+ #include "jdsp_accum.h"
++#include "jdsp_tap.h"
+ typedef struct
+ {
+ 	unsigned long long initializeForFirst;
+@@ -1449,6 +1450,10 @@
+ 	 * the command path (binder threads of the HAL), read from the same path, so
+ 	 * plain int + the gate's own ordering is enough. */
+ 	int write_locked;
++	/* 0007: capture tap (see jdsp_tap.h).  It lives on the module, not on the
++	 * engine, so a capture survives the builder's engine swaps; NULL when no
++	 * capture is armed, which is the normal case and costs one branch. */
++	struct jdsp_tap *tap;
+ 	/* Deferred parameter queue (see jdsp_paramq.h): the command thread copies
+ 	 * value SET_PARAM commands in here instead of mutating the engine in place
+ 	 * (which raced the render thread); generic_process() drains it at a buffer
+@@ -1688,9 +1693,31 @@
+ 	}
+ }
+ 
++/* 0007: capture tap wrapper.  The pre-effect input is taken before anything can
++ * write to the buffer (when AudioFlinger aliases in and out, the render below
++ * overwrites the input in place), the output lane right after the framework
++ * buffer has been produced - i.e. exactly the bytes AudioFlinger hands to the
++ * output thread, which makes the OUT lane directly comparable with the vendor
++ * AF35_EffectOut dump.  Both calls are no-ops when no tap is armed. */
++static int32_t generic_process_inner(effect_handle_t self, audio_buffer_t *in, audio_buffer_t *out);
++
+ static int32_t generic_process(effect_handle_t self, audio_buffer_t *in, audio_buffer_t *out)
+ {
+ 	struct effect_module_s *e = (struct effect_module_s *) self;
++	int32_t rc;
++	size_t frames = (in != NULL) ? in->frameCount : 0u;
++
++	if (e->tap != NULL && frames > 0u)
++		jdsp_tap_capture(e->tap, JDSP_TAP_LANE_IN, in->raw, frames);
++	rc = generic_process_inner(self, in, out);
++	if (e->tap != NULL && frames > 0u && out != NULL)
++		jdsp_tap_capture(e->tap, JDSP_TAP_LANE_OUT, out->raw, frames);
++	return rc;
++}
++
++static int32_t generic_process_inner(effect_handle_t self, audio_buffer_t *in, audio_buffer_t *out)
++{
++	struct effect_module_s *e = (struct effect_module_s *) self;
+ 	EffectDSPMain *fresh = __atomic_exchange_n(&e->pending, NULL, __ATOMIC_ACQUIRE);
+ 	if (fresh != NULL)
+ 	{
+@@ -1759,6 +1786,56 @@
+ static int32_t generic_command(effect_handle_t self, uint32_t cmdCode, uint32_t cmdSize, void *pCmdData, uint32_t *replySize, void *pReplyData)
+ {
+ 	struct effect_module_s *e = (struct effect_module_s *) self;
++	/* 0007: capture tap control (see jdsp_tap.h).  The tap ids are diagnostic
++	 * only: never queued, never persisted, never part of the DSP parameter
++	 * shapes, and deliberately usable on a write-locked instance (jdpd unlocks
++	 * with the key; a capture must not need the key).  They are handled before
++	 * the gate and before the classifier, which rejects every unknown id. */
++	if ((cmdCode == EFFECT_CMD_SET_PARAM || cmdCode == EFFECT_CMD_GET_PARAM) &&
++		pCmdData != NULL && cmdSize >= 16u &&
++		*(const uint32_t *)((const uint8_t *)pCmdData + 4) == 4u)
++	{
++		int32_t tapId = (int32_t)*(const uint32_t *)((const uint8_t *)pCmdData + 12);
++		if (tapId == (int32_t)JDSP_TAP_PARAM_CONFIG || tapId == (int32_t)JDSP_TAP_PARAM_STATUS)
++		{
++			if (cmdCode == EFFECT_CMD_SET_PARAM && tapId == (int32_t)JDSP_TAP_PARAM_CONFIG)
++			{
++				const uint8_t *val = (const uint8_t *)pCmdData + 16;
++				uint32_t vsize = *(const uint32_t *)((const uint8_t *)pCmdData + 8);
++				int32_t *replyData = (int32_t *)pReplyData;
++				int rc = jdsp_tap_configure(&e->tap, val, vsize,
++					e->cur != NULL ? e->cur->formatFloatModeInt32Mode : 0,
++					e->cur != NULL ? (int)e->cur->mSamplingRate : 0);
++				if (replyData != NULL)
++					*replyData = rc;
++				return 0;
++			}
++			if (cmdCode == EFFECT_CMD_GET_PARAM && tapId == (int32_t)JDSP_TAP_PARAM_STATUS)
++			{
++				jdsp_tap_status_t st;
++				uint32_t need = (uint32_t)sizeof(jdsp_tap_status_t);
++				uint32_t total = 12u + 4u + need;
++				if (pReplyData != NULL && replySize != NULL && *replySize >= total)
++				{
++					memset(&st, 0, sizeof(st));
++					jdsp_tap_status(e->tap, &st);
++					if (e->tap == NULL)
++						st.magic = JDSP_TAP_MAGIC;
++					*(uint32_t *)((uint8_t *)pReplyData + 0) = 0u;
++					*(uint32_t *)((uint8_t *)pReplyData + 4) = 4u;
++					*(uint32_t *)((uint8_t *)pReplyData + 8) = need;
++					*(int32_t *)((uint8_t *)pReplyData + 12) = (int32_t)JDSP_TAP_PARAM_STATUS;
++					memcpy((uint8_t *)pReplyData + 16, &st, need);
++					*replySize = total;
++				}
++				else if (replySize != NULL)
++				{
++					*replySize = total;
++				}
++				return 0;
++			}
++		}
++	}
+ 	/* Caller write protection: while the instance is locked every parameter
+ 	 * write is refused here, before the engine (and the state recorder) ever
+ 	 * sees it.  An unlock handshake is consumed by the gate itself and never
+@@ -1843,6 +1920,12 @@
+ 		/* JDSP_PARAM_CLASS_STREAM: fall through to the inline engine call. */
+ 	}
+ 	int32_t ret = EffectDSPMainCommand(e->cur, cmdCode, cmdSize, pCmdData, replySize, pReplyData);
++	/* 0007: keep the tap's frame geometry in sync with the format the framework
++	 * just configured (a format change stops the capture instead of writing
++	 * mis-framed data, see jdsp_tap_set_format). */
++	if (ret == 0 && cmdCode == EFFECT_CMD_SET_CONFIG && e->tap != NULL)
++		jdsp_tap_set_format(e->tap, e->cur->formatFloatModeInt32Mode,
++			(int)e->cur->mSamplingRate);
+ 	/* Persist every state changing command that the engine accepted. Recording is
+ 	 * disabled while a recorded sequence is being replayed, otherwise a replay
+ 	 * would duplicate its own records. */
+@@ -1910,6 +1993,7 @@
+ 	/* Every fresh instance starts locked: only jdspd, presenting the engine key,
+ 	 * opens the write window (see jdsp_writelock.h). */
+ 	e->write_locked = 1;
++	e->tap = NULL;
+ #ifdef DEBUG
+ 	LOGI("JamesDSP: Creating effect with %d sessionId", sessionId);
+ #endif
+@@ -1986,6 +2070,8 @@
+ 	jdsp_engine_free(e->cur);
+ 	e->cur = NULL;
+ 	jdsp_paramq_destroy(&e->pq);
++	jdsp_tap_destroy(e->tap);
++	e->tap = NULL;
+ 	free(e->xscratch);
+ 	free(e);
+ 	(void)swapped;
+diff -Naur a/Main/libjamesdsp/jni/jamesdsp/jdsp_tap.c b/Main/libjamesdsp/jni/jamesdsp/jdsp_tap.c
+--- a/Main/libjamesdsp/jni/jamesdsp/jdsp_tap.c	1970-01-01 08:00:00.000000000 +0800
++++ b/Main/libjamesdsp/jni/jamesdsp/jdsp_tap.c	2026-10-31 13:29:32.760641484 +0800
+@@ -0,0 +1,512 @@
++/*
++ * jdsp_tap.c - see jdsp_tap.h for the rationale and the contract.
++ *
++ * Implementation notes
++ * --------------------
++ * * Render thread side (jdsp_tap_capture): one mirrored atomic add/sub for the
++ *   "busy" guard, a bounds check, one or two memcpy()s and one release store
++ *   of the producer index.  No malloc, no lock, no syscall, no log call - the
++ *   function is safe to call from the AudioFlinger mixer thread and does not
++ *   change its scheduling behaviour.
++ * * Writer thread side: a private pthread that drains the ring into canonical
++ *   WAV files.  It polls with a 4 ms sleep when the ring is empty, so a stalled
++ *   filesystem can never stall the render thread; the ring simply fills up and
++ *   the overrun counter grows.
++ * * Ring: single producer / single consumer, indices are free running uint32
++ *   frame counters masked at use.  Capacity is a power of two.
++ * * Format: the tap stores the *native* engine bytes, the WAV header carries
++ *   the matching format tag, so a captured file is bit-identical to what the
++ *   engine produced - no float<->int conversion anywhere in the tap.
++ */
++#include "jdsp_tap.h"
++
++#include <errno.h>
++#include <pthread.h>
++#include <stdatomic.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <time.h>
++#include <unistd.h>
++
++#define JDSP_TAP_MSG_MAGIC 0x31504154u /* "TAP1" - same value as in the header */
++
++/* Writer thread tuning.  DRAIN_MAX bounds one fwrite() call (8192 frames of
++ * 8 bytes = 64 KiB, i.e. one deep-buffer HAL buffer x2); POLL_IDLE_US is the
++ * sleep when the ring is empty, POLL_BUSY_US when there was data. */
++#define DRAIN_MAX 8192u
++#define POLL_IDLE_US 4000
++#define POLL_BUSY_US 500
++
++struct tap_ring {
++	uint8_t *mem;
++	uint32_t cap;          /* frames */
++	atomic_uint head;      /* producer index, free running */
++	atomic_uint tail;      /* consumer index, free running */
++	atomic_ullong captured;
++	atomic_ullong dropped;
++	atomic_ullong written;
++	atomic_ullong read_by_caller;
++	FILE *file;
++	uint64_t data_bytes;
++	uint32_t active;
++};
++
++struct jdsp_tap {
++	jdsp_tap_config_t cfg;
++	int mode;
++	int sample_rate;
++	uint32_t frame_bytes;
++	atomic_int busy;               /* render thread is inside capture() */
++	atomic_int stopping;
++	atomic_uint overruns;
++	atomic_ullong files;
++	struct tap_ring lane[JDSP_TAP_LANES];
++	pthread_t writer;
++	int writer_running;
++	pthread_mutex_t lock;
++	int fmt_logged;
++};
++
++size_t jdsp_tap_frame_bytes(int mode)
++{
++	switch (mode)
++	{
++	case 0: return 2u * 2u; /* int16 stereo */
++	case 1: return 4u * 2u; /* float32 stereo */
++	case 2: return 4u * 2u; /* int32 stereo */
++	case 3: return 3u * 2u; /* packed 24 bit stereo */
++	case 4: return 4u * 2u; /* 8.24 stereo */
++	default: return 0u;
++	}
++}
++
++/* WAV (fmt tag, bits per sample) for an engine format mode. */
++static void tap_wav_format(int mode, uint16_t *tag, uint16_t *bits)
++{
++	switch (mode)
++	{
++	case 0: *tag = 1; *bits = 16; break;   /* PCM                        */
++	case 1: *tag = 3; *bits = 32; break;   /* IEEE float                 */
++	case 2: *tag = 1; *bits = 32; break;   /* 32 bit PCM                 */
++	case 3: *tag = 1; *bits = 24; break;   /* packed 24 bit              */
++	case 4: *tag = 1; *bits = 32; break;   /* 8.24 in int32, WAV 32 bit  */
++	default: *tag = 1; *bits = 16; break;
++	}
++}
++
++static uint32_t tap_next_pow2(uint32_t v)
++{
++	uint32_t r = 1u;
++	while (r < v && r < JDSP_TAP_MAX_FRAMES)
++		r <<= 1;
++	return r;
++}
++
++static void tap_put_le16(uint8_t *p, uint16_t v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
++static void tap_put_le32(uint8_t *p, uint32_t v)
++{
++	p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8);
++	p[2] = (uint8_t)(v >> 16); p[3] = (uint8_t)(v >> 24);
++}
++
++static int tap_write_header(FILE *f, int mode, int sample_rate, uint32_t frame_bytes)
++{
++	uint8_t h[44];
++	uint16_t tag, bits;
++	tap_wav_format(mode, &tag, &bits);
++	memset(h, 0, sizeof(h));
++	memcpy(h, "RIFF", 4);
++	tap_put_le32(h + 4, 0);              /* patched on close */
++	memcpy(h + 8, "WAVEfmt ", 8);
++	tap_put_le32(h + 16, 16);            /* fmt chunk size   */
++	tap_put_le16(h + 20, tag);
++	tap_put_le16(h + 22, 2);             /* channels         */
++	tap_put_le32(h + 24, (uint32_t)sample_rate);
++	tap_put_le32(h + 28, (uint32_t)sample_rate * frame_bytes);
++	tap_put_le16(h + 32, (uint16_t)frame_bytes);
++	tap_put_le16(h + 34, bits);
++	memcpy(h + 36, "data", 4);
++	tap_put_le32(h + 40, 0);             /* patched on close */
++	return fwrite(h, 1, sizeof(h), f) == sizeof(h) ? 0 : -1;
++}
++
++static void tap_patch_header(FILE *f, uint64_t data_bytes)
++{
++	uint8_t b[4];
++	if (f == NULL || data_bytes > 0xFFFFFFFFull - 44u)
++		return;
++	fseek(f, 4, SEEK_SET);
++	tap_put_le32(b, (uint32_t)(data_bytes + 36u));
++	fwrite(b, 1, 4, f);
++	fseek(f, 40, SEEK_SET);
++	tap_put_le32(b, (uint32_t)data_bytes);
++	fwrite(b, 1, 4, f);
++	fflush(f);
++}
++
++static void tap_close_file(struct jdsp_tap *t, int lane)
++{
++	struct tap_ring *r = &t->lane[lane];
++	if (r->file == NULL)
++		return;
++	tap_patch_header(r->file, r->data_bytes);
++	fclose(r->file);
++	r->file = NULL;
++	atomic_fetch_add(&t->files, 1ull);
++}
++
++static FILE *tap_open_file(struct jdsp_tap *t, int lane)
++{
++	char name[JDSP_TAP_PATH_MAX + 96];
++	struct timespec ts;
++	struct tm tmv;
++	FILE *f;
++	if (t->cfg.path[0] == '\0')
++		return NULL;
++	clock_gettime(CLOCK_REALTIME, &ts);
++	localtime_r(&ts.tv_sec, &tmv);
++	snprintf(name, sizeof(name), "%s/jdsp-tap-%s-%dHz-m%d-%04d%02d%02d-%02d%02d%02d-%d.wav",
++		t->cfg.path, lane == JDSP_TAP_LANE_IN ? "in" : "out", t->sample_rate, t->mode,
++		tmv.tm_year + 1900, tmv.tm_mon + 1, tmv.tm_mday,
++		tmv.tm_hour, tmv.tm_min, tmv.tm_sec, (int)getpid());
++	f = fopen(name, "wb");
++	if (f == NULL)
++		return NULL;
++	setvbuf(f, NULL, _IOFBF, 256 * 1024);
++	if (tap_write_header(f, t->mode, t->sample_rate, t->frame_bytes) != 0)
++	{
++		fclose(f);
++		return NULL;
++	}
++	return f;
++}
++
++/* Copies frames out of a ring (wrapping at the end of the buffer). */
++static uint32_t tap_ring_take(struct tap_ring *r, uint32_t n, uint8_t *dst, uint32_t fb)
++{
++	uint32_t tail = atomic_load_explicit(&r->tail, memory_order_relaxed);
++	uint32_t off = tail & (r->cap - 1u);
++	uint32_t first = r->cap - off;
++	uint32_t bytes;
++	if (first > n)
++		first = n;
++	bytes = first * fb;
++	memcpy(dst, r->mem + (size_t)off * fb, bytes);
++	if (n > first)
++		memcpy(dst + bytes, r->mem, (size_t)(n - first) * fb);
++	return n;
++}
++
++/* Drains one lane to its file; returns the number of frames written. */
++static uint32_t tap_drain_lane(struct jdsp_tap *t, int lane, uint8_t *scratch, uint32_t scratch_frames)
++{
++	struct tap_ring *r = &t->lane[lane];
++	uint32_t head, tail, avail, n;
++	if (r->file == NULL)
++		return 0u;
++	head = atomic_load_explicit(&r->head, memory_order_acquire);
++	tail = atomic_load_explicit(&r->tail, memory_order_relaxed);
++	avail = head - tail;
++	if (avail == 0u)
++		return 0u;
++	n = avail > scratch_frames ? scratch_frames : avail;
++	tap_ring_take(r, n, scratch, t->frame_bytes);
++	atomic_store_explicit(&r->tail, tail + n, memory_order_release);
++	if (fwrite(scratch, t->frame_bytes, n, r->file) != n)
++	{
++		/* A failed write must not spin; drop the data and let the counter
++		 * show it (the caller sees written < captured). */
++		atomic_fetch_add(&r->dropped, (unsigned long long)n);
++	}
++	else
++	{
++		r->data_bytes += (uint64_t)n * t->frame_bytes;
++		atomic_fetch_add(&r->written, (unsigned long long)n);
++	}
++	return n;
++}
++
++static void *tap_writer_thread(void *arg)
++{
++	struct jdsp_tap *t = (struct jdsp_tap *)arg;
++	uint32_t scratch_frames = DRAIN_MAX;
++	uint8_t *scratch = (uint8_t *)malloc((size_t)scratch_frames * t->frame_bytes);
++	if (scratch == NULL)
++		return NULL;
++
++	for (;;)
++	{
++		uint32_t did = 0;
++		if (atomic_load_explicit(&t->stopping, memory_order_acquire))
++			break;
++		for (int lane = 0; lane < JDSP_TAP_LANES; lane++)
++			did += tap_drain_lane(t, lane, scratch, scratch_frames);
++		if (did == 0u)
++			usleep(POLL_IDLE_US);
++		else
++			usleep(POLL_BUSY_US);
++	}
++	/* final flush: drain whatever the render thread produced before stopping */
++	for (int lane = 0; lane < JDSP_TAP_LANES; lane++)
++		while (tap_drain_lane(t, lane, scratch, scratch_frames) != 0u)
++			;
++	for (int lane = 0; lane < JDSP_TAP_LANES; lane++)
++		tap_close_file(t, lane);
++	free(scratch);
++	return NULL;
++}
++
++struct jdsp_tap *jdsp_tap_create(const jdsp_tap_config_t *cfg, int mode, int sample_rate)
++{
++	struct jdsp_tap *t;
++	uint32_t frames;
++
++	if (cfg == NULL || cfg->magic != JDSP_TAP_MAGIC || cfg->lanes == 0u)
++		return NULL;
++	frames = cfg->frames;
++	if (frames < JDSP_TAP_MIN_FRAMES)
++		frames = JDSP_TAP_MIN_FRAMES;
++	if (frames > JDSP_TAP_MAX_FRAMES)
++		frames = JDSP_TAP_MAX_FRAMES;
++	frames = tap_next_pow2(frames);
++
++	t = (struct jdsp_tap *)calloc(1, sizeof(*t));
++	if (t == NULL)
++		return NULL;
++	t->cfg = *cfg;
++	t->cfg.frames = frames;
++	t->cfg.path[JDSP_TAP_PATH_MAX - 1] = '\0';
++	t->mode = mode;
++	t->sample_rate = sample_rate > 0 ? sample_rate : (int)cfg->sample_rate;
++	t->frame_bytes = (uint32_t)jdsp_tap_frame_bytes(mode);
++	atomic_init(&t->busy, 0);
++	atomic_init(&t->stopping, 0);
++	atomic_init(&t->overruns, 0u);
++	atomic_init(&t->files, 0ull);
++	pthread_mutex_init(&t->lock, NULL);
++
++	for (int lane = 0; lane < JDSP_TAP_LANES; lane++)
++	{
++		struct tap_ring *r = &t->lane[lane];
++		if ((t->cfg.lanes & JDSP_TAP_LANE_BIT(lane)) == 0u)
++			continue;
++		if (t->frame_bytes == 0u || t->sample_rate <= 0)
++			continue; /* format unknown: the lane stays off until set_format */
++		r->cap = frames;
++		r->mem = (uint8_t *)calloc((size_t)frames, t->frame_bytes);
++		if (r->mem == NULL)
++		{
++			jdsp_tap_destroy(t);
++			return NULL;
++		}
++		atomic_init(&r->head, 0u);
++		atomic_init(&r->tail, 0u);
++		atomic_init(&r->captured, 0ull);
++		atomic_init(&r->dropped, 0ull);
++		atomic_init(&r->written, 0ull);
++		atomic_init(&r->read_by_caller, 0ull);
++		r->active = 1u;
++		if ((t->cfg.flags & 1u) != 0u && t->cfg.path[0] != '\0')
++			r->file = tap_open_file(t, lane);
++	}
++	if (pthread_create(&t->writer, NULL, tap_writer_thread, t) == 0)
++		t->writer_running = 1;
++	return t;
++}
++
++void jdsp_tap_set_format(struct jdsp_tap *t, int mode, int sample_rate)
++{
++	if (t == NULL)
++		return;
++	if (t->frame_bytes == 0u || t->sample_rate <= 0)
++	{
++		t->mode = mode;
++		t->sample_rate = sample_rate;
++		t->frame_bytes = (uint32_t)jdsp_tap_frame_bytes(mode);
++		return;
++	}
++	/* A format change invalidates the ring geometry (frame size), so stop
++	 * capturing instead of writing mis-framed data into the WAV files.  The
++	 * caller re-arms the tap with a fresh JDSP_TAP_PARAM_CONFIG. */
++	if (mode != t->mode || (sample_rate > 0 && sample_rate != t->sample_rate))
++		jdsp_tap_stop(t);
++}
++
++void jdsp_tap_stop(struct jdsp_tap *t)
++{
++	if (t == NULL)
++		return;
++	atomic_store(&t->stopping, 1);
++	if (t->writer_running)
++	{
++		pthread_join(t->writer, NULL);
++		t->writer_running = 0;
++	}
++	for (int lane = 0; lane < JDSP_TAP_LANES; lane++)
++	{
++		t->lane[lane].active = 0u;
++		tap_close_file(t, lane);
++	}
++}
++
++void jdsp_tap_destroy(struct jdsp_tap *t)
++{
++	if (t == NULL)
++		return;
++	jdsp_tap_stop(t);
++	/* Wait for a render thread that is inside jdsp_tap_capture() right now.
++	 * The engine never frees a tap from the render thread itself, so this
++	 * spin is bounded (a capture is a few microseconds). */
++	for (int i = 0; i < 10000 && atomic_load(&t->busy) != 0; i++)
++		usleep(10);
++	for (int lane = 0; lane < JDSP_TAP_LANES; lane++)
++	{
++		free(t->lane[lane].mem);
++		t->lane[lane].mem = NULL;
++	}
++	pthread_mutex_destroy(&t->lock);
++	free(t);
++}
++
++size_t jdsp_tap_capture(struct jdsp_tap *t, int lane, const void *buf, size_t frames)
++{
++	struct tap_ring *r;
++	uint32_t fb, head, tail, avail, off, first, skip = 0;
++	size_t bytes;
++
++	if (t == NULL || buf == NULL || frames == 0u || lane < 0 || lane >= JDSP_TAP_LANES)
++		return 0u;
++	r = &t->lane[lane];
++	if (r->mem == NULL || r->active == 0u)
++		return 0u;
++	fb = t->frame_bytes;
++	if (fb == 0u)
++		return 0u;
++
++	atomic_fetch_add(&t->busy, 1);
++	head = atomic_load_explicit(&r->head, memory_order_relaxed);
++	tail = atomic_load_explicit(&r->tail, memory_order_relaxed);
++	avail = r->cap - (head - tail);
++
++	if (frames > (size_t)r->cap)
++	{
++		/* The block is larger than the whole ring: keep the tail of it. */
++		skip = (uint32_t)(frames - r->cap);
++		frames = r->cap;
++		atomic_fetch_add(&r->dropped, (unsigned long long)skip);
++		atomic_fetch_add(&t->overruns, 1u);
++	}
++	if ((size_t)avail < frames)
++	{
++		uint32_t over = (uint32_t)frames - avail;
++		/* Overwrite the oldest frames: advance the consumer. */
++		atomic_store_explicit(&r->tail, tail + over, memory_order_release);
++		atomic_fetch_add(&r->dropped, (unsigned long long)over);
++		atomic_fetch_add(&t->overruns, 1u);
++	}
++
++	off = head & (r->cap - 1u);
++	first = r->cap - off;
++	if (first > frames)
++		first = (uint32_t)frames;
++	bytes = (size_t)first * fb;
++	memcpy(r->mem + (size_t)off * fb, (const uint8_t *)buf + (size_t)skip * fb, bytes);
++	if (frames > first)
++		memcpy(r->mem, (const uint8_t *)buf + (size_t)(skip + first) * fb,
++			(size_t)(frames - first) * fb);
++	atomic_store_explicit(&r->head, head + (uint32_t)frames, memory_order_release);
++	atomic_fetch_add(&r->captured, (unsigned long long)frames);
++
++	/* Stop after the configured limit (file export keeps the last partial
++	 * buffer out, which is what the caller asked for). */
++	if (t->cfg.limit_frames != 0u && atomic_load(&r->captured) >= t->cfg.limit_frames)
++		r->active = 0u;
++
++	atomic_fetch_sub(&t->busy, 1);
++	return frames;
++}
++
++int jdsp_tap_read(struct jdsp_tap *t, int lane, void *dst, size_t max_frames, size_t *frames_out)
++{
++	struct tap_ring *r;
++	uint32_t head, tail, avail, n;
++
++	if (frames_out != NULL)
++		*frames_out = 0u;
++	if (t == NULL || dst == NULL || lane < 0 || lane >= JDSP_TAP_LANES)
++		return -1;
++	r = &t->lane[lane];
++	if (r->mem == NULL)
++		return -1;
++	head = atomic_load_explicit(&r->head, memory_order_acquire);
++	tail = atomic_load_explicit(&r->tail, memory_order_relaxed);
++	avail = head - tail;
++	n = avail > max_frames ? (uint32_t)max_frames : avail;
++	if (n > 0u)
++	{
++		tap_ring_take(r, n, (uint8_t *)dst, t->frame_bytes);
++		atomic_store_explicit(&r->tail, tail + n, memory_order_release);
++		atomic_fetch_add(&r->read_by_caller, (unsigned long long)n);
++	}
++	if (frames_out != NULL)
++		*frames_out = n;
++	return 0;
++}
++
++int jdsp_tap_status(const struct jdsp_tap *t, jdsp_tap_status_t *out)
++{
++	struct jdsp_tap *m = (struct jdsp_tap *)t;
++	if (t == NULL || out == NULL)
++		return -1;
++	memset(out, 0, sizeof(*out));
++	out->magic = JDSP_TAP_MAGIC;
++	out->mode = (uint32_t)t->mode;
++	out->sample_rate = (uint32_t)t->sample_rate;
++	out->frame_bytes = t->frame_bytes;
++	out->ring_frames = t->cfg.frames;
++	for (int lane = 0; lane < JDSP_TAP_LANES; lane++)
++	{
++		out->captured[lane] = atomic_load(&m->lane[lane].captured);
++		out->written[lane] = atomic_load(&m->lane[lane].written);
++		out->dropped[lane] = atomic_load(&m->lane[lane].dropped);
++		out->read_by_caller[lane] = atomic_load(&m->lane[lane].read_by_caller);
++		if (m->lane[lane].active != 0u)
++			out->active |= JDSP_TAP_LANE_BIT(lane);
++	}
++	out->overruns = atomic_load(&m->overruns);
++	out->files = atomic_load(&m->files);
++	return 0;
++}
++
++int jdsp_tap_configure(struct jdsp_tap **slot, const void *data, size_t size, int mode, int sample_rate)
++{
++	jdsp_tap_config_t cfg;
++	struct jdsp_tap *fresh = NULL;
++
++	if (slot == NULL || data == NULL || size < sizeof(cfg))
++	{
++		fprintf(stderr, "jdsp-tap: configure rejected (slot=%p data=%p size=%zu need=%zu)\n",
++			(void *)slot, data, size, sizeof(cfg));
++		return -1;
++	}
++	memcpy(&cfg, data, sizeof(cfg));
++	if (cfg.magic != JDSP_TAP_MAGIC)
++	{
++		fprintf(stderr, "jdsp-tap: configure bad magic 0x%08x\n", cfg.magic);
++		return -1;
++	}
++	if (cfg.lanes != 0u)
++	{
++		fresh = jdsp_tap_create(&cfg, mode, sample_rate);
++		if (fresh == NULL)
++		{
++			fprintf(stderr, "jdsp-tap: create failed (mode=%d sr=%d frames=%u lanes=%u path=%s)\n",
++				mode, sample_rate, cfg.frames, cfg.lanes, cfg.path);
++			return -1;
++		}
++	}
++	jdsp_tap_destroy(*slot);
++	*slot = fresh;
++	return 0;
++}
+diff -Naur a/Main/libjamesdsp/jni/jamesdsp/jdsp_tap.h b/Main/libjamesdsp/jni/jamesdsp/jdsp_tap.h
+--- a/Main/libjamesdsp/jni/jamesdsp/jdsp_tap.h	1970-01-01 08:00:00.000000000 +0800
++++ b/Main/libjamesdsp/jni/jamesdsp/jdsp_tap.h	2026-10-31 13:29:32.798642052 +0800
+@@ -0,0 +1,131 @@
++/*
++ * jdsp_tap.h - capture tap for the JamesDSP effect library.
++ *
++ * Why: every acceptance test of this module so far had to record the speaker
++ * with a microphone (docs/ACCEPTANCE-COLOROS-v2.1.2.md).  That path is
++ * acoustic: the microphone chain compresses the signal (~1.6:1 measured) and
++ * adds the room, so it can only prove "something audible came out", never
++ * "this exact PCM reached the speaker".  The tap captures the samples the
++ * engine is about to hand to AudioFlinger instead - no microphone, no room,
++ * no compression.
++ *
++ * Two lanes are captured from the same render call so a before/after pair is
++ * always time aligned:
++ *
++ *   lane 0 (IN)  the effect input buffer   -> what AudioFlinger mixed for us
++ *   lane 1 (OUT) the rendered DSP output   -> what we hand back to
++ *                                             AudioFlinger (and therefore what
++ *                                             the output thread writes to the
++ *                                             HAL / speaker)
++ *
++ * The audio (render) thread only ever does a bounds checked memcpy into a
++ * preallocated ring buffer: no allocation, no lock, no syscall, no log.  A
++ * dedicated writer thread drains the ring into canonical WAV files (or leaves
++ * it in the ring for jdsp_tap_read()).  On overrun the ring drops the oldest
++ * frames and counts them, it never blocks the render thread.
++ *
++ * The tap is configured through the normal effect parameter channel, so it is
++ * reachable from userspace with the existing CLI (no new daemon op needed):
++ *
++ *   jdspcli --hex set <session> 32001 <jdsp_tap_config_t as hex>
++ *   jdspcli            get <session> 32002        (jdsp_tap_status_t)
++ *
++ * See docs/SPEAKER-TAP-RESEARCH.md for the measurements.
++ */
++#ifndef JDSP_TAP_H
++#define JDSP_TAP_H
++
++#include <stddef.h>
++#include <stdint.h>
++#include <sys/types.h>
++
++/* --- effect parameter codes ------------------------------------------------ */
++/* 32001 / 32002 are outside every existing JamesDSP parameter range (the
++ * engine uses 100..1500 and the state module 0x1000..), so they can never
++ * collide with a DSP parameter. */
++#define JDSP_TAP_PARAM_CONFIG 32001u   /* SET_PARAM: jdsp_tap_config_t        */
++#define JDSP_TAP_PARAM_STATUS 32002u   /* GET_PARAM: jdsp_tap_status_t        */
++
++#define JDSP_TAP_MAGIC   0x31504154u   /* "TAP1" */
++#define JDSP_TAP_PATH_MAX 160
++
++#define JDSP_TAP_LANE_IN  0
++#define JDSP_TAP_LANE_OUT 1
++#define JDSP_TAP_LANES    2
++#define JDSP_TAP_LANE_BIT(lane) (1u << (lane))
++
++/* Runtime geometry.  Bounds keep a bad parameter from eating the audio
++ * server's heap: 1024 frames (21 ms) .. 2^18 frames (5.46 s at 48 kHz). */
++#define JDSP_TAP_MIN_FRAMES 1024u
++#define JDSP_TAP_MAX_FRAMES (1u << 18)
++
++typedef struct jdsp_tap_config {
++	uint32_t magic;        /* JDSP_TAP_MAGIC                                */
++	uint32_t lanes;        /* bit0 = capture IN, bit1 = capture OUT         */
++	uint32_t frames;       /* ring capacity in frames, clamped to the bounds*/
++	uint32_t limit_frames; /* stop after N frames per lane (0 = unlimited)  */
++	uint32_t sample_rate;  /* 0 = take the rate the effect was configured for*/
++	uint32_t flags;        /* bit0 = also write WAV files (needs path)      */
++	uint32_t reserved[2];
++	char path[JDSP_TAP_PATH_MAX]; /* output directory, "" = ring only       */
++} jdsp_tap_config_t;
++
++/* Status / statistics; GET_PARAM returns this struct. */
++typedef struct jdsp_tap_status {
++	uint32_t magic;
++	uint32_t active;        /* lanes currently capturing                   */
++	uint32_t mode;          /* engine format mode (0 int16 .. 4 int8_24)   */
++	uint32_t sample_rate;
++	uint32_t frame_bytes;   /* bytes per stereo frame in the ring          */
++	uint32_t ring_frames;   /* ring capacity in frames                     */
++	uint32_t reserved[2];
++	uint64_t captured[JDSP_TAP_LANES];   /* frames accepted into the ring   */
++	uint64_t written[JDSP_TAP_LANES];    /* frames drained to file          */
++	uint64_t dropped[JDSP_TAP_LANES];    /* frames lost to a ring overrun   */
++	uint64_t overruns;                   /* overrun events (ring full)      */
++	uint64_t files;                      /* WAV files finished              */
++	uint64_t read_by_caller[JDSP_TAP_LANES]; /* frames taken by jdsp_tap_read */
++} jdsp_tap_status_t;
++
++struct jdsp_tap;
++
++/* Bytes of one stereo frame for the engine format mode
++ * (0 int16, 1 float32, 2 int32, 3 packed 24, 4 int8_24 in int32). */
++size_t jdsp_tap_frame_bytes(int mode);
++
++/* Creates a tap.  mode/sample_rate may be 0 when the caller does not know the
++ * engine format yet; jdsp_tap_set_format() then installs it before the first
++ * capture (a render with an unknown format is simply not captured).
++ * Returns NULL on bad config or allocation failure. */
++struct jdsp_tap *jdsp_tap_create(const jdsp_tap_config_t *cfg, int mode, int sample_rate);
++
++/* Installs/updates the engine format (called from the SET_CONFIG path). */
++void jdsp_tap_set_format(struct jdsp_tap *t, int mode, int sample_rate);
++
++/* Stops the capture, joins the writer thread (flushing and closing the WAV
++ * files) and frees everything.  NULL safe.  Must be called without the render
++ * thread inside jdsp_tap_capture() - the effect destructor and the parameter
++ * path both guarantee that. */
++void jdsp_tap_destroy(struct jdsp_tap *t);
++
++/* Render thread entry point.  Never blocks, never allocates.  Returns the
++ * number of frames accepted (0 when the lane is off or the ring is not
++ * usable). */
++size_t jdsp_tap_capture(struct jdsp_tap *t, int lane, const void *buf, size_t frames);
++
++/* Drains up to max_frames frames of a lane into dst (raw engine bytes).
++ * Returns 0 on success and stores the frame count in *frames_out. */
++int jdsp_tap_read(struct jdsp_tap *t, int lane, void *dst, size_t max_frames, size_t *frames_out);
++
++/* Copies the statistics snapshot. */
++int jdsp_tap_status(const struct jdsp_tap *t, jdsp_tap_status_t *out);
++
++/* Applies a jdsp_tap_config_t.  Used by the SET_PARAM handler and by the
++ * offline harness; returns 0 on success, -1 on a malformed config. */
++int jdsp_tap_configure(struct jdsp_tap **slot, const void *data, size_t size,
++	int mode, int sample_rate);
++
++/* Stops capturing (keeps files closed) - the "disable" path. */
++void jdsp_tap_stop(struct jdsp_tap *t);
++
++#endif /* JDSP_TAP_H */

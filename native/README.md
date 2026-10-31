@@ -5,6 +5,18 @@
 
 ## 补丁内容
 
+| 补丁 | 主题 | 默认状态 |
+|---|---|---|
+| `0001-state-persistence-and-hot-reload` | 状态持久化 + inotify 热加载 + 后台重建/原子切换 | 常开 |
+| `0002-engine-write-lock` | 调用方写保护（只有 jdspd 能写参数） | 常开 |
+| `0003-deferred-param-apply-and-no-cross-instance-rebuild` | SET_PARAM 延迟到音频线程 + 消除跨实例重建风暴 | 常开 |
+| `0004-dump-async-state-and-peq-heap-scratch` | DUMP 分支、禁用态返回 0、PEQ/loudness 堆缓冲、state 异步落盘 | 常开 |
+| `0005-engine-accumulate-out` | 遵守 `EFFECT_BUFFER_ACCESS_ACCUMULATE`（修同输出第二会话静音） | 常开 |
+| `0006-async-effect-create-passthrough-priming` | EffectCreate 异步构建 + 直通实例交叉淡化换入 | 常开 |
+| `0007-engine-capture-tap` | 采集 tap：IN/OUT 两路 WAV（32001/32002） | **默认关**（未武装零开销） |
+| `0008-engine-mix-integrity-check` | mix 保真自检：断言 `out_after == out_before + rendered`（30023–30028） | **默认关**（未武装零开销） |
+0004–0006 的细节见 `module/src/changelog.md`（v2.1.0 段），0007/0008 见下。
+
 `patches/0001-state-persistence-and-hot-reload.patch`（相对 `src-baseline`，即仅做了 NDK30 编译兼容修复的上游源码）：
 
 1. **状态持久化** `jdsp_state.c/h`
@@ -67,6 +79,42 @@ AudioEffect 句柄也写不进去：
 4. 主机单测 `test_paramq.c` 覆盖分类白名单、FIFO、合并、满槽驱逐、并发生产者/
    渲染者压力（最新值必达、乱序必报）。
 
+## 采集 tap（0007）与 mix 保真自检（0008）
+
+### `patches/0007-engine-capture-tap.patch`（相对 0001–0006 应用后的源码）
+
+**采不到麦克风也要能验收**：把引擎交给 AudioFlinger 的样本直接落 WAV（`jdsp_tap.c/h`）。
+
+- 两路同一渲染调用内取，天然帧对齐：lane0 = effect 输入（AudioFlinger 给我们混的），
+  lane1 = `generic_process()` 交回的 out buffer（= 厂商 AF35 dump 的同一个对象，bit-exact）
+- 渲染线程只做「边界检查 + memcpy 进预分配环形」：无 malloc / 无锁 / 无 syscall / 无日志；
+  writer 线程负责排空成 44 字节头 WAV；环形满则丢最旧并计数，**绝不阻塞音频线程**
+- 参数：`32001` = `jdsp_tap_config_t`（magic/lanes/frames/limit_frames/path/flags），
+  `32002` 读 `jdsp_tap_status_t`（每路 captured/written/dropped + overruns/files）
+- **默认关闭**：`e->tap == NULL`，两处钩子各是一个 NULL 判断——不分配、不 memcpy、不落盘、不打日志
+- 诊断参数在写锁 gate **之前**处理：不需要 engine key、不进延迟队列、不写入 state.bin
+- 主机单测 `test_tap.c`：五种格式逐字节回读、环形溢出策略、`limit_frames`、
+  WAV 头/负载、生产者+消费者并发 19.2 万帧零丢帧、NULL/未知格式 no-op
+
+### `patches/0008-engine-mix-integrity-check.patch`（相对 0007 应用后的源码）
+
+**把 0005 修的契约变成可读计数器**（`jdsp_mixcheck.c/h`）：
+
+- accumulate 路径上：进 process 前快照共享 mix，累加后断言 `out_after == out_before + rendered`
+  （float32 / int32 / int16，整型按饱和；packed-24 与 int8_24 不覆盖）
+- 不一致就计数 ⇒ **即使没有厂商 dump，也能在设备上断言「引擎没有吞掉别人的混音」**
+- 参数：`30023` broken / `30024` checked / `30025` arm(1/0) / `30026` reset /
+  `30027` armed / `30028` 上次不一致的样本数；同样是「gate 之前、不持久、不进队列」
+- **默认关闭**：未武装时每个 buffer 只多一次 relaxed 原子读 + 一次可预测分支；
+  快照缓冲首次武装时才按实例惰性分配，随实例释放
+- 主机单测 `test_mixcheck.c`：覆盖回归（覆盖非零 mix）、静音实例清空整条 mix、
+  int16/int32 饱和、arm/reset/status 计数、未武装默认值、NULL 缓冲
+
+> 两个补丁都是**诊断设施**：默认关闭，未武装时对 DSP 输出没有影响
+> （`module/src/common/files/` 里的 .so 已用未武装路径与 0001–0006 版做过逐字节对比，见
+> `docs/ENGINE-TAP-AND-MIX-CHECK.md`）。
+
+---
 ## 应用补丁
 
 推荐（自动处理上游漂移，见下）：
@@ -84,6 +132,11 @@ cd ../work && cp -a src-baseline src
 patch -p1 -d src < <repo>/native/patches/0001-state-persistence-and-hot-reload.patch
 patch -p1 -d src < <repo>/native/patches/0002-engine-write-lock.patch
 patch -p1 -d src < <repo>/native/patches/0003-deferred-param-apply-and-no-cross-instance-rebuild.patch
+patch -p1 -d src < <repo>/native/patches/0004-dump-async-state-and-peq-heap-scratch.patch
+patch -p1 -d src < <repo>/native/patches/0005-engine-accumulate-out.patch
+patch -p1 -d src < <repo>/native/patches/0006-async-effect-create-passthrough-priming.patch
+patch -p1 -d src < <repo>/native/patches/0007-engine-capture-tap.patch
+patch -p1 -d src < <repo>/native/patches/0008-engine-mix-integrity-check.patch
 ```
 
 > 上游漂移注意：当前 extensions 分支的 Android.mk 已经补齐了 0001 增加的三个

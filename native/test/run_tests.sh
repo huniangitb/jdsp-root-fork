@@ -63,4 +63,14 @@ $CC -std=gnu99 -O1 -g -Wall -Wextra -Wno-unused-parameter -I"$SRC" \
     "$ROOT/test/test_async_save.c" "$SRC/jdsp_state.c" -o "$OUT/test_async_save" -lpthread
 "$OUT/test_async_save"
 
+echo "== build test_tap (0007 capture tap)"
+$CC -std=gnu99 -O1 -g -Wall -Wextra -Wno-unused-parameter -I"$SRC" \
+    "$ROOT/test/test_tap.c" "$SRC/jdsp_tap.c" -o "$OUT/test_tap" -lpthread
+"$OUT/test_tap"
+
+echo "== build test_mixcheck (0008 mix fidelity check)"
+$CC -std=gnu99 -O1 -g -Wall -Wextra -Wno-unused-parameter -I"$SRC" \
+    "$ROOT/test/test_mixcheck.c" "$SRC/jdsp_mixcheck.c" -o "$OUT/test_mixcheck" -lm
+"$OUT/test_mixcheck"
+
 echo "== all host tests passed"

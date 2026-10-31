@@ -1,0 +1,439 @@
+From: JamesDSP root fork - 0008
+Subject: [PATCH 0008] engine: mix fidelity self check (catch a replace style write
+ over the shared mix without the vendor PCM dump)
+
+Patch 0005 fixed a real, user visible bug: with EFFECT_BUFFER_ACCESS_ACCUMULATE
+the effect's out buffer is the output thread's *shared mix*, so the contract is
+"add your rendered output to it".  The engine used to store over it, which
+deleted every other session's contribution (one session playing made the next
+one silent).  That bug was only visible in a thread level capture - the vendor
+AF40_ThreadWrite dump, see docs/TAP-AUDIO-LOSS-VERIFICATION.md - because each
+per-instance lane still looks healthy while another chain's audio disappears.
+
+This patch turns the contract into a counter that runs inside the engine, so
+any ROM can assert it without any vendor dump:
+
+    out_after == out_before + rendered        (saturating for int16/int32)
+
+The process path snapshots the shared mix right before the accumulate, compares
+it afterwards and counts the buffers that do not match.  The counters are
+process wide (every instance in audioserver adds to them) and are exposed
+through the diagnostic parameter channel:
+
+  30023 GET  broken buffers (overwrote somebody else's mix)   <- must stay 0
+  30024 GET  checked buffers                                  <- must grow
+  30025 SET  arm (1) / disarm (0)
+  30026 SET  reset the counters
+  30027 GET  armed flag
+  30028 GET  mismatching samples in the last broken buffer
+
+Default state is OFF and the unarmed path is one relaxed atomic load plus a
+predictable branch: no allocation, no memcpy, no log, no counter update.  The
+snapshot buffer is allocated lazily the first time the check is armed, per
+engine instance, and freed with the instance.  The diagnostic ids are handled
+before the write-lock gate and before the parameter classifier, so they need no
+engine key, are never queued, never persisted and never reach the DSP.
+
+Modes covered: float32, int32 and int16.  Packed 24 bit and int8_24 keep the
+historical replace behaviour (patch 0005) and are deliberately not checked -
+the check never claims fidelity it did not verify.
+
+Host tests: native/test/test_mixcheck.c (the two real bug shapes - replace over
+a non-zero mix and a silent holder wiping the thread - plus saturation and the
+arm/reset accounting).
+
+Overhead measured on this device: see docs/ENGINE-TAP-AND-MIX-CHECK.md.
+---
+diff -Naur b/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c c/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c
+--- a/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c	2026-10-31 13:29:32.661640003 +0800
++++ b/Main/libjamesdsp/jni/jamesdsp/jamesdsp.c	2026-10-31 13:29:32.759641469 +0800
+@@ -25,6 +25,7 @@
+ #include "jdsp_paramq.h"
+ #include "jdsp_accum.h"
+ #include "jdsp_tap.h"
++#include "jdsp_mixcheck.h"
+ typedef struct
+ {
+ 	unsigned long long initializeForFirst;
+@@ -45,6 +46,11 @@
+ 	 * widest).  Allocated in the constructor, grown on demand. */
+ 	void *accScratch;
+ 	size_t accScratchFrames;
++	/* 0008: snapshot of the shared mix taken right before the accumulate, used
++	 * by the mix fidelity check.  NULL unless the check has been armed (lazy
++	 * allocation keeps the unarmed path free of any memory traffic). */
++	void *mcSnap;
++	size_t mcSnapFrames;
+ 	char *stringEq;
+ 	float *tempImpulseIncoming;
+ 	float drcAtkRel[4];
+@@ -135,6 +141,10 @@
+ 	dspmain->outAccumulate = 0;
+ 	dspmain->accScratchFrames = 4096u;
+ 	dspmain->accScratch = malloc(dspmain->accScratchFrames * 2u * sizeof(int32_t));
++	/* 0008: the mix-check snapshot is allocated on the first armed buffer, so a
++	 * build with the check disarmed never touches the allocator. */
++	dspmain->mcSnap = NULL;
++	dspmain->mcSnapFrames = 0;
+ 	/* 0004: preallocate the PEQ/loudness scratch (32 KB).  If this fails the
+ 	 * process path will try to grow it on demand. */
+ 	dspmain->peqScratchSamples = 8192u;
+@@ -144,6 +154,9 @@
+ {
+ 	free(dspmain->accScratch);
+ 	dspmain->accScratch = NULL;
++	free(dspmain->mcSnap);
++	dspmain->mcSnap = NULL;
++	dspmain->mcSnapFrames = 0;
+ 	free(dspmain->peqScratch);
+ 	dspmain->peqScratch = NULL;
+ 	dspmain->peqScratchSamples = 0;
+@@ -1366,9 +1379,43 @@
+ 	}
+ 	if (accumulate)
+ 	{
++		/* 0008: the mix fidelity check.  When disarmed this is one relaxed
++		 * atomic load and one branch; when armed it snapshots the shared mix
++		 * and verifies afterwards that the accumulate really added our output
++		 * to it instead of replacing it. */
++		const int mixArmed = jdsp_mixcheck_armed();
++		int mixfmt = -1;
+ 		renderBuf = *out;
+ 		renderBuf.raw = dspmain->accScratch;
+ 		renderBuf.frameCount = frames;
++		if (mixArmed)
++		{
++			switch (dspmain->formatFloatModeInt32Mode)
++			{
++			case JDSP_ACCUM_MODE_FLOAT: mixfmt = JDSP_MIXCHECK_FLOAT; break;
++			case JDSP_ACCUM_MODE_INT32: mixfmt = JDSP_MIXCHECK_INT32; break;
++			case JDSP_ACCUM_MODE_INT16: mixfmt = JDSP_MIXCHECK_INT16; break;
++			default: break; /* packed 24 / int8_24: not covered, never replace */
++			}
++			if (mixfmt >= 0)
++			{
++				if (dspmain->mcSnap == NULL || dspmain->mcSnapFrames < frames)
++				{
++					void *grownSnap = realloc(dspmain->mcSnap,
++						frames * 2u * sizeof(int32_t));
++					if (grownSnap != NULL)
++					{
++						dspmain->mcSnap = grownSnap;
++						dspmain->mcSnapFrames = frames;
++					}
++				}
++				if (dspmain->mcSnap != NULL && dspmain->mcSnapFrames >= frames)
++					jdsp_copy_interleaved(out->raw, dspmain->mcSnap, frames,
++						dspmain->formatFloatModeInt32Mode);
++				else
++					mixfmt = -1; /* cannot snapshot: skip the check, never the audio */
++			}
++		}
+ 		EffectDSPMainRender(dspmain, in, &renderBuf);
+ 		if (jdsp_accum_add(out->raw, dspmain->accScratch, frames,
+ 			dspmain->formatFloatModeInt32Mode) != 0)
+@@ -1376,6 +1423,9 @@
+ 			/* unreachable for the modes accepted above; replace is the only
+ 			 * possible fallback and matches the historical behaviour */
+ 		}
++		if (mixArmed && mixfmt >= 0)
++			jdsp_mixcheck_account(frames, jdsp_mixcheck_mismatch_count(out->raw,
++				dspmain->mcSnap, dspmain->accScratch, frames, mixfmt, 2u));
+ 		return 0;
+ 	}
+ 	return EffectDSPMainRender(dspmain, in, out);
+@@ -1836,6 +1886,66 @@
+ 			}
+ 		}
+ 	}
++	/* 0008: mix fidelity diagnostic channel.  Handled before the gate and
++	 * before the parameter classifier, so it needs no engine key, is never
++	 * queued, never persisted and never reaches the DSP: these ids only arm a
++	 * counter or read it back. */
++	if ((cmdCode == EFFECT_CMD_SET_PARAM || cmdCode == EFFECT_CMD_GET_PARAM) &&
++		pCmdData != NULL && cmdSize >= 16u &&
++		*(const uint32_t *)((const uint8_t *)pCmdData + 4) == 4u)
++	{
++		const int32_t mcId = (int32_t)*(const uint32_t *)((const uint8_t *)pCmdData + 12);
++		if (mcId == (int32_t)JDSP_MIXCHECK_PARAM_ARM ||
++			mcId == (int32_t)JDSP_MIXCHECK_PARAM_RESET)
++		{
++			if (cmdCode != EFFECT_CMD_SET_PARAM)
++				return -EINVAL;
++			if (*(const uint32_t *)((const uint8_t *)pCmdData + 8) != 4u)
++				return -EINVAL;
++			const int32_t value = *(const int32_t *)((const uint8_t *)pCmdData + 16);
++			if (mcId == (int32_t)JDSP_MIXCHECK_PARAM_ARM)
++				jdsp_mixcheck_configure((uint32_t)(value != 0 ? 1 : 0));
++			else
++				jdsp_mixcheck_reset();
++			if (pReplyData != NULL && replySize != NULL && *replySize >= 4u)
++			{
++				*(int32_t *)pReplyData = 0;
++				*replySize = 4u;
++			}
++			return 0;
++		}
++		if (cmdCode == EFFECT_CMD_GET_PARAM &&
++			(mcId == (int32_t)JDSP_MIXCHECK_PARAM_BROKEN ||
++			 mcId == (int32_t)JDSP_MIXCHECK_PARAM_RUNS ||
++			 mcId == (int32_t)JDSP_MIXCHECK_PARAM_STATE ||
++			 mcId == (int32_t)JDSP_MIXCHECK_PARAM_LAST))
++		{
++			uint32_t armed = 0u;
++			uint64_t runs = 0ull, broken = 0ull, lastBad = 0ull, lastFrames = 0ull;
++			reply1x4_1x4_t *replyData = (reply1x4_1x4_t *)pReplyData;
++			int32_t value;
++			jdsp_mixcheck_status(&armed, &runs, &broken, &lastBad, &lastFrames);
++			(void)lastFrames;
++			if (mcId == (int32_t)JDSP_MIXCHECK_PARAM_BROKEN)
++				value = (int32_t)broken;
++			else if (mcId == (int32_t)JDSP_MIXCHECK_PARAM_RUNS)
++				value = (int32_t)runs;
++			else if (mcId == (int32_t)JDSP_MIXCHECK_PARAM_STATE)
++				value = (int32_t)armed;
++			else
++				value = (int32_t)lastBad;
++			if (replyData == NULL || replySize == NULL ||
++				*replySize < sizeof(reply1x4_1x4_t))
++				return -EINVAL;
++			replyData->status = 0;
++			replyData->psize = 4u;
++			replyData->vsize = 4u;
++			replyData->cmd = mcId;
++			replyData->data = value;
++			*replySize = sizeof(reply1x4_1x4_t);
++			return 0;
++		}
++	}
+ 	/* Caller write protection: while the instance is locked every parameter
+ 	 * write is refused here, before the engine (and the state recorder) ever
+ 	 * sees it.  An unlock handshake is consumed by the gate itself and never
+diff -Naur b/Main/libjamesdsp/jni/jamesdsp/jdsp_mixcheck.c c/Main/libjamesdsp/jni/jamesdsp/jdsp_mixcheck.c
+--- a/Main/libjamesdsp/jni/jamesdsp/jdsp_mixcheck.c	1970-01-01 08:00:00.000000000 +0800
++++ b/Main/libjamesdsp/jni/jamesdsp/jdsp_mixcheck.c	2026-10-31 13:29:32.901643592 +0800
+@@ -0,0 +1,136 @@
++/*
++ * jdsp_mixcheck.c - see jdsp_mixcheck.h (patch 0008).
++ *
++ * Everything here is lock free and allocation free on the render thread: the
++ * counters are atomics and the comparison walks the three buffers once.
++ */
++#include "jdsp_mixcheck.h"
++
++#include <math.h>
++#include <stdatomic.h>
++#include <stdint.h>
++
++/* float32 carries ~7 decimal digits; the accumulate path is an exact float add
++ * for the engine's own output, so a tight epsilon is enough and still tolerates
++ * a HAL that rounds. */
++#define JDSP_MIXCHECK_EPS 1e-6f
++
++static atomic_int g_armed;            /* 0 = off (default), 1 = armed        */
++static atomic_ullong g_runs;          /* buffers checked                     */
++static atomic_ullong g_broken;        /* buffers that did not match the add  */
++static atomic_ullong g_last_bad;      /* mismatching samples in the last one  */
++static atomic_ullong g_last_frames;   /* frames of the last checked buffer    */
++
++int jdsp_mixcheck_configure(uint32_t flags)
++{
++	atomic_store_explicit(&g_armed, (flags & 1u) != 0u ? 1 : 0,
++		memory_order_release);
++	return 0;
++}
++
++int jdsp_mixcheck_armed(void)
++{
++	return atomic_load_explicit(&g_armed, memory_order_relaxed);
++}
++
++void jdsp_mixcheck_reset(void)
++{
++	atomic_store(&g_runs, 0ull);
++	atomic_store(&g_broken, 0ull);
++	atomic_store(&g_last_bad, 0ull);
++	atomic_store(&g_last_frames, 0ull);
++}
++
++void jdsp_mixcheck_account(size_t frames, size_t bad)
++{
++	atomic_fetch_add(&g_runs, 1ull);
++	if (bad != 0u)
++	{
++		atomic_fetch_add(&g_broken, 1ull);
++		atomic_store(&g_last_bad, (unsigned long long)bad);
++		atomic_store(&g_last_frames, (unsigned long long)frames);
++	}
++}
++
++void jdsp_mixcheck_status(uint32_t *armed, uint64_t *runs, uint64_t *broken,
++	uint64_t *last_bad, uint64_t *last_frames)
++{
++	if (armed != NULL)
++		*armed = (uint32_t)atomic_load(&g_armed);
++	if (runs != NULL)
++		*runs = (uint64_t)atomic_load(&g_runs);
++	if (broken != NULL)
++		*broken = (uint64_t)atomic_load(&g_broken);
++	if (last_bad != NULL)
++		*last_bad = (uint64_t)atomic_load(&g_last_bad);
++	if (last_frames != NULL)
++		*last_frames = (uint64_t)atomic_load(&g_last_frames);
++}
++
++size_t jdsp_mixcheck_mismatch_count(const void *out_after, const void *out_before,
++	const void *rendered, size_t frames, int fmt, unsigned channels)
++{
++	const size_t n = frames * (channels != 0u ? channels : 1u);
++	size_t bad = 0;
++	size_t i;
++
++	if (out_after == NULL || out_before == NULL || rendered == NULL)
++		return n;
++
++	switch (fmt)
++	{
++	case JDSP_MIXCHECK_FLOAT:
++	{
++		const float *o = (const float *)out_after;
++		const float *b = (const float *)out_before;
++		const float *r = (const float *)rendered;
++		for (i = 0; i < n; i++)
++		{
++			const float want = b[i] + r[i];
++			if (fabsf(o[i] - want) > JDSP_MIXCHECK_EPS)
++				bad++;
++		}
++		break;
++	}
++	case JDSP_MIXCHECK_INT32:
++	{
++		const int32_t *o = (const int32_t *)out_after;
++		const int32_t *b = (const int32_t *)out_before;
++		const int32_t *r = (const int32_t *)rendered;
++		for (i = 0; i < n; i++)
++		{
++			/* Saturate in the integer domain: INT32_MAX is not representable
++			 * as float32, so a float comparison would misfire exactly on the
++			 * saturation case this check exists for. */
++			int64_t v = (int64_t)b[i] + (int64_t)r[i];
++			if (v > (int64_t)INT32_MAX)
++				v = (int64_t)INT32_MAX;
++			else if (v < (int64_t)INT32_MIN)
++				v = (int64_t)INT32_MIN;
++			if ((int64_t)o[i] != v)
++				bad++;
++		}
++		break;
++	}
++	case JDSP_MIXCHECK_INT16:
++	{
++		const int16_t *o = (const int16_t *)out_after;
++		const int16_t *b = (const int16_t *)out_before;
++		const int16_t *r = (const int16_t *)rendered;
++		for (i = 0; i < n; i++)
++		{
++			int32_t v = (int32_t)b[i] + (int32_t)r[i];
++			if (v > 32767)
++				v = 32767;
++			else if (v < -32768)
++				v = -32768;
++			if ((int32_t)o[i] != v)
++				bad++;
++		}
++		break;
++	}
++	default:
++		return n; /* unknown format: never claim fidelity */
++	}
++	return bad;
++}
+diff -Naur b/Main/libjamesdsp/jni/jamesdsp/jdsp_mixcheck.h c/Main/libjamesdsp/jni/jamesdsp/jdsp_mixcheck.h
+--- a/Main/libjamesdsp/jni/jamesdsp/jdsp_mixcheck.h	1970-01-01 08:00:00.000000000 +0800
++++ b/Main/libjamesdsp/jni/jamesdsp/jdsp_mixcheck.h	2026-10-31 13:29:33.020645372 +0800
+@@ -0,0 +1,84 @@
++/*
++ * jdsp_mixcheck.h - engine side "mix fidelity" self check (patch 0008).
++ *
++ * Why: with EFFECT_BUFFER_ACCESS_ACCUMULATE (patch 0005) the effect's out
++ * buffer is the output thread's *shared mix*, so the contract is
++ *
++ *     out_after == out_before + rendered          (saturating for integers)
++ *
++ * A replace-style write silently deletes every other session's contribution
++ * (that was the 0005 regression: "one session playing, the next one silent"),
++ * and no per-instance tap can see it - the damaged buffer is somebody else's.
++ * The check snapshots the shared mix right before the accumulate, compares it
++ * afterwards and counts the samples that do not match.  A non-zero "broken"
++ * counter therefore *is* the bug, measurable on any ROM without the vendor
++ * PCM dump.
++ *
++ * Cost when not armed: one relaxed atomic load per processed buffer and one
++ * predictable branch.  No allocation, no memcpy, no logging - the snapshot
++ * buffer is allocated lazily the first time the check is armed.
++ *
++ * Control channel (effect parameters, handled before the write-lock gate in
++ * generic_command, so it needs no engine key and is never persisted):
++ *
++ *   30023 GET  int32  broken buffers (engine overwrote the mix)
++ *   30024 GET  int32  checked buffers
++ *   30025 SET  int32  arm (1) / disarm (0)
++ *   30026 SET  int32  reset the counters
++ *   30027 GET  int32  armed flag
++ *   30028 GET  int32  samples that mismatched in the last broken buffer
++ *
++ * The counters are process wide: every JamesDSP instance in audioserver adds
++ * to them, which is what an acceptance run wants (any instance damaging the
++ * mix is a failure).
++ */
++#ifndef JDSP_MIXCHECK_H
++#define JDSP_MIXCHECK_H
++
++#ifndef __cplusplus
++
++#include <stddef.h>
++#include <stdint.h>
++
++#define JDSP_MIXCHECK_PARAM_BROKEN 30023u
++#define JDSP_MIXCHECK_PARAM_RUNS   30024u
++#define JDSP_MIXCHECK_PARAM_ARM    30025u
++#define JDSP_MIXCHECK_PARAM_RESET  30026u
++#define JDSP_MIXCHECK_PARAM_STATE  30027u
++#define JDSP_MIXCHECK_PARAM_LAST   30028u
++
++/* Snapshot format selector (mirrors the engine's formatFloatModeInt32Mode,
++ * minus packed 24 bit and int8_24: the first keeps the historical behaviour,
++ * the second has no WAV/compare counterpart here). */
++enum jdsp_mixcheck_fmt {
++	JDSP_MIXCHECK_FLOAT = 0,
++	JDSP_MIXCHECK_INT32 = 1,
++	JDSP_MIXCHECK_INT16 = 2
++};
++
++/* Arms (flags & 1) or disarms the check.  Returns 0. */
++int jdsp_mixcheck_configure(uint32_t flags);
++
++/* Relaxed read of the armed flag - one atomic load, safe from the render
++ * thread. */
++int jdsp_mixcheck_armed(void);
++
++/* Clears the counters (does not touch the armed flag). */
++void jdsp_mixcheck_reset(void);
++
++/* Records one checked buffer: frames compared, bad = samples that did not
++ * match.  Lock free (atomic add), safe from the render thread. */
++void jdsp_mixcheck_account(size_t frames, size_t bad);
++
++/* Number of samples of one buffer that are not out_before + rendered.
++ * fmt is a jdsp_mixcheck_fmt, channels the interleaved channel count. */
++size_t jdsp_mixcheck_mismatch_count(const void *out_after, const void *out_before,
++	const void *rendered, size_t frames, int fmt, unsigned channels);
++
++/* Snapshot of the counters (any pointer may be NULL). */
++void jdsp_mixcheck_status(uint32_t *armed, uint64_t *runs, uint64_t *broken,
++	uint64_t *last_bad, uint64_t *last_frames);
++
++#endif /* !__cplusplus */
++
++#endif /* JDSP_MIXCHECK_H */
