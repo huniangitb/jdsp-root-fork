@@ -395,4 +395,31 @@ mode=dumpsys sessions=0` → `detach session=113` → `released session=113`，�
 复现/验收脚本：`out/confirm/stale-ab.sh`（原生播放器挂载 + 强杀 + 计时），
 verdict 判据 = `kill->release < 5 s` 且 `attach session=` 出现在 `aaudio_tone` 启动后 2 s 内。
 
+### 13.2 v2.1.10 发版安装与开机验证
+
+```bash
+adb -s 64a4bad0 push dist/JDSP-fork-v2.1.10.zip /data/local/tmp/
+adb -s 64a4bad0 shell su -c 'ksud module install /data/local/tmp/JDSP-fork-v2.1.10.zip'
+#  -> Module installed successfully!（暂存 /data/adb/modules_update，versionCode=220）
+adb -s 64a4bad0 reboot
+```
+
+开机核对（全部通过）：
+
+| 项 | 结果 |
+|---|---|
+| 模块版本 | `version=v2.1.10-fork (2026-10-31)` / `versionCode=220`；`/data/adb/modules_update` 已空 |
+| 守护进程 | `jdspd 2.1.10`，`backend/jdspd.dex` md5 `2f3cd0b1c5230f6a3ecc03d753d4462a`（与 dist 内一致） |
+| 配置 | `config.json` 1291 B、md5 `39f0dba39fcf56f3633c68fbcbc2391a`，与重启前**逐字节一致** |
+| 验收①：强杀 → 释放 | 原生播放器（AAudio, uid 10123）挂载后 `SIGKILL` → **1600 ms** `released session=89`（`reason=confirm`） |
+| 验收②：原生播放器挂载 | `attach session=89 … in 84352us`，启动后 **1200 ms** 完成（v2.1.9：从不） |
+| 验收③：Java 播放器 | attach **81 ms**（probe 路径），结束后当次 pass 释放（无回归） |
+| 空闲 CPU | 开机后 40 s 窗口 7 ticks = **0.175 %**，期间 0 次 dumpsys |
+| soak | service.d 自启正常，重启后首行 `19:17:26`（bootid `c4ea0352`，`jdsphits=0`） |
+| 单测/自检 | `./backend/test/run_tests.sh` **283 passed** + 自检 11 PASS；`./module/package.sh` 四段自检全绿 |
+
+分发包 `dist/JDSP-fork-v2.1.10.zip`：33,276,424 B，sha256
+`32879bca442ce87344f3dbf1b55848a98ba40b86b2a100396dc9f53c260c0fb4`（jdspd.dex `2f3cd0b1…`、
+jdspcli.dex `ed1cc121…`）。
+
 
