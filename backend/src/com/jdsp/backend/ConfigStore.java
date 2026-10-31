@@ -123,9 +123,17 @@ public final class ConfigStore {
         return !map.isEmpty();
     }
 
+    /**
+     * Serialises the file writes. The payload is built under the config monitor,
+     * the fsync happens under this lock only, so a save can never make a reader
+     * (the hot parameter path calls isEnabled()/setParamFor() per write) wait for
+     * the flash: one fsync on /data/adb is 35-50 ms and used to be the burst tail.
+     */
+    private final Object fileLock = new Object();
+
     /** Writes the config when something changed. Also called from the watcher tick. */
-    public synchronized boolean saveIfDirty() {
-        return dirty ? saveLocked() : true;
+    public boolean saveIfDirty() {
+        return saveThrottled(0L);
     }
 
     /**
@@ -133,39 +141,69 @@ public final class ConfigStore {
      * parameter path so a slider drag does not fsync on every event, while a single set is still
      * on disk almost immediately (the watcher tick flushes anything throttled within 1 s).
      */
-    public synchronized boolean saveThrottled(long minIntervalMs) {
-        if (!dirty) {
-            return true;
+    public boolean saveThrottled(long minIntervalMs) {
+        byte[] data;
+        synchronized (this) {
+            if (!dirty) {
+                return true;
+            }
+            if (minIntervalMs > 0L && System.currentTimeMillis() - lastSaveAt < minIntervalMs) {
+                return true;
+            }
+            data = payloadLocked();
+            dirty = false;
         }
-        if (System.currentTimeMillis() - lastSaveAt < minIntervalMs) {
-            return true;
-        }
-        return saveLocked();
+        return writePayload(data);
     }
 
-    public synchronized boolean save() {
-        dirty = true;
-        return saveLocked();
+    public boolean save() {
+        byte[] data;
+        synchronized (this) {
+            dirty = true;
+            data = payloadLocked();
+            dirty = false;
+        }
+        return writePayload(data);
     }
 
-    private boolean saveLocked() {
+    /** Snapshot of the config as bytes; the caller holds the monitor. */
+    private byte[] payloadLocked() {
         try {
             JSONObject o = toJsonLocked();
             o.put("updatedAt", System.currentTimeMillis() / 1000L);
-            byte[] data = o.toString(2).getBytes("UTF-8");
-            if (!FileUtil.writeAtomic(file, data, FILE_MODE)) {
-                Log.w("config save failed: " + file);
-                return false;
-            }
-            updatedAt = System.currentTimeMillis() / 1000L;
-            lastSaveAt = System.currentTimeMillis();
-            dirty = false;
-            writeModeMirrorLocked();
-            return true;
+            return o.toString(2).getBytes("UTF-8");
         } catch (Throwable t) {
-            Log.e("config save failed", t);
+            Log.e("config serialisation failed", t);
+            return null;
+        }
+    }
+
+    /** Atomic write of a payload snapshot; never called with the config monitor held. */
+    private boolean writePayload(byte[] data) {
+        if (data == null) {
             return false;
         }
+        synchronized (fileLock) {
+            try {
+                if (!FileUtil.writeAtomic(file, data, FILE_MODE)) {
+                    Log.w("config save failed: " + file);
+                    return false;
+                }
+                long now = System.currentTimeMillis();
+                updatedAt = now / 1000L;
+                lastSaveAt = now;
+                writeModeMirrorLocked();
+                return true;
+            } catch (Throwable t) {
+                Log.e("config save failed", t);
+                return false;
+            }
+        }
+    }
+
+    /** Save path for the callers that already hold the monitor (load / import). */
+    private boolean saveLocked() {
+        return writePayload(payloadLocked());
     }
 
     // ---- mode / enable -------------------------------------------------------

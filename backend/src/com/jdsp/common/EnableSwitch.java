@@ -44,11 +44,18 @@ public final class EnableSwitch {
      * Default rate limit for transitions (ms).
      *
      * <p>Was 1000 ms; every "on" then waited up to a full second before the first instance was
-     * even created, which the user reported as "the switch takes seconds".  300 ms still caps
-     * the transition rate at ~3.3/s (the measured crash needed ~28 framework calls per second)
-     * while keeping the whole on-transition inside the 1 s budget.
+     * even created, which the user reported as "the switch takes seconds". 300 ms still left a
+     * deferred "on" at 588-604 ms end to end (measured) because it was the dominant term.
+     *
+     * <p>Now 50 ms. The interval exists to bound how often the daemon can <b>mount</b> instances
+     * ("on" = create + parameter replay, the expensive direction); with the bypass-first master
+     * switch an "off" no longer releases the handles, they are only un-bypassed or - after
+     * {@code CoreApi.IDLE_UNLOAD_MS} of silence - re-created, so a click burst can no longer
+     * produce a mount storm: it collapses into at most one transition per 50 ms while no handle
+     * is torn down in between. The bypass path itself was measured at 400 toggles with 0 errors
+     * (p50 0.26 ms), two orders of magnitude faster than this limit.
      */
-    public static final long DEFAULT_MIN_INTERVAL_MS = 300L;
+    public static final long DEFAULT_MIN_INTERVAL_MS = 50L;
 
     private boolean applied = true;
     /** True while the transition to the opposite state waits for the rate limit. */
@@ -117,6 +124,19 @@ public final class EnableSwitch {
         }
         pending = false;
         return Boolean.valueOf(!applied);
+    }
+
+    /**
+     * Absolute time (ms, {@link System#currentTimeMillis()}) at which the pending
+     * transition may be applied, or {@code 0} when nothing is pending.
+     *
+     * <p>Lets the daemon arm a timer for exactly that instant instead of finding
+     * out on the next watcher poll (which cost up to {@code POLL_MS} on top of the
+     * rate limit: measured 612 ms from the request to the apply, 986 ms to a
+     * mounted instance).
+     */
+    public long pendingDeadlineMs() {
+        return pending ? pendingDeadline : 0L;
     }
 
     /**

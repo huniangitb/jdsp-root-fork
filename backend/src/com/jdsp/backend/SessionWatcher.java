@@ -184,6 +184,12 @@ public final class SessionWatcher {
     /** Runs exactly one watcher pass (also used by --selftest). */
     public void pollOnce() {
         long t0 = System.currentTimeMillis();
+        // A rate limited "on" transition is applied FIRST: it must not queue behind
+        // the dumpsys + reconcile work of this tick (CoreApi also arms a timer for
+        // the exact deadline, this is the safety net only).
+        if (api != null) {
+            api.pollEnableSwitch();
+        }
         String dump = runDumpsys();
         ticks++;
         lastTickAt = t0;
@@ -213,10 +219,6 @@ public final class SessionWatcher {
         reconcile(list);
         config.saveIfDirty();
         refreshEndpointFiles();
-        // Apply a "on" transition that was rate limited (see EnableSwitch).
-        if (api != null) {
-            api.pollEnableSwitch();
-        }
     }
 
     /**
@@ -412,6 +414,17 @@ public final class SessionWatcher {
                     Log.i("detached session=" + s.sessionId + " pkg=" + s.pkg + " ("
                             + (globallyDisabled ? "global switch off, " : "")
                             + d.reason + ")");
+                }
+                continue;
+            }
+            if (action == EnableGate.ACTION_BYPASS_HELD) {
+                // Bypass-first off: the handle stays in the chain but must be
+                // disabled (enabled=0 -> zero audio processing). One idempotent
+                // framework call at most; no detach, so no chain rebuild.
+                if (effects.isEnabled(s.sessionId)) {
+                    effects.setEnabled(s.sessionId, false);
+                    Log.i("bypassed session=" + s.sessionId + " pkg=" + s.pkg
+                            + " (global switch off, handle kept)");
                 }
                 continue;
             }

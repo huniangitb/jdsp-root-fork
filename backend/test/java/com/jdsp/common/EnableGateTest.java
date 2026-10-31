@@ -25,16 +25,20 @@ public final class EnableGateTest {
             }
         });
 
-        suite.test("gate: global switch off unloads held handles and never attaches",
+        suite.test("gate: global switch off bypasses held handles and never attaches",
                 new com.jdsp.cli.Body() {
                     public void run() {
                         // policy wants the effect, but the master switch is off and a handle
-                        // is held: unload semantics, identical to the exclusion path.
-                        Assert.eq(EnableGate.ACTION_RELEASE,
+                        // is held: bypass-first. The handle stays in the chain, disabled, so
+                        // turning the switch back on costs one framework call instead of a
+                        // detach + create + 26-parameter replay (measured 250-420 ms); the
+                        // daemon releases it only after CoreApi.IDLE_UNLOAD_MS of silence,
+                        // which is why this is no longer ACTION_RELEASE.
+                        Assert.eq(EnableGate.ACTION_BYPASS_HELD,
                                 EnableGate.action(false, true, true, true));
                         // policy=follow in auto mode (no effect wanted) and the switch off:
-                        // still released.
-                        Assert.eq(EnableGate.ACTION_RELEASE,
+                        // the held handle is bypassed the same way.
+                        Assert.eq(EnableGate.ACTION_BYPASS_HELD,
                                 EnableGate.action(false, true, false, true));
                         // Nothing held while the switch is off: nothing to do, and above all
                         // no attach (that is what keeps the switch off from mounting instances).
@@ -69,6 +73,7 @@ public final class EnableGateTest {
                 Assert.eq("attach", EnableGate.name(EnableGate.ACTION_ATTACH));
                 Assert.eq("bypass", EnableGate.name(EnableGate.ACTION_BYPASS));
                 Assert.eq("release", EnableGate.name(EnableGate.ACTION_RELEASE));
+                Assert.eq("bypass-held", EnableGate.name(EnableGate.ACTION_BYPASS_HELD));
             }
         });
     }

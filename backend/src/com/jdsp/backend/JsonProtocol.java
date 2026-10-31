@@ -201,18 +201,55 @@ public final class JsonProtocol {
             int session = intField(req, new String[] {"session", "s"}, -1);
             int param = intField(req, new String[] {"param", "p"}, -1);
             String hex = firstString(req, new String[] {"value", "v", "hex"});
-            if (session <= 0 || param < 0 || hex == null) {
-                return Reply.error("missing 'session'/'param'/'value'", EffectManager.ERR_BAD_ARG);
+            if (param < 0 || hex == null) {
+                return Reply.error("missing 'param'/'value'", EffectManager.ERR_BAD_ARG);
             }
             byte[] value = ConfigStore.unhex(hex);
             if (value == null || value.length == 0) {
                 return Reply.error("value is not a valid hex string", EffectManager.ERR_BAD_ARG);
             }
-            int rc = api.setParam(session, param, value);
+            // session <= 0 = the App's global instance: apply to every mounted session
+            // (one request instead of sessions + N x setParam round trips).
+            int rc = session <= 0
+                    ? api.setParamGlobal(param, value)
+                    : api.setParam(session, param, value);
             if (rc == CoreApi.ERR_DISABLED) {
                 return Reply.error("backend is globally disabled", rc);
             }
             return rc == 0 ? Reply.status(0) : Reply.error("setParam status " + rc, rc);
+        }
+        if ("setparams".equals(cmd)) {
+            // Batch dialect: {"op":"setparams","s":0,"params":[[1500,"cdcc..."],[...]]}
+            // One round trip per slider frame instead of one per parameter.
+            int session = intField(req, new String[] {"session", "s"}, 0);
+            JSONArray list = req.optJSONArray("params");
+            if (list == null) {
+                return Reply.error("missing 'params'", EffectManager.ERR_BAD_ARG);
+            }
+            int ok = 0;
+            int failed = 0;
+            for (int i = 0; i < list.length(); i++) {
+                JSONArray pair = list.optJSONArray(i);
+                if (pair == null || pair.length() < 2) {
+                    failed++;
+                    continue;
+                }
+                int param = pair.optInt(0, -1);
+                byte[] value = ConfigStore.unhex(pair.optString(1, ""));
+                if (param < 0 || value == null || value.length == 0) {
+                    failed++;
+                    continue;
+                }
+                int rc = session <= 0
+                        ? api.setParamGlobal(param, value)
+                        : api.setParam(session, param, value);
+                if (rc == 0) {
+                    ok++;
+                } else {
+                    failed++;
+                }
+            }
+            return Reply.ok().with("applied", ok).with("failed", failed);
         }
         if ("getparam".equals(cmd)) {
             int session = intField(req, new String[] {"session", "s"}, -1);

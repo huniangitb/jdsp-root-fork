@@ -80,8 +80,30 @@ public final class CoreApi {
             }
         }
     });
+    /**
+     * Bypass-first master switch: after the switch went off the instances stay in
+     * the chain (disabled) for this long before they are released. Long enough
+     * that a user who flips the switch back does not pay the create/replay path,
+     * short enough that an "off" device does not keep a dormant effect forever.
+     */
+    public static final long IDLE_UNLOAD_MS = 20000L;
+    /** Fires the deferred "on" transition at its deadline (no 500 ms poll dependency). */
+    private final java.util.concurrent.ScheduledExecutorService switchTimer =
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(
+                    new java.util.concurrent.ThreadFactory() {
+                        @Override
+                        public Thread newThread(Runnable r) {
+                            Thread t = new Thread(r, "jdspd-switch");
+                            t.setDaemon(true);
+                            return t;
+                        }
+                    });
+    /** Pending idle unload of the bypassed handles (cancelled by a re-enable). */
+    private volatile java.util.concurrent.ScheduledFuture<?> idleUnload;
     private volatile String instanceLockFile = "";
     private volatile long instanceStartedAt;
+    private final java.util.concurrent.atomic.AtomicLong unloadSeq =
+            new java.util.concurrent.atomic.AtomicLong();
     private volatile boolean binderPublished;
     private volatile int tcpPort = -1;
     private volatile int tcpClients;
@@ -338,8 +360,10 @@ public final class CoreApi {
         }
         int status = bus.setParam(sessionId, paramId, value);
         if (status == 0 && isPersistable(paramId, value)) {
-            SessionView v = getSession(sessionId);
-            String pkg = v == null ? "" : v.pkg;
+            // The package for the scope rule comes from the handle: getSession() would
+            // rebuild the whole session view list (snapshot + per-session policy lookup
+            // + sort) on every single write.
+            String pkg = effects.pkgOf(sessionId);
             // One rule for every caller (ConfigStore.scopeFor): global unless the app has its
             // own per app parameters or an explicit policy entry.
             config.setParamFor(pkg, paramId, value);
@@ -350,6 +374,46 @@ public final class CoreApi {
             persister.request();
         }
         return status;
+    }
+
+    /**
+     * One write that applies to every mounted session (the App's "global instance"
+     * semantics: its sink is session 0, the handle set lives here).
+     *
+     * <p>Why in the daemon: the App used to resolve session 0 itself - one
+     * {@code sessions} round trip plus one {@code setParam} round trip per mounted
+     * session, per slider event. Here it is one request and one config record, and
+     * the per-session writes happen in process.
+     *
+     * @return 0 when at least one session accepted the write (or the intent was
+     *         stored while the backend is off / nothing is mounted),
+     *         {@link #ERR_DISABLED} when the master switch is off
+     */
+    public int setParamGlobal(int paramId, byte[] value) {
+        if (value == null || value.length == 0) {
+            return EffectManager.ERR_BAD_ARG;
+        }
+        if (!config.isEnabled()) {
+            return ERR_DISABLED;
+        }
+        List<Integer> targets = effects.attachedSessionsCopy();
+        int applied = 0;
+        int last = 0;
+        for (int i = 0; i < targets.size(); i++) {
+            last = bus.setParam(targets.get(i).intValue(), paramId, value);
+            if (last == 0) {
+                applied++;
+            }
+        }
+        if (isPersistable(paramId, value)) {
+            config.setParamFor("", paramId, value);
+            persister.request();
+        }
+        if (applied > 0) {
+            return 0;
+        }
+        // Nothing mounted: keep the value (the config replay applies it on attach).
+        return targets.isEmpty() ? 0 : last;
     }
 
     /** One GET_PARAM; returns the value bytes, or an empty array on failure. */
@@ -566,9 +630,11 @@ public final class CoreApi {
         }
         if (decision == EnableSwitch.DEFER) {
             // The "on" direction is rate limited: a burst of requests collapses into one
-            // transition (the watcher applies it when the deadline passes).
+            // transition. The timer below applies it at the deadline - the watcher tick
+            // stays as a fallback only, so the transition no longer waits for a poll.
             Log.i("global enable deferred (rate limited), the switch is currently "
                     + (enableSwitch.applied() ? "on" : "off"));
+            scheduleEnablePoll(enableSwitch.pendingDeadlineMs() - now);
             return 0;
         }
         applyEnabled(enabled, now);
@@ -586,19 +652,74 @@ public final class CoreApi {
                     + " (policy on/exclude does not override the master switch)");
         }
         if (!enabled) {
-            // Off means unload: detach every handle (each detach first issues a synchronous
-            // setEnabled(false) - an immediate bypass - and then releases, see
-            // EffectManager.detach). On ROMs that tear handles down promptly the instances
-            // leave the chain; on ROMs where they linger the leftovers are at least
-            // enabled=n (zero audio processing). detachAll goes through detach() per session,
-            // so the write-lock unlock state is forgotten too.
-            int n = effects.detachAll();
-            Log.i("global disabled: " + n + " instance(s) detached");
+            // Bypass first, unload later. Disabling a live instance is one framework
+            // call (0.25 ms p50 measured, 400/400 ok, no chain rebuild); releasing it
+            // costs 28 ms and the next "on" pays another 150-420 ms of create +
+            // 26-parameter replay - and chain churn is what crashed the vendor HAL.
+            int n = effects.setEnabledAll(false);
+            Log.i("global disabled: " + n + " instance(s) bypassed (unload in "
+                    + IDLE_UNLOAD_MS + " ms)");
+            scheduleIdleUnload();
+        } else {
+            // Fast path: whatever is still mounted is simply un-bypassed (~0.25 ms),
+            // only what the idle unload already released goes through attach+replay.
+            cancelIdleUnload();
+            int n = effects.setEnabledAll(true);
+            Log.i("global enabled: " + n + " instance(s) un-bypassed");
         }
         // The watcher reconciles the rest: off -> no new attaches (and it releases anything that
         // is somehow still held), on -> re-attach the active sessions and re-apply their
         // parameters on the next tick.
         watcher.poke();
+    }
+
+    /**
+     * Releases the bypassed handles after {@link #IDLE_UNLOAD_MS} of "off".
+     *
+     * <p>Runs on the switch timer, never on a request thread, so a user who flips
+     * the switch back within the window only pays the bypass path.
+     */
+    private void scheduleIdleUnload() {
+        cancelIdleUnload();
+        final long seq = unloadSeq.incrementAndGet();
+        idleUnload = switchTimer.schedule(new Runnable() {
+            @Override
+            public void run() {
+                if (seq != unloadSeq.get() || config.isEnabled()) {
+                    return; // the switch came back on meanwhile
+                }
+                int n = effects.detachAll();
+                Log.i("idle unload: " + n + " bypassed instance(s) released");
+            }
+        }, IDLE_UNLOAD_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
+    }
+
+    private void cancelIdleUnload() {
+        unloadSeq.incrementAndGet();
+        java.util.concurrent.ScheduledFuture<?> f = idleUnload;
+        idleUnload = null;
+        if (f != null) {
+            f.cancel(false);
+        }
+    }
+
+    /**
+     * Arms the deferred "on" transition for exactly its deadline.
+     *
+     * <p>Why not the watcher poll: the tick runs a 78 KB {@code dumpsys
+     * media.audio_flinger} (28-150 ms) plus reconcile before it polls the switch,
+     * so a deferred transition could wait 500 ms (poll period) + 300 ms (rate
+     * limit) + the dumpsys cost. Measured end to end: 612 ms to "applied", 986 ms
+     * until the engine instance was enabled again.
+     */
+    private void scheduleEnablePoll(long delayMs) {
+        final long delay = Math.max(1L, delayMs);
+        switchTimer.schedule(new Runnable() {
+            @Override
+            public void run() {
+                pollEnableSwitch();
+            }
+        }, delay, java.util.concurrent.TimeUnit.MILLISECONDS);
     }
 
     /** Current state of the master switch. */

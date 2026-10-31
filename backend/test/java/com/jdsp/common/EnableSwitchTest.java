@@ -72,6 +72,28 @@ public final class EnableSwitchTest {
             }
         });
 
+        suite.test("switch: the pending deadline is exposed for the timer",
+                new com.jdsp.cli.Body() {
+                    public void run() {
+                        // 0 = nothing pending, so the daemon arms no timer.
+                        EnableSwitch s = new EnableSwitch(300L);
+                        Assert.eq(0L, s.pendingDeadlineMs());
+                        s.request(false, 1000L);
+                        s.transitionApplied(false, 1000L);
+                        Assert.eq(0L, s.pendingDeadlineMs(), "still nothing pending");
+                        // A deferred "on" reports exactly the instant it becomes due: CoreApi
+                        // arms a ScheduledExecutor for it (the watcher tick stays as the
+                        // fallback), so a deferred transition no longer waits for the 500 ms
+                        // poll on top of the rate limit (measured 612/986 ms before).
+                        Assert.eq(EnableSwitch.DEFER, s.request(true, 1100L));
+                        // The deadline is "request time + one rate-limit interval".
+                        Assert.eq(1400L, s.pendingDeadlineMs());
+                        Assert.eq(null, s.poll(1399L), "not due one ms before the deadline");
+                        Assert.eq(Boolean.TRUE, s.poll(1400L), "due at the deadline");
+                        Assert.eq(0L, s.pendingDeadlineMs(), "nothing pending after the poll");
+                    }
+                });
+
         suite.test("switch: an echo does not cancel a pending transition", new com.jdsp.cli.Body() {
             public void run() {
                 EnableSwitch s = new EnableSwitch(1000L);

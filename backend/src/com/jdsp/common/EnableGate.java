@@ -22,6 +22,17 @@ public final class EnableGate {
     public static final int ACTION_BYPASS = 1;
     /** Release the handle (policy exclude, or the global master switch is off). */
     public static final int ACTION_RELEASE = 2;
+    /**
+     * Keep the handle and only bypass it (master switch off, bypass-first).
+     *
+     * <p>Disabling a live instance is one framework call (~0.25 ms measured) and
+     * never touches the effect chain, while releasing + re-creating it costs
+     * 28 ms (release) plus 150-420 ms (create + parameter replay) and rebuilds
+     * the chain - the operation that was measured to crash the vendor HAL under
+     * churn. {@link com.jdsp.backend.CoreApi} therefore bypasses first and only
+     * releases the handles after {@code IDLE_UNLOAD_MS} of silence.
+     */
+    public static final int ACTION_BYPASS_HELD = 3;
 
     private EnableGate() {
     }
@@ -42,7 +53,7 @@ public final class EnableGate {
             // instance may stay in the chain, so a held handle is released (the watcher
             // detaches it, AudioFlinger destroys the instance) and a new one is never
             // attached. Turning the switch back on re-attaches via the watcher.
-            return alreadyHeld ? ACTION_RELEASE : ACTION_BYPASS;
+            return alreadyHeld ? ACTION_BYPASS_HELD : ACTION_BYPASS;
         }
         if (policyAllows) {
             return ACTION_ATTACH;
@@ -60,6 +71,8 @@ public final class EnableGate {
                 return "bypass";
             case ACTION_RELEASE:
                 return "release";
+            case ACTION_BYPASS_HELD:
+                return "bypass-held";
             default:
                 return "unknown";
         }
