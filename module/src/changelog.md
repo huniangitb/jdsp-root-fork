@@ -1,3 +1,34 @@
+### v2.1.4-fork（最低操作链路时延：总开关 bypass 优先 + 事件唤醒 deferred + 后端批量/全局写 + App 直投）
+
+* **总开关改 bypass 优先、空闲兜底卸载（jdspd 2.1.4）**：`off` 不再拆链，只在活着的句柄上下一次
+  `EnableGate.ACTION_BYPASS_HELD`（bypass 生效 12 ms），`on` 变成取消 bypass——on 方向
+  **p50 412 ms → 14 ms**（7-25 ms 区间），正常的 off/on 周期**不再重建 effect chain**。
+  `off` 满 20 s 才做一次空闲卸载（`CoreApi.IDLE_UNLOAD_MS=20 s`，日志
+  `idle unload: N bypassed instance(s) released`），此后再 `on` 回到完整 attach 代价（实测 328 ms）。
+* **deferred `on` 改事件唤醒**：`EnableSwitch.pendingDeadlineMs()` 到期由 ScheduledExecutor 直接
+  apply（watcher tick 只作兜底，且挪到 tick 最前），端到端 **857-999 ms → 52-57 ms**；同时
+  `EnableSwitch.DEFAULT_MIN_INTERVAL_MS` 300 → 50 ms——bypass 优先之后 off 不再拆链，这个间隔只
+  约束挂载方向，连点被压成一次跳变（单独回退这一项 = 把常量恢复 300L）。
+* **config 落盘 fsync 移出锁**：JSON 快照在 ConfigStore 监视器内构建、fsync 在独立 fileLock 下，
+  保存不再挡住参数热路径（`isEnabled()`/`setParamFor()`）：参数写 p95 15.6 → 11.7 ms，
+  **RTT max 94.8 → 16.1 ms**。
+* **后端写路径**：`pkgOf(sessionId)` 直接读句柄、不再为每次写重建整张会话视图；新增
+  `setParamGlobal`（session <= 0 = 所有已挂载会话）与 JsonProtocol 的 `setparams` 批量操作
+  （每帧一个往返，向后兼容）。
+* **App 1.6.18（versionCode 64，源码构建，同签名可直接升级）**：
+  - 总开关意图**直投 worker**（`ENABLE_REQUEST` + `LockSupport.unpark`，循环顶消费，不限速、
+    不被 `backendDisabled` 拦）：连点第二次不再等 500 ms 重放闸门（实测 470-537 ms → 点击窗口内到达）。
+  - `backendDisabled` 有了真正的出口：重放闸门放行 "on"，用户开关请求清零退避并立刻重连
+    （不再等 3 s / 10 s / 30 s）。
+  - `TcpTransport.setParam` 返回后端业务码而不是一律 -2：**-1006（总开关关着）不再被当成传输
+    故障**（不丢连接、不退避）；实测后端关着时六次被拒写后，紧接着的开关点击立即到达 daemon。
+  - worker 改 park 2 ms + **20 s 一次 TCP 保活 ping**：空闲 >30 s 后第一条写不再付重连代价（+65 ms）。
+* 引擎与 `libjamesdsp.so` 不变（arm64 `265544f5` / arm `6a5ad413`，补丁 0001-0006 未改）；
+  后端 jdspd 2.1.4。
+* 测试：`./backend/test/run_tests.sh` → **248 passed**，设备选择 selftest **11 PASS**
+  （`EnableGateTest` 期望 `ACTION_BYPASS_HELD`，`EnableSwitchTest` 覆盖 `pendingDeadlineMs()`；
+  App 无主机测试目标，App 侧改动在真机复验）。
+
 ### v2.1.3-fork（App 1.6.17：UI 不持有任何音效配置参数，先拉取再修改）
 
 * **App 1.6.17（versionCode 63，源码构建，同签名可直接升级）**——按"UI 不持有参数、只从后端拉取，

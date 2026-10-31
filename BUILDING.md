@@ -66,13 +66,14 @@ AIDL_EFFECT_V=3 AIDL_TYPES_V=5 ./native/aidl/build-aidl.sh vendor
 
 ## 6. 版本基线
 
-当前模块源码 = v2.1.3-fork（versionCode 213），内置后端 jdspd 2.1.3、引擎补丁 0001-0006、
-App 1.6.17（versionCode 63；"UI 不持有参数，先从后端拉取、用户修改才写回"）。分发包
-`dist/JDSP-fork-v2.1.3.zip`（sha256 `c16f14ec2e94c3a91f6f1fc1945c4709b283155e003bc54aa72ac647004b5231`）。
+当前模块源码 = v2.1.4-fork（versionCode 214），内置后端 jdspd 2.1.4、引擎补丁 0001-0006、
+App 1.6.18（versionCode 64；"UI 不持有参数，先从后端拉取、用户修改才写回"，另有总开关意图直投 /
+-1006 业务码透传 / 20 s TCP 保活）。分发包
+`dist/JDSP-fork-v2.1.4.zip`（sha256 `b3ed97b80012ecc5a334a9ecd86a2e4b1dcef70e16ac21d75c0d412e9120d3e2`）。
 
 App 构建（源码路线，Gradle 离线）：`cd /home/bdy/work/loundess_git && ./gradlew --offline --no-daemon \
 -Dorg.gradle.jvmargs=-Xmx3g --max-workers=2 assembleRootFullRelease`，产物
-`app/build/outputs/apk/rootFull/release/JamesDSP-v1.6.17-63-root-full-universal-release.apk`
+`app/build/outputs/apk/rootFull/release/JamesDSP-v1.6.18-64-root-full-universal-release.apk`
 （debug 签名证书 `904ddf44…`，可直接覆盖升级），再拷到 `module/src/common/files/JamesDSPManagerThePBone.apk`。
 
 引擎侧补丁（`native/patches/`，arm64/arm 两路都已编入；arm64-sve/aidl/x86 仍是上游预编译，未含补丁）：

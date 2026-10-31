@@ -307,3 +307,5 @@ harness 里三个必踩的坑（写给后人）：
     out/tap/bin/pcmdump, out/tap/bin/vendorlibs/    # setParameters 小工具 + 反汇编用厂商库副本
     out/tap/samples/                                # 厂商 dump WAV（6 个）+ harness 三组样本
     out/tap/evidence/                               # 属性前后快照、logcat、dump 列表、FFT/JSON 结果
+
+脚本已随仓库提供：tools/vendor-pcmdump.sh
