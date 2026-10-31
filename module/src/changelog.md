@@ -1,3 +1,29 @@
+### v2.1.6-fork（GET 返回值语义修正 + 诊断参数不再落盘；App 开关状态以后端为准）
+
+* **修复 `getParam` 的返回值语义（P1，装机复验发现）**：引擎的 `GET_PARAM` 成功时返回**写入的字节数**
+  （mix 保真自检计数 30023/30024 返回 4，采集 tap 状态 32002 返回 112；传统 DSP 参数返回 0），
+  而 daemon 只把 `rc == 0` 当成功、把任何 `rc > 0` 当失败，于是 `jdspcli get` 对 30000-32999 整个
+  诊断区间恒回 "no data"——尽管引擎其实已经答了（日志 `W/jdspd: getParam … param=32002 rc=112`）。
+  现在 **`rc >= 0` 即成功**：`rc > 0` 取前 `rc` 字节，`rc == 0` 保持旧行为（整段回复缓冲），
+  `rc < 0` 才回落到配置快照 / 报错。
+* **诊断参数不再写进 config.json（P1，装机复验发现）**：`30000-32999`（mix 自检 30023-30028、
+  采集 tap 32001/32002）是**运行期状态**（计数器、武装标志、环形缓冲路径），不是设置项。之前一次
+  `jdspcli set 30025 --int 1` 被持久化，daemon 重启后按 **27 项** replay，污染了 26 项参数基线。
+  现在这个区间：写**不落盘**、`dump-config` 不出现、attach replay 不参与；已污染的 config.json 在
+  **加载时自动清理并重写**（日志 `dropped N diagnostic param(s)`），引擎状态文件导入同样过滤。
+  引擎仍照常收到这些写——只有持久化被跳过。
+* **App 1.6.20（versionCode 66）**：重连后以**后端**开关状态为准——修掉 v2.1.5 装机复验里看到的
+  "App 把本地 UI 开关状态推给刚重启的 daemon，导致 off→on→off 翻转、最后停在 off"。三条把
+  "App 缓存值"当"用户意图"的路径全部收口：新会话不再推快照、AudioEffect 兼容层的 setEnabled 改 no-op、
+  `pendingEnabled` 值缓冲改为只由用户点击写的 `userEnableIntent`；重连后只 `getEnabled()` 读一次真值。
+  不变量：**只有用户点击能写后端开关**。细节与真机三用例（80 s 0 次翻转）见
+  `docs/APP-SWITCH-STATE-AUTHORITY.md`。
+* 后端 **jdspd 2.1.6**；模块 versionCode **216**；引擎与 v2.1.5 相同（补丁 0001-0008、
+  arm64 `658aff86` / arm `b7aba479`）。
+* 测试：`./backend/test/run_tests.sh` → **258 passed**（原 248 + 新增 10：`ParamReplyTest` 覆盖
+  `rc > 0 / == 0 / < 0` 与诊断区间边界，`DiagnosticParamPersistenceTest` 覆盖不落盘 / 不 replay /
+  加载时清理），设备选择 selftest **11 PASS**。
+
 ### v2.1.5-fork（引擎采集 tap + mix 保真自检；App 参数写入一帧一批）
 
 * **引擎 0007（capture tap，诊断设施，默认关闭）**：新增 `jdsp_tap.c/h` 与 `generic_process()` 里的

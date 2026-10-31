@@ -1,8 +1,10 @@
 package com.jdsp.backend;
 
+import com.jdsp.common.DiagnosticParams;
 import com.jdsp.common.EnableErrors;
 import com.jdsp.common.EnableSwitch;
 import com.jdsp.common.JdspConst;
+import com.jdsp.common.ParamReply;
 import com.jdsp.common.WritePolicy;
 
 import java.util.ArrayList;
@@ -27,7 +29,7 @@ import org.json.JSONObject;
  */
 public final class CoreApi {
     /** Reported by getVersion / ping. */
-    public static final String VERSION = "jdspd 2.1.5";
+    public static final String VERSION = "jdspd 2.1.6";
     /** Returned by ping(). */
     public static final int PING_OK = 1;
     /**
@@ -427,12 +429,24 @@ public final class CoreApi {
         }
         byte[] reply = new byte[n];
         int rc = bus.getParam(sessionId, paramId, reply);
-        if (rc == 0) {
-            return reply;
+        if (ParamReply.isSuccess(rc)) {
+            // The engine reports how many bytes it wrote: 0 for the classic DSP parameters (they
+            // fill the buffer without reporting a size) and the real length for the diagnostic
+            // ones (4 for the mix check counters 30023/30024, 112 for the tap status 32002).
+            // Both are success - v2.1.5 treated every rc > 0 as a failure, which is why
+            // jdspcli get answered "no data" for the whole 30000-32999 range although the
+            // daemon log showed the engine had answered (param=32002 rc=112).
+            int len = ParamReply.successLength(rc, reply.length);
+            if (len == reply.length) {
+                return reply;
+            }
+            byte[] out = new byte[len];
+            System.arraycopy(reply, 0, out, 0, len);
+            return out;
         }
-        // Nothing from the engine (the clean engine has no GET_PARAM) and no cached write:
-        // fall back to the configured value of the session's package (same scope rule as the
-        // write path, so get always returns what set stored).
+        // rc < 0: nothing from the engine for this id (the classic GET-less case or an unknown
+        // parameter) and no cached write: fall back to the configured value of the session's
+        // package (same scope rule as the write path, so get always returns what set stored).
         SessionView v = getSession(sessionId);
         byte[] configured = v == null
                 ? config.getParamFor("", paramId) : config.getParamFor(v.pkg, paramId);
@@ -461,9 +475,18 @@ public final class CoreApi {
         return (vsize + 3) & ~3;
     }
 
-    /** Chunked transfers and huge values are forwarded but never written to config.json. */
+    /**
+     * Chunked transfers, huge values and the whole diagnostic range are forwarded to the engine
+     * but never written to config.json.
+     */
     private static boolean isPersistable(int paramId, byte[] value) {
         if (value.length > 64 * 1024) {
+            return false;
+        }
+        // 30000-32999 (mix check 30023-30028, capture tap 32001/32002): runtime state, not a
+        // setting. Persisting it meant the next daemon start replayed it (a stray "set 30025"
+        // showed up as a 27th parameter in dump-config and broke the 26 parameter baseline).
+        if (DiagnosticParams.isDiagnostic(paramId)) {
             return false;
         }
         switch (paramId) {

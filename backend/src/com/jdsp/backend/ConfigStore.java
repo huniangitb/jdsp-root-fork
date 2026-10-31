@@ -1,5 +1,6 @@
 package com.jdsp.backend;
 
+import com.jdsp.common.DiagnosticParams;
 import com.jdsp.common.JdspConst;
 import com.jdsp.common.ParamScope;
 
@@ -75,10 +76,18 @@ public final class ConfigStore {
             return;
         }
         try {
-            parseLocked(new JSONObject(new String(raw, "UTF-8")));
+            int dropped = parseLocked(new JSONObject(new String(raw, "UTF-8")));
             dirty = false;
             Log.i("config loaded: mode=" + mode + " params=" + globalParams.size()
-                    + " policies=" + policies.size() + " perApp=" + perAppParams.size());
+                    + " policies=" + policies.size() + " perApp=" + perAppParams.size()
+                    + (dropped > 0 ? " (dropped " + dropped + " diagnostic param(s))" : ""));
+            if (dropped > 0) {
+                // The file still holds the diagnostic keys; rewrite it so dump-config, the replay
+                // on attach and a preset export stay clean from now on.
+                if (!saveLocked()) {
+                    Log.w("config: rewrite after dropping diagnostics failed (" + file + ")");
+                }
+            }
         } catch (Throwable t) {
             Log.e("config parse failed, keeping a backup and starting from engine state", t);
             File bad = new File(file.getPath() + ".bad");
@@ -112,6 +121,12 @@ public final class ConfigStore {
         Map<Integer, byte[]> map = r.toMap();
         globalParams.clear();
         globalParams.putAll(map);
+        // Same rule as the config file: the diagnostic range never enters the store, so it
+        // cannot be replayed into an attach either.
+        int dropped = dropDiagnostics(globalParams);
+        if (dropped > 0) {
+            Log.i("engine state import: dropped " + dropped + " diagnostic param(s)");
+        }
         if (r.sawEnableRecord) {
             enabled = r.enabled;
         }
@@ -253,6 +268,11 @@ public final class ConfigStore {
 
     /** Sets (or removes, when value is null/empty) one global parameter. */
     public synchronized void setGlobalParam(int paramId, byte[] value) {
+        if (DiagnosticParams.isDiagnostic(paramId)) {
+            // 30000-32999 is runtime state (counters, an armed flag, a ring buffer path), never a
+            // setting: it reaches the engine but is not stored, so it cannot be replayed later.
+            return;
+        }
         Integer key = Integer.valueOf(paramId);
         if (value == null || value.length == 0) {
             globalParams.remove(key);
@@ -263,6 +283,9 @@ public final class ConfigStore {
     }
 
     public synchronized void setPerAppParam(String pkg, int paramId, byte[] value) {
+        if (DiagnosticParams.isDiagnostic(paramId)) {
+            return; // see setGlobalParam: the diagnostic range is never persisted
+        }
         if (pkg == null || pkg.length() == 0) {
             setGlobalParam(paramId, value);
             return;
@@ -299,6 +322,32 @@ public final class ConfigStore {
         dirty = true;
         Log.i("baseline applied: " + globalParams.size() + " global param(s)"
                 + (clearPerApp ? ", perAppParams cleared" : ", perAppParams kept"));
+    }
+
+    /**
+     * Removes every diagnostic parameter (30000-32999) from {@code map} in place.
+     *
+     * <p>Used by both parse paths (config file, engine state import): those ids are runtime
+     * state - counters, an armed flag, a ring buffer path - and replaying them into an attach is
+     * never useful, while storing them breaks the 26 parameter baseline (v2.1.5 wrote a stray
+     * {@code 30025} that came back as a 27th parameter after a restart).
+     *
+     * @return how many entries were dropped
+     */
+    static int dropDiagnostics(Map<Integer, byte[]> map) {
+        if (map == null || map.isEmpty()) {
+            return 0;
+        }
+        int dropped = 0;
+        java.util.Iterator<Integer> it = map.keySet().iterator();
+        while (it.hasNext()) {
+            Integer id = it.next();
+            if (id != null && DiagnosticParams.isDiagnostic(id.intValue())) {
+                it.remove();
+                dropped++;
+            }
+        }
+        return dropped;
     }
 
     /** Global parameters overlaid with the per app overrides of {@code pkg}. */
@@ -462,7 +511,15 @@ public final class ConfigStore {
         return o;
     }
 
-    private void parseLocked(JSONObject o) throws JSONException {
+    /**
+     * Parses one config/preset document into this store.
+     *
+     * @return how many diagnostic parameters (30000-32999) were dropped; they are runtime state
+     *         and are neither replayed nor shown by dump-config (v2.1.5 wrote a stray
+     *         {@code 30025} into the file, which then replayed as a 27th parameter)
+     */
+    private int parseLocked(JSONObject o) throws JSONException {
+        int dropped = 0;
         mode = o.optInt("mode", JdspConst.MODE_AUTO) == JdspConst.MODE_BACKEND
                 ? JdspConst.MODE_BACKEND : JdspConst.MODE_AUTO;
         enabled = o.optBoolean("enabled", true);
@@ -478,6 +535,7 @@ public final class ConfigStore {
                     globalParams.put(id, v);
                 }
             }
+            dropped += dropDiagnostics(globalParams);
         }
         policies.clear();
         JSONObject pol = o.optJSONObject("policies");
@@ -511,6 +569,7 @@ public final class ConfigStore {
                         map.put(id, v);
                     }
                 }
+                dropped += dropDiagnostics(map);
                 if (!map.isEmpty()) {
                     perAppParams.put(pkg, map);
                 }
@@ -518,6 +577,7 @@ public final class ConfigStore {
         }
         importedFrom = o.optString("importedFrom", "");
         updatedAt = o.optLong("updatedAt", 0L);
+        return dropped;
     }
 
     /** Full configuration as a pretty printed JSON string (never null). */
