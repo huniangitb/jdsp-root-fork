@@ -93,6 +93,30 @@ public final class WatcherPolicy {
      * wait half a minute for its effect chain.
      */
     public static final long BLIND_MAX_MS = 15000L;
+    /**
+     * Dwell of "sessions are attached but nothing plays" before one dump is spent to confirm it.
+     * A player that dies without closing its track (SIGTERM, crash, kernel kill) leaves jdspd's own
+     * {@code AudioEffect} handle behind in audioserver: the dump still lists the session while the
+     * cheap playback query no longer knows the player at all. The cheap pass deliberately keeps
+     * dump-only sessions alive (that is what keeps native players working), so without this trigger
+     * the dead session kept its effect until the {@link #CROSSCHECK_MS} cross-check - measured
+     * 5 min 40 s of an attached bypassed effect and ~1 % CPU while the probe polled at 10 Hz.
+     */
+    public static final long CONFIRM_DWELL_MS = 1500L;
+    /**
+     * First retry delay after a confirmation dump that did <em>not</em> retire the session. That
+     * dump is the answer to "is this session real?": a paused native player legitimately keeps its
+     * track open while nothing plays, so the session survives and the next check has to back off.
+     */
+    public static final long CONFIRM_BACKOFF_START_MS = 4000L;
+    /**
+     * Ceiling of the confirmation back-off. Deliberately generous: the interesting case is decided
+     * by the first dump ({@link #CONFIRM_DWELL_MS} after the state appears); the repeats only exist
+     * so a session that dies <em>while</em> the state persists is still retired without the
+     * five-minute cross-check. At this period a paused native player costs one dump per minute.
+     */
+    public static final long CONFIRM_BACKOFF_MAX_MS = 60000L;
+
     /** Degraded ladder: dense first, then two back-off rungs. */
     private static final long[] DEGRADED_TIERS = {3000L, 15000L, 30000L};
 
@@ -148,6 +172,50 @@ public final class WatcherPolicy {
      */
     public static boolean crossCheckDue(long now, long lastCrosscheckAt) {
         return lastCrosscheckAt <= 0L || now - lastCrosscheckAt >= CROSSCHECK_MS;
+    }
+
+    /**
+     * True when a confirmation dump is due.
+     *
+     * @param armedAt        when "attached but nothing plays" was first seen, 0 = not armed
+     * @param lastConfirmAt  when the last confirmation dump ran, 0 = none yet
+     * @param backoffMs      current retry delay (only used once a confirmation dump ran)
+     */
+    public static boolean confirmDue(long now, long armedAt, long lastConfirmAt, long backoffMs) {
+        if (armedAt <= 0L) {
+            return false;
+        }
+        if (lastConfirmAt <= 0L) {
+            return now - armedAt >= CONFIRM_DWELL_MS;
+        }
+        return now - lastConfirmAt >= Math.max(1L, backoffMs);
+    }
+
+    /**
+     * Next retry delay after a confirmation dump: start at {@link #CONFIRM_BACKOFF_START_MS} and
+     * double up to {@link #CONFIRM_BACKOFF_MAX_MS}. A zero/invalid input yields the start value, so
+     * the ladder can never collapse into a dump loop.
+     */
+    public static long nextConfirmBackoff(long currentMs) {
+        if (currentMs <= 0L) {
+            return CONFIRM_BACKOFF_START_MS;
+        }
+        long next = currentMs * 2L;
+        return next > CONFIRM_BACKOFF_MAX_MS ? CONFIRM_BACKOFF_MAX_MS : next;
+    }
+
+    /**
+     * True when a session's attach-debounce stamp has to survive this pass.
+     *
+     * @param present   the session was in this pass's session list
+     * @param dumpOnly  the cheap playback query cannot see this session at all (native player)
+     *
+     * <p>A cheap pass has an empty list for every native player (the probe only knows players that
+     * registered with AudioService), so forgetting the stamp there restarted the debounce window
+     * on every dump: the player was discovered, forgotten, discovered again, and never attached.
+     */
+    public static boolean keepFirstSeen(boolean present, boolean dumpOnly) {
+        return present || dumpOnly;
     }
 
     /** True when the non hot maintenance work is due. */

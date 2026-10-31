@@ -169,6 +169,53 @@ public final class WatcherPolicyTest {
             Assert.isTrue(WatcherPolicy.GATE_HOLD_MS >= WatcherPolicy.PROBE_IDLE_MS,
                     "the gate verdict outlives one idle tick");
         });
+        suite.test("watcher policy: a stale session is confirmed shortly after it goes silent", () -> {
+            // Attached but nothing plays: jdspd's own effect handle may outlive a player that died
+            // without closing its track. The first dump has to come soon (that is the whole point of
+            // the trigger), it must not fire before the dwell, and it must not repeat per tick.
+            long now = 9000000L;
+            long armed = now - WatcherPolicy.CONFIRM_DWELL_MS + 1L;
+            Assert.isTrue(!WatcherPolicy.confirmDue(now, armed, 0L, 4000L),
+                    "not armed long enough: no dump");
+            Assert.isTrue(WatcherPolicy.confirmDue(now, now - WatcherPolicy.CONFIRM_DWELL_MS,
+                    0L, 4000L), "dwell elapsed: one dump");
+            Assert.isTrue(!WatcherPolicy.confirmDue(now, 0L, 0L, 4000L),
+                    "not armed at all: no dump");
+            Assert.isTrue(WatcherPolicy.CONFIRM_DWELL_MS < WatcherPolicy.CROSSCHECK_MS,
+                    "the confirmation is orders of magnitude tighter than the cross-check");
+            // A session that survives its confirmation dump is real (a paused native player), so the
+            // repeats must back off instead of dumping on every iteration.
+            Assert.isTrue(!WatcherPolicy.confirmDue(now, now - 60000L, now - 1000L, 4000L),
+                    "a confirmation that just ran is not due again");
+            Assert.isTrue(WatcherPolicy.confirmDue(now, now - 60000L, now - 4000L, 4000L),
+                    "back-off elapsed: retry is due");
+        });
+        suite.test("watcher policy: the confirmation back-off doubles up to its ceiling", () -> {
+            Assert.eq(WatcherPolicy.CONFIRM_BACKOFF_START_MS,
+                    WatcherPolicy.nextConfirmBackoff(0L), "invalid input: start value");
+            long ms = WatcherPolicy.CONFIRM_BACKOFF_START_MS;
+            ms = WatcherPolicy.nextConfirmBackoff(ms);
+            Assert.eq(WatcherPolicy.CONFIRM_BACKOFF_START_MS * 2L, ms, "first retry doubles");
+            for (int i = 0; i < 20; i++) {
+                ms = WatcherPolicy.nextConfirmBackoff(ms);
+            }
+            Assert.eq(WatcherPolicy.CONFIRM_BACKOFF_MAX_MS, ms, "clamped at the ceiling");
+            Assert.isTrue(WatcherPolicy.CONFIRM_BACKOFF_MAX_MS < WatcherPolicy.CROSSCHECK_MS,
+                    "the ceiling stays far below the five minute cross-check");
+            Assert.isTrue(WatcherPolicy.CONFIRM_BACKOFF_START_MS > WatcherPolicy.PROBE_IDLE_MS,
+                    "no retry denser than the idle probe cadence");
+        });
+        suite.test("watcher policy: a dump-only session keeps its attach debounce stamp", () -> {
+            // The cheap playback query cannot see a native player, so its session list is empty on
+            // every cheap pass. Forgetting the stamp there restarted the debounce window on every
+            // dump and the session was never attached (dump sees it, cheap pass forgets it, ...).
+            Assert.isTrue(WatcherPolicy.keepFirstSeen(true, false), "seen in this pass: keep");
+            Assert.isTrue(WatcherPolicy.keepFirstSeen(true, true), "seen and dump-only: keep");
+            Assert.isTrue(WatcherPolicy.keepFirstSeen(false, true),
+                    "invisible to the probe but real: keep the stamp");
+            Assert.isTrue(!WatcherPolicy.keepFirstSeen(false, false),
+                    "vanished and not dump-only: forget (fresh window on re-appearance)");
+        });
         suite.test("watcher policy: the idle gate only re-runs the query every IDLE_QUERY_MS",
                 new com.jdsp.cli.Body() {
             public void run() {

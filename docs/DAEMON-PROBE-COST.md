@@ -354,15 +354,45 @@ adb -s 64a4bad0 reboot   # 18:33:56，开机约 30 s 完成
 | soak | `/data/adb/service.d/99-jdsp-soak-autostart.sh` 正常拉起（pid 3866），开机后 18:34:22 写出首行（bootid `8a69cce5`，`jdsphits=0`） |
 | App | `james.dsp` 1.6.20（versionCode 66） |
 
-### 13.1 一个观察：effect 链残留会话最长等一个交叉校验
+### 13.1 残会话与原生播放器：v2.1.10 收紧（+ 修一个 v2.1.9 回归）
 
-测试播放器被 `SIGTERM` 杀掉后，audioserver 侧 tracks 已为 0，但 dump 里仍有 `1 effects for session 113`
-（那是 jdspd 自己的 effect 句柄）。daemon 的 `dumpOnly` 保护策略规定「只有 dump 见过的会话不能被廉价 pass 摘掉」，
-因此该会话会一直保留到下一次 5 min 交叉校验：实测 `18:40:58 watcher pass reason=crosscheck mode=dumpsys sessions=0`
-→ `detach session=113` → `released session=113`。期间探针按 10 Hz 跑（CPU ≈0.95 %，正常空转是 0.13-0.22 %）。
+**观察（v2.1.9）**：测试播放器被 `SIGTERM` 杀掉后，audioserver 侧 tracks 已为 0，但 dump 里仍有
+`1 effects for session 113`（那是 jdspd 自己的 effect 句柄）。`dumpOnly` 保护策略规定「只有 dump 见过的会话不能被
+廉价 pass 摘掉」，因此该会话一直保留到下一次 5 min 交叉校验：实测 `18:40:58 watcher pass reason=crosscheck
+mode=dumpsys sessions=0` → `detach session=113` → `released session=113`，残留 **5 min 40 s**，
+期间探针 10 Hz 空转 ≈0.95 % CPU（正常空转 0.13-0.22 %）。
 
-这是**有意的取舍**（宁可多留一个空 effect 到下一次交叉校验，也不要让廉价 pass 把原生播放器的会话摘掉）。
-若要进一步收紧，可在「已有会话 + `isStreamActive` 为假 + 探针无可用 sessionId」时提前触发一次确认 dump（预计改动 <30 行，
-留待 v2.1.10 评估）。
+**根因**：廉价视图看不见"只有 dump 记得的会话"，而 `dumpOnly` 又必须保护它们（否则原生播放器的效果链会被误摘）。
+两者的唯一交汇点是 dump —— 所以收紧点不是缩短交叉校验周期（那会把 5 min 一次变成分钟级常态开销），
+而是**按需**在可疑状态出现时提前要一次 dump。
+
+**v2.1.10 的实现**（三处，均在 `WatcherPolicy` 里有纯逻辑 + 单测）：
+
+| 机制 | 规则 | 作用 |
+|---|---|---|
+| 确认 dump | 已挂句柄 + 没在播（`!isStreamActive` 且探针无 playing 行）持续 `CONFIRM_DWELL_MS`=1.5 s → 跑一次 dump | 死会话当次释放；活着的（暂停中的原生播放器）确认它还是真的 |
+| 确认退避 | 确认 dump 后仍有会话：`CONFIRM_BACKOFF_START_MS`=4 s 起翻倍，封顶 `CONFIRM_BACKOFF_MAX_MS`=60 s；播放恢复/会话清空立即复位 | 暂停的原生播放器稳态成本 ≤1 dump/min，不会因为"暂停"变成 dump 循环 |
+| 静音节拍 | 循环等待只看"真在播"（闸门 + 探针 playing 行），不再因"持有句柄"按 100 ms 转 | 暂停中的已挂载会话 10 Hz → 2 Hz |
+
+**顺带修掉一个 v2.1.9 回归（原生播放器从不挂载）**：v2.1.9 让廉价 pass 接管稳态后，`reconcile` 的防抖记账把
+"本轮会话列表里没有"的会话当作消失、清掉 `firstSeen` 戳。原生播放器（AAudio/OpenSL）只出现在 dump 里，于是
+"dump 看见 → 廉价 pass 忘掉 → dump 再看见"无限循环，**400 ms 防抖永远等不到**，效果链从不建立
+（实测 uid 10123 的 AAudio 播放器 50 s 内 attach 0 次）。修法：
+`WatcherPolicy.keepFirstSeen(present, dumpOnly)` —— 只有 dump 见过的会话必须保留戳；再加一个"attach dump"触发器
+（`DUMP_ATTACH_MIN_MS`=1 s 限速，连续 `DUMP_ATTACH_MAX_MISSES`=5 次拿不到句柄就放弃并重新观察），
+让"戳已到期但廉价 pass 看不见"的会话花一次 dump 完成挂载。
+
+**实测（同机，v2.1.9 → v2.1.10）**：
+
+| 指标 | v2.1.9 | v2.1.10 |
+|---|---|---|
+| 强杀到 `released session` | >90 s（实测 90 s 预算内未释放，只有 5 min 交叉校验能收；历史 5 min 40 s） | **1400 ms**（`reason=confirm` 的 dump 当次 detach+release） |
+| 原生播放器（AAudio, uid 10123）attach | 0 次（永不） | **800 ms** |
+| Java 播放器 attach | 95-103 ms | 95-103 ms（无回归） |
+| 空闲 40 s CPU | 0.13-0.22 % | 0.225 % |
+| 单测 | 280 passed | **283 passed**（+3：确认触发、确认退避、dumpOnly 记账）+ 自检 11 PASS |
+
+复现/验收脚本：`out/confirm/stale-ab.sh`（原生播放器挂载 + 强杀 + 计时），
+verdict 判据 = `kill->release < 5 s` 且 `attach session=` 出现在 `aaudio_tone` 启动后 2 s 内。
 
 

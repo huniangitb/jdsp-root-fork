@@ -148,6 +148,22 @@ public final class SessionWatcher {
     private volatile long blindFlips;
     /** True when the last pass saw a different attachable session set (drives the ladder). */
     private volatile boolean dumpSetChanged;
+    /** When "sessions attached but nothing plays" was first seen (0 = not armed). */
+    private long confirmArmedAt;
+    /** When the last confirmation dump ran (0 = none since start). */
+    private volatile long lastConfirmAt;
+    /** Current confirmation retry delay (see {@link WatcherPolicy#nextConfirmBackoff(long)}). */
+    private long confirmBackoffMs = WatcherPolicy.CONFIRM_BACKOFF_START_MS;
+    /** Confirmation dumps since start (diagnostics). */
+    private volatile long confirmDumps;
+    /** When the last "attach a dump-only session" dump ran (rate limit, 0 = never). */
+    private volatile long lastDumpAttachAt;
+    /** Consecutive attach dumps that did not produce a handle (loop guard). */
+    private int dumpAttachMisses;
+    /** Minimum spacing of the attach dumps (they only cost 90-120 ms, but never in a loop). */
+    private static final long DUMP_ATTACH_MIN_MS = 1000L;
+    /** Give up after this many consecutive attach dumps for the same corpse. */
+    private static final int DUMP_ATTACH_MAX_MISSES = 5;
     /** Session ids of the last pass. */
     private java.util.Set<Integer> lastDumpIds = java.util.Collections.emptySet();
     /** Diagnostic line period of the watcher counters. */
@@ -360,18 +376,79 @@ public final class SessionWatcher {
                     WatcherPolicy.degradedFallbackMs(stableDegradedPasses,
                             blind ? WatcherPolicy.BLIND_MAX_MS
                                     : WatcherPolicy.DEGRADED_MAX_MS));
-            if (WatcherPolicy.shouldRunPass(poke, crossDue || degradedDue, changed)) {
-                boolean full = crossDue || degradedDue;
+            // Stale-session confirmation. A player that dies without closing its track (SIGTERM,
+            // crash, kernel kill, or a player that simply stops feeding) leaves jdspd's own effect
+            // handle behind in audioserver: the dump still lists "1 effects for session N" while the
+            // cheap query no longer knows the player at all. Because a cheap pass must not retire a
+            // dump-only session (that is what keeps native players attached), the dead session used
+            // to sit there until the five-minute cross-check - measured 5 min 40 s. Ask for one dump
+            // shortly after "attached but nothing plays" appears; if the session survives that dump
+            // it is real (a paused native player), so the repeats back off to one per minute.
+            boolean confirmWanted = probeOk && !dumpOnly.isEmpty() && !music && !probe.playing();
+            if (!confirmWanted) {
+                confirmArmedAt = 0L;
+                confirmBackoffMs = WatcherPolicy.CONFIRM_BACKOFF_START_MS;
+            } else if (confirmArmedAt == 0L) {
+                confirmArmedAt = now;
+            }
+            boolean confirmDue = WatcherPolicy.confirmDue(now, confirmArmedAt, lastConfirmAt,
+                    confirmBackoffMs);
+            // A dump-only session (native player) that survived its attach debounce needs exactly
+            // one more dump: the cheap pass cannot see it, so without this trigger its handle
+            // waited for the next ladder rung (3-15 s). The stamp is consumed when the dump is
+            // armed, so a session whose attach fails is re-observed from scratch on the next dump
+            // instead of turning this trigger into a dump loop.
+            boolean dumpAttachDue = false;
+            if (probeOk && !dumpOnly.isEmpty() && now - lastDumpAttachAt >= DUMP_ATTACH_MIN_MS) {
+                java.util.Iterator<Integer> it = dumpOnly.iterator();
+                while (it.hasNext()) {
+                    Integer id = it.next();
+                    if (effects.isAttached(id.intValue())) {
+                        continue;
+                    }
+                    Long seenAt = firstSeen.get(id);
+                    if (seenAt != null && mayAttach(seenAt, now, inStorm())) {
+                        dumpAttachDue = true;
+                        break;
+                    }
+                }
+                if (!dumpAttachDue) {
+                    dumpAttachMisses = 0;
+                }
+            }
+            if (WatcherPolicy.shouldRunPass(poke,
+                    crossDue || degradedDue || confirmDue || dumpAttachDue, changed)) {
+                boolean full = crossDue || degradedDue || confirmDue || dumpAttachDue;
                 lastPassReason = poke ? "poke"
                         : (changed ? "change"
                                 : (crossDue ? "crosscheck"
-                                        : (blind ? "blind" : "degraded")));
+                                        : (confirmDue ? "confirm"
+                                                : (dumpAttachDue ? "attach"
+                                                        : (blind ? "blind" : "degraded")))));
                 try {
                     if (full) {
                         pollOnce();
                         lastCrosscheckAt = System.currentTimeMillis();
                         if (crossDue) {
                             crossChecks++;
+                        }
+                        if (confirmDue) {
+                            // A dump is a dump: it also answers the cross-check deadline.
+                            lastConfirmAt = System.currentTimeMillis();
+                            confirmBackoffMs = WatcherPolicy.nextConfirmBackoff(confirmBackoffMs);
+                            confirmDumps++;
+                        }
+                        if (dumpAttachDue) {
+                            lastDumpAttachAt = System.currentTimeMillis();
+                            dumpAttachMisses++;
+                            if (dumpAttachMisses > DUMP_ATTACH_MAX_MISSES) {
+                                // The session is a corpse the probe never saw and the attach cannot
+                                // succeed: stop spending dumps on it. Forgetting the stamps restarts
+                                // the observation window; the next dump retires the id from
+                                // dumpOnly if it is really gone.
+                                forgetUnattachedDumpOnly();
+                                dumpAttachMisses = 0;
+                            }
                         }
                     } else {
                         passFromProbe();
@@ -401,7 +478,7 @@ public final class SessionWatcher {
                 if (!wake) {
                     try {
                         wakeLock.wait(probeOk
-                                ? WatcherPolicy.probeSleepMs(playingNow())
+                                ? WatcherPolicy.probeSleepMs(playingNow(musicRecent))
                                 : WatcherPolicy.degradedFallbackMs(stableDegradedPasses));
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
@@ -509,12 +586,16 @@ public final class SessionWatcher {
         lastDumpIds = ids;
     }
 
-    /** True while audio plays (a probe row reports playing) or a handle is held. */
-    private boolean playingNow() {
-        if (probe != null && probe.playing()) {
-            return true;
-        }
-        return !effects.attachedSessions().isEmpty();
+    /**
+     * True while audio actually plays: a probe row reports "playing", or the system gate said so
+     * within the hold window. An attached but silent session deliberately does not count: with
+     * handles held the loop used to poll the playback-configuration query at 10 Hz for as long as
+     * the session lived, which measured 0.95 % CPU for a paused player (2 Hz costs ~0.2 %). Being
+     * attached is not a reason to look ten times a second - attaching is poked directly by the App
+     * and by session discovery, and a paused player's set does not change in tenths of a second.
+     */
+    private boolean playingNow(boolean musicRecent) {
+        return musicRecent || (probe != null && probe.playing());
     }
 
     /** Reads and clears the pending poke flag. */
@@ -633,6 +714,7 @@ public final class SessionWatcher {
             Log.i("watcher: passes=" + fullPasses + " mode=" + discoveryMode
                     + " probePasses=" + probePasses + " idleSkips=" + idleSkips
                     + " dumpOnly=" + dumpOnly.size() + " blind=" + probeBlind
+                    + " confirmDumps=" + confirmDumps + " confirmAgo=" + lastConfirmAgoMs()
                     + " music=" + (probe != null && probe.lastMusicActive())
                     + " probePolls=" + probePolls()
                     + " probeChanges=" + probeChanges() + " probeCostUs=" + probeCostUs()
@@ -783,6 +865,21 @@ public final class SessionWatcher {
      */
     static boolean stormActive(int shortLivedDeathsInWindow) {
         return shortLivedDeathsInWindow >= STORM_DEATHS;
+    }
+
+    /**
+     * Drops the attach-debounce stamp of every dump-only session that has no handle: the loop's
+     * attach dump gave up on it (see {@link #DUMP_ATTACH_MAX_MISSES}), so the id has to earn a new
+     * observation window before it costs another dump.
+     */
+    private void forgetUnattachedDumpOnly() {
+        java.util.Iterator<Integer> it = dumpOnly.iterator();
+        while (it.hasNext()) {
+            Integer id = it.next();
+            if (!effects.isAttached(id.intValue())) {
+                firstSeen.remove(id);
+            }
+        }
     }
 
     /** Records one vanished session (called from the reconcile pass). */
@@ -952,11 +1049,18 @@ public final class SessionWatcher {
         // Debounce bookkeeping: forget first-seen stamps of sessions that vanished (a session
         // id that re-appears later starts a fresh observation window) and feed the storm
         // detector with the lifetime of every short-lived one.
+        //
+        // A session the cheap view cannot see must keep its stamp: a cheap pass legitimately has
+        // an empty session list (the probe does not know native players), so pruning it there
+        // restarted the debounce window on every dump and the session was never attached - the
+        // native player cycled dump(seen) -> cheap pass(forgotten) -> dump(seen) forever. The
+        // dump-only set is the memory of "this id is real, only a dump may retire it".
         long nowMs = System.currentTimeMillis();
         java.util.Iterator<Map.Entry<Integer, Long>> seen = firstSeen.entrySet().iterator();
         while (seen.hasNext()) {
             Map.Entry<Integer, Long> entry = seen.next();
-            if (!present.contains(entry.getKey())) {
+            if (!WatcherPolicy.keepFirstSeen(present.contains(entry.getKey()),
+                    dumpOnly.contains(entry.getKey()))) {
                 recordDeath(nowMs, nowMs - entry.getValue().longValue());
                 seen.remove();
             }
@@ -1203,6 +1307,23 @@ public final class SessionWatcher {
     /** Rows (registered players) the probe reported in the last poll. */
     public int probeRows() {
         return probeRows;
+    }
+
+    /** Confirmation dumps ("attached but nothing plays") since start. */
+    public long confirmDumps() {
+        return confirmDumps;
+    }
+
+    /**
+     * Age of the last confirmation dump in ms, -1 when none ran yet, -2 while the trigger is not
+     * armed (nothing attached, or something plays).
+     */
+    public long lastConfirmAgoMs() {
+        if (confirmArmedAt <= 0L) {
+            return -2L;
+        }
+        long at = lastConfirmAt;
+        return at <= 0L ? -1L : System.currentTimeMillis() - at;
     }
 
     /** Age of the last dumpsys cross-check in ms, -1 when none ran yet. */

@@ -1,3 +1,25 @@
+### v2.1.10-fork（残会话 5 min → 1.4 s；修 v2.1.9 原生播放器从不挂载的回归）
+
+* **残会话确认（P1，用户的"小问题"）**：播放器被强杀/崩溃时不关闭 track，audioserver 里会留下 jdspd 自己的
+  effect 句柄（dump 里 `0 Tracks` + `1 effects for session N`），廉价查询看不见它，`dumpOnly` 保护又让它
+  只能等 5 min 交叉校验 —— 实测残留 **5 min 40 s**，期间探针 10 Hz 空转约 0.95% CPU。新增"确认 dump"触发器：
+  已经挂上句柄但"没有任何东西在播"持续 1.5 s，就跑一次 dump 确认；会话若真死了当次释放，若还活着（暂停中的
+  原生播放器）按 4 s→8 s→…→60 s 退避重试，播放恢复或会话清空立即复位。**实测 SIGKILL 到 `released session`
+  1400 ms**（v2.1.9：>90 s，只有 5 min 交叉校验能收）。
+* **修 v2.1.9 回归：原生播放器（AAudio/OpenSL）被发现但从不挂载（P1）**：v2.1.9 让廉价 pass 接管稳态后，
+  `reconcile` 的防抖记账把"本轮会话列表里没有"的会话当作消失并清掉 firstSeen 戳；原生播放器只存在于 dump，
+  于是"dump 看见 → 廉价 pass 忘掉 → dump 再看见"无限循环，**永远等不到 400 ms 防抖到期**，效果链从不建立
+  （实测 uid 10123 的 AAudio 播放器 50 s 内 attach 0 次）。新增 `WatcherPolicy.keepFirstSeen(present, dumpOnly)`
+  —— 只有 dump 见过的会话保留戳，同时新增"attach dump"触发（1 s 限速、连续 5 次无句柄则放弃并重新观察）。
+  **实测原生播放器 attach 800 ms（v2.1.9：从不）**。
+* **静音附着不再 10 Hz 轮询（P2）**：循环等待节拍只看"真在播"（isStreamActive 保持窗 + 探针 playing 行），
+  不再因为"持有句柄"就按 100 ms 转：暂停中的已挂载会话从 10 Hz 降到 2 Hz（每个 tick 一次 isStreamActive +
+  一次配置查询，实测约 0.95% → 0.2%）。挂载本身不慢——App 与发现都直接 poke 循环。
+* **诊断**：`stats` 新增 `watcherConfirmDumps` / `watcherConfirmAgoMs`（-2 = 触发器未武装），
+  60 s 诊断行新增 `confirmDumps` / `confirmAgo`；pass reason 新增 `confirm`、`attach`。
+* **实测（同机 v2.1.9 → v2.1.10）**：残会话释放 **>90 s → 1.4 s**；原生播放器 attach **0 次 → 800 ms**；
+  Java 播放器 attach **95-103 ms**（无回归）；空闲 40 s CPU **0.225%**；单测 283 passed（v2.1.9: 280）+ 自检 11 PASS。
+
 ### v2.1.9-fork（会话发现改用 IAudioService 查询 + 空转闸门：jdspd 空闲 CPU -91%，稳态 dumpsys 归零，attach p50 -53%）
 
 * **发现路径不再用 dumpsys（P1）**：`IAudioService.getActivePlaybackConfigurations()` 一次 binder 调用就给出每个
