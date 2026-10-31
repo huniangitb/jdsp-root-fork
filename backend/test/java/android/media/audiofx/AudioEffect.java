@@ -34,6 +34,15 @@ public class AudioEffect {
     /** Scripted engine replies (0 = accept; a no-lock engine rejects the unlock id). */
     public static int unlockReply = 0;
     public static int writeReply = 0;
+    /**
+     * Delay (ms) applied to every <b>data</b> SET_PARAM, simulating a slow binder round trip
+     * (an impulse upload is 6-100 ms on the device). The unlock write is not delayed, so tests
+     * can keep the harness setup cheap. Test-only knob.
+     */
+    public static volatile long writeDelayMs = 0;
+    /** Framework state reads, so tests can prove the EffectManager cache works. */
+    public static int enabledReads = 0;
+    public static int controlReads = 0;
     private static int nextId = 1;
 
     private final int id;
@@ -54,10 +63,16 @@ public class AudioEffect {
     }
 
     public boolean getEnabled() {
+        synchronized (WRITES) {
+            enabledReads++;
+        }
         return enabled;
     }
 
     public boolean hasControl() {
+        synchronized (WRITES) {
+            controlReads++;
+        }
         return !released;
     }
 
@@ -78,6 +93,14 @@ public class AudioEffect {
 
     public int setParameter(byte[] param, byte[] value) {
         int paramId = le32(param);
+        long delay = writeDelayMs;
+        if (delay > 0 && paramId != 31232) { /* UNLOCK_PARAM_ID stays fast */
+            try {
+                Thread.sleep(delay);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
         synchronized (WRITES) {
             WRITES.add(new Write(sessionId, paramId, value));
         }
@@ -102,6 +125,9 @@ public class AudioEffect {
         }
         unlockReply = 0;
         writeReply = 0;
+        writeDelayMs = 0;
+        enabledReads = 0;
+        controlReads = 0;
     }
 
     /**

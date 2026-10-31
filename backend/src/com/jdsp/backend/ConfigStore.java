@@ -146,7 +146,14 @@ public final class ConfigStore {
      */
     private final Object fileLock = new Object();
 
-    /** Writes the config when something changed. Also called from the watcher tick. */
+    /** True when the in-memory state is not on disk yet (diagnostics / persist scheduling). */
+    public boolean isDirty() {
+        synchronized (this) {
+            return dirty;
+        }
+    }
+
+    /** Writes the config when something changed. Also called by the slow watcher pass. */
     public boolean saveIfDirty() {
         return saveThrottled(0L);
     }

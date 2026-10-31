@@ -48,6 +48,12 @@ public final class Daemon {
     private static BinderService binder;
     private static TcpService tcp;
     private static volatile boolean shuttingDown;
+    /**
+     * Released by {@link #shutdown(String)} once the teardown finished: the main thread waits on
+     * it instead of polling a flag once per second.
+     */
+    private static final java.util.concurrent.CountDownLatch MAIN_EXIT =
+            new java.util.concurrent.CountDownLatch(1);
     private static String instanceLockFile;
     private static FileChannel instanceLockChannel;
     private static FileLock instanceLock;
@@ -211,21 +217,23 @@ public final class Daemon {
                 + " tcp=" + (tcp.isRunning() ? String.valueOf(tcp.port()) : "off")
                 + " config=" + configPath);
 
-        // Main thread: idle, but honour a stop file so an external supervisor can ask for a
-        // graceful release even when signals are not delivered to the JVM.
+        // Main thread: nothing left to do. Every periodic duty moved to an event source or a
+        // one-shot timer (watcher: inotify/binder probe, config flush: AsyncPersister, deferred
+        // switch: ScheduledExecutor), so this thread only waits for the shutdown latch. The stop
+        // file (the module's uninstall script asks for a graceful exit) is watched by its own
+        // event driven watcher instead of a 1 s poll.
         File stopFile = new File(dir, "stop");
-        while (!shuttingDown) {
-            try {
-                Thread.sleep(1000L);
-            } catch (InterruptedException e) {
-                Thread.currentThread().interrupt();
-                break;
-            }
-            if (stopFile.exists()) {
-                stopFile.delete();
+        new StopFileWatcher(dir, stopFile, new Runnable() {
+            @Override
+            public void run() {
                 Log.i("stop file detected, shutting down");
-                break;
+                shutdown("stop file");
             }
+        }).start();
+        try {
+            MAIN_EXIT.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
         shutdown("main loop exit");
     }
@@ -519,6 +527,107 @@ public final class Daemon {
         releaseInstanceLock();
         Log.i("=== jdspd stopped (released " + released + " handle(s))");
         Log.close();
+        // Let the main thread leave its await() and return from main.
+        MAIN_EXIT.countDown();
+    }
+
+    /**
+     * Watches the runtime directory for the {@code stop} file.
+     *
+     * <p>Event driven through inotify ({@link java.nio.file.WatchService}); the main loop used to
+     * test the file once per second forever just to notice this one-shot teardown hint, which the
+     * module's uninstall script writes before it removes the module files. If inotify is not
+     * available the watcher falls back to one check every {@value #FALLBACK_CHECK_MS} ms - still
+     * an order of magnitude cheaper than the old loop and only alive until shutdown.
+     */
+    private static final class StopFileWatcher {
+        /** Slow re-check used when inotify is unavailable (or to catch a missed event). */
+        private static final long FALLBACK_CHECK_MS = 5000L;
+        private final File dir;
+        private final File stopFile;
+        private final Runnable action;
+        private Thread thread;
+
+        StopFileWatcher(File dir, File stopFile, Runnable action) {
+            this.dir = dir;
+            this.stopFile = stopFile;
+            this.action = action;
+        }
+
+        void start() {
+            thread = new Thread(new Runnable() {
+                @Override
+                public void run() {
+                    loop();
+                }
+            }, "jdspd-stopfile");
+            thread.setDaemon(true);
+            thread.start();
+        }
+
+        private void loop() {
+            java.nio.file.WatchService ws = null;
+            if (dir != null && dir.isDirectory()) {
+                try {
+                    ws = dir.toPath().getFileSystem().newWatchService();
+                    dir.toPath().register(ws,
+                            java.nio.file.StandardWatchEventKinds.ENTRY_CREATE,
+                            java.nio.file.StandardWatchEventKinds.ENTRY_MODIFY);
+                    Log.i("stop file watcher armed (inotify) on " + dir);
+                } catch (Throwable t) {
+                    ws = null;
+                    Log.w("stop file watcher: inotify unavailable (" + t.getClass().getSimpleName()
+                            + "), re-checking every " + FALLBACK_CHECK_MS + " ms");
+                }
+            }
+            try {
+                while (!shuttingDown) {
+                    if (ws != null) {
+                        try {
+                            java.nio.file.WatchKey key = ws.poll(FALLBACK_CHECK_MS,
+                                    java.util.concurrent.TimeUnit.MILLISECONDS);
+                            if (key != null) {
+                                key.pollEvents();
+                                key.reset();
+                            }
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        } catch (Throwable t) {
+                            Log.w("stop file watcher: poll failed (" + t.getClass().getSimpleName()
+                                    + "), falling back to timed checks");
+                            try {
+                                ws.close();
+                            } catch (Throwable ignored) {
+                                // best effort
+                            }
+                            ws = null;
+                            continue;
+                        }
+                    } else {
+                        try {
+                            Thread.sleep(FALLBACK_CHECK_MS);
+                        } catch (InterruptedException e) {
+                            Thread.currentThread().interrupt();
+                            return;
+                        }
+                    }
+                    if (stopFile != null && stopFile.exists()) {
+                        stopFile.delete();
+                        action.run();
+                        return;
+                    }
+                }
+            } finally {
+                if (ws != null) {
+                    try {
+                        ws.close();
+                    } catch (Throwable ignored) {
+                        // best effort
+                    }
+                }
+            }
+        }
     }
 
     private static void usage() {

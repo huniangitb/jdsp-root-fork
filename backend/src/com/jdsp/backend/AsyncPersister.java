@@ -18,6 +18,10 @@ final class AsyncPersister {
     private boolean scheduled;
     /** At least one request arrived while a run was in flight: run once more afterwards. */
     private boolean rerun;
+    /** At most one delayed follow-up (single shot, disarmed when it fires). */
+    private java.util.concurrent.ScheduledFuture<?> delayed;
+    /** Timer for {@link #requestAfter(long)}; created lazily. */
+    private java.util.concurrent.ScheduledExecutorService timer;
 
     AsyncPersister(Runnable action) {
         this.action = action;
@@ -36,6 +40,35 @@ final class AsyncPersister {
             scheduled = true;
         }
         submit();
+    }
+
+    /**
+     * Arms exactly one delayed run ({@code <=} 1 outstanding). The persist action uses it when the
+     * throttle window swallowed the save (the config is still dirty): a single follow-up fires
+     * after the window instead of a periodic timer or a watcher-tick flush.
+     */
+    void requestAfter(long delayMs) {
+        synchronized (lock) {
+            if (delayed != null && !delayed.isDone()) {
+                return; // already armed: the follow-up will see the newest state anyway
+            }
+            delayed = timer().schedule(new Runnable() {
+                @Override
+                public void run() {
+                    synchronized (lock) {
+                        delayed = null;
+                    }
+                    request();
+                }
+            }, Math.max(1L, delayMs), java.util.concurrent.TimeUnit.MILLISECONDS);
+        }
+    }
+
+    /** True while a delayed follow-up is armed (diagnostics / tests). */
+    boolean isDelayArmed() {
+        synchronized (lock) {
+            return delayed != null && !delayed.isDone();
+        }
     }
 
     /** True while a run is queued or executing (diagnostics / tests). */
@@ -64,6 +97,21 @@ final class AsyncPersister {
                 }
             }
         });
+    }
+
+    private synchronized java.util.concurrent.ScheduledExecutorService timer() {
+        if (timer == null) {
+            timer = java.util.concurrent.Executors.newSingleThreadScheduledExecutor(
+                    new java.util.concurrent.ThreadFactory() {
+                        @Override
+                        public Thread newThread(Runnable r) {
+                            Thread t = new Thread(r, "jdspd-persist-timer");
+                            t.setDaemon(true);
+                            return t;
+                        }
+                    });
+        }
+        return timer;
     }
 
     private synchronized java.util.concurrent.ExecutorService pool() {

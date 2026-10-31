@@ -71,6 +71,11 @@ public final class CoreApi {
             long t0 = System.currentTimeMillis();
             try {
                 config.saveThrottled(200L);
+                if (config.isDirty()) {
+                    // The throttle window swallowed this save: arm one delayed follow-up
+                    // (single shot) instead of relying on a periodic flush somewhere else.
+                    persister.requestAfter(250L);
+                }
             } catch (Throwable t) {
                 Log.e("async config persist failed", t);
             }
@@ -599,7 +604,7 @@ public final class CoreApi {
             return EffectManager.ERR_BAD_ARG;
         }
         config.setPolicy(pkg, mode);
-        config.saveIfDirty();
+        persister.request(); // never fsync on the request thread
         watcher.poke();
         Log.i("policy " + pkg + " -> " + mode);
         return 0;
@@ -668,7 +673,9 @@ public final class CoreApi {
     private void applyEnabled(boolean enabled, long now) {
         boolean changed = config.isEnabled() != enabled;
         config.setEnabled(enabled);
-        config.saveThrottled(200L);
+        // Never fsync here: the master switch is a latency path (one save costs 35-50 ms on
+        // /data/adb). The AsyncPersister coalesces it and arms a single follow-up if throttled.
+        persister.request();
         enableSwitch.transitionApplied(enabled, now);
         if (changed) {
             Log.i("global " + (enabled ? "enabled" : "disabled")
@@ -772,7 +779,7 @@ public final class CoreApi {
             return EffectManager.ERR_BAD_ARG;
         }
         config.setMode(mode);
-        config.saveIfDirty();
+        persister.request(); // never fsync on the request thread
         watcher.poke();
         return config.getMode();
     }

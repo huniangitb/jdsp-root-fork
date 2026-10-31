@@ -12,22 +12,44 @@ import java.util.Set;
 
 import com.jdsp.common.BypassRule;
 import com.jdsp.common.EnableGate;
+import com.jdsp.common.WatcherPolicy;
 
 /**
- * Polls {@code dumpsys media.audio_flinger} once per second, resolves sessions to (pid, uid, pkg)
- * and reconciles the effect handles: new sessions get attached (and their configured parameters
- * replayed plus {@code setEnabled(true)}), vanished or excluded ones are released.
+ * Resolves playback sessions to (pid, uid, pkg) and reconciles the effect handles: new sessions
+ * get attached (and their configured parameters replayed plus {@code setEnabled(true)}), vanished
+ * or excluded ones are released.
  *
- * <p>The shell command runs through {@code sh -c} with a hard 3 s watchdog; a hung dumpsys can
- * never wedge the daemon (the next tick simply tries again).
+ * <h3>Event driven, not polled</h3>
+ *
+ * <p>The session list comes from {@code dumpsys media.audio_flinger} (78 KB, 28-150 ms measured
+ * including the {@code sh -c} fork) - far too expensive for a fixed 500 ms timer, which is what
+ * the daemon used to do.
+ *
+ * <p>Three triggers drive the loop instead (see {@link WatcherPolicy}):
+ * <ol>
+ *   <li>{@link #poke()} - an explicit request from the daemon (policy/mode change, attach or
+ *       detach command), runs a pass immediately;</li>
+ *   <li>a <b>cheap binder change detector</b> ({@link AudioServiceProbe},
+ *       {@code getActivePlaybackConfigurations()}, 64-93 us measured) polled every
+ *       {@link WatcherPolicy#PROBE_MS} ms: when the active player set changes, one dumpsys pass
+ *       resolves the session ids (with {@link WatcherPolicy#CHANGE_DEBOUNCE_MS} coalescing);</li>
+ *   <li>a {@link WatcherPolicy#FALLBACK_MS} ms safety pass that also carries the work that must
+ *       not sit on the hot path of a fast pass: the deferred global switch safety net, the App
+ *       endpoint file refresh and (through the AsyncPersister) the config flush.</li>
+ * </ol>
+ *
+ * <p>If the cheap detector is unavailable (ROM without that transaction, SELinux denial), the
+ * loop degrades to the timed {@link WatcherPolicy#LEGACY_POLL_MS} ms dump - the previous
+ * behaviour. The shell command runs through {@code sh -c} with a hard 3 s watchdog; a hung
+ * dumpsys can never wedge the daemon (the next pass simply tries again).
  */
 public final class SessionWatcher {
     /**
-     * Poll period. Was 1000 ms; 500 ms halves the worst-case discovery latency of a new
-     * playback session (dumpsys media.audio_flinger is ~75 KB here and parses in low tens of
-     * ms, so two passes per second cost a few percent of one core at most).
+     * Legacy timed poll period, kept for the fallback path and for diagnostics.
+     *
+     * @deprecated the loop is event driven; use {@link WatcherPolicy#LEGACY_POLL_MS}.
      */
-    public static final long POLL_MS = 500L;
+    public static final long POLL_MS = WatcherPolicy.LEGACY_POLL_MS;
     /** Hard timeout for one dumpsys invocation. */
     public static final long DUMPSYS_TIMEOUT_MS = 3000L;
     /**
@@ -58,6 +80,8 @@ public final class SessionWatcher {
     private final PolicyEngine policy;
     private final EffectManager effects;
     private final ParamBus bus;
+    /** Cheap "did the active playback set change" detector (null in host tests). */
+    private final AudioServiceProbe probe;
     /** Optional: keeps the App's endpoint files alive across App reinstalls. */
     private TcpService tcp;
     /** Optional: the core API (used for the deferred global switch transition). */
@@ -73,11 +97,19 @@ public final class SessionWatcher {
 
     private volatile List<SessionInfo> sessions = new ArrayList<SessionInfo>();
     private volatile long ticks;
+    private volatile long fullPasses;
     private volatile long failures;
     private volatile long lastTickAt;
     private volatile int lastDumpBytes;
     private volatile String lastError = "";
+    private volatile String lastPassReason = "";
     private long lastEndpointCheck;
+    /** Diagnostic line period of the watcher counters. */
+    private static final long DIAG_MS = 60000L;
+    private long lastDiagAt;
+    private long lastPassLogAt;
+    /** Session count of the last logged pass (diagnostics: log only changes). */
+    private int lastLoggedSessionCount = -1;
     /** sessionId -> wall clock of the tick the session was first seen (short-session debounce). */
     private final Map<Integer, Long> firstSeen = new HashMap<Integer, Long>();
     /**
@@ -86,6 +118,27 @@ public final class SessionWatcher {
      */
     private final java.util.ArrayDeque<long[]> recentDeaths = new java.util.ArrayDeque<long[]>();
     private volatile int stormDeaths;
+    /**
+     * One-shot timer that re-pokes the loop when a session's attach debounce expires.
+     *
+     * <p>With a periodic tick the debounce was free: the next tick simply found the session old
+     * enough. An event driven loop has no next tick, so the deadline has to be armed explicitly -
+     * otherwise a new stream waits for the {@link WatcherPolicy#FALLBACK_MS} safety pass (measured:
+     * 3.4 s instead of the expected ~0.6 s).
+     */
+    private final java.util.concurrent.ScheduledExecutorService debounceTimer =
+            java.util.concurrent.Executors.newSingleThreadScheduledExecutor(
+                    new java.util.concurrent.ThreadFactory() {
+                        @Override
+                        public Thread newThread(Runnable r) {
+                            Thread t = new Thread(r, "jdspd-attach-debounce");
+                            t.setDaemon(true);
+                            return t;
+                        }
+                    });
+    private final Object debounceLock = new Object();
+    private java.util.concurrent.ScheduledFuture<?> debounceTask;
+
     /** Worker pool for the per-session attach tasks (bounded, shared with EffectManager). */
     private final java.util.concurrent.ExecutorService attachPool = EffectManager.sharedPool();
     /**
@@ -100,10 +153,17 @@ public final class SessionWatcher {
 
     public SessionWatcher(ConfigStore config, PolicyEngine policy, EffectManager effects,
                           ParamBus bus) {
+        this(config, policy, effects, bus, new AudioServiceProbe());
+    }
+
+    /** Test/diagnostic constructor: {@code probe == null} means "use the timed dump". */
+    SessionWatcher(ConfigStore config, PolicyEngine policy, EffectManager effects, ParamBus bus,
+                   AudioServiceProbe probe) {
         this.config = config;
         this.policy = policy;
         this.effects = effects;
         this.bus = bus;
+        this.probe = probe;
     }
 
     /** Lets the watcher re-create the App's port/token files when they disappear. */
@@ -129,11 +189,18 @@ public final class SessionWatcher {
         }, "jdspd-watcher");
         thread.setDaemon(true);
         thread.start();
-        Log.i("session watcher started (poll " + POLL_MS + "ms)");
+        Log.i("session watcher started (event driven: probe " + WatcherPolicy.PROBE_MS
+                + "ms, full pass every " + WatcherPolicy.FALLBACK_MS + "ms)");
     }
 
     public void stop() {
         running = false;
+        synchronized (debounceLock) {
+            if (debounceTask != null) {
+                debounceTask.cancel(false);
+                debounceTask = null;
+            }
+        }
         poke();
         Thread t = thread;
         thread = null;
@@ -146,7 +213,7 @@ public final class SessionWatcher {
         }
     }
 
-    /** Makes the watcher run a pass immediately (used after policy/mode changes). */
+    /** Makes the watcher run a pass immediately (used after policy/mode/handle changes). */
     public void poke() {
         synchronized (wakeLock) {
             wake = true;
@@ -154,14 +221,42 @@ public final class SessionWatcher {
         }
     }
 
+    /**
+     * The event loop: sleep until a trigger, run a full pass, repeat.
+     *
+     * <p>Order per iteration: consume a pending poke, check the fallback deadline, otherwise ask
+     * the cheap detector whether the active playback set changed. Only then does a dumpsys pass
+     * run, so the expensive path is proportional to real audio activity instead of wall clock.
+     */
     private void loop() {
+        long lastPassAt = 0L;
         while (running) {
-            try {
-                pollOnce();
-            } catch (Throwable t) {
-                failures++;
-                lastError = EffectManager.describe(t);
-                Log.e("watcher tick failed: " + lastError, t);
+            long now = System.currentTimeMillis();
+            boolean poke = takeWake();
+            boolean fallback = WatcherPolicy.fallbackDue(now, lastPassAt);
+            boolean changed = false;
+            if (!poke && !fallback) {
+                changed = pollProbe();
+                if (changed) {
+                    // Coalesce the burst of player events one track switch produces.
+                    sleepQuietly(WatcherPolicy.CHANGE_DEBOUNCE_MS);
+                }
+            }
+            if (WatcherPolicy.shouldRunPass(poke, fallback, changed)) {
+                lastPassReason = poke ? "poke" : (changed ? "change" : "fallback");
+                try {
+                    pollOnce();
+                } catch (Throwable t) {
+                    failures++;
+                    lastError = EffectManager.describe(t);
+                    Log.e("watcher tick failed: " + lastError, t);
+                }
+                lastPassAt = System.currentTimeMillis();
+                if (fallback) {
+                    // Only the slow pass carries the non hot maintenance work.
+                    slowMaintenance();
+                }
+                continue;
             }
             synchronized (wakeLock) {
                 if (!running) {
@@ -169,35 +264,65 @@ public final class SessionWatcher {
                 }
                 if (!wake) {
                     try {
-                        wakeLock.wait(POLL_MS);
+                        wakeLock.wait(WatcherPolicy.nextSleepMs(probeReady()));
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                         break;
                     }
                 }
-                wake = false;
+                // Deliberately do NOT clear the wake flag here: takeWake() at the top of the next
+                // iteration consumes it and runs the pass. Clearing it here swallowed the poke
+                // that interrupted the wait (measured: a new stream then waited for the 3 s
+                // fallback pass instead of the 400 ms attach debounce).
             }
         }
         Log.i("session watcher stopped");
     }
 
-    /** Runs exactly one watcher pass (also used by --selftest). */
+    /** Reads and clears the pending poke flag. */
+    private boolean takeWake() {
+        synchronized (wakeLock) {
+            boolean w = wake;
+            wake = false;
+            return w;
+        }
+    }
+
+    /** True when the cheap detector can be used (cached inside the probe). */
+    private boolean probeReady() {
+        return probe != null && probe.available();
+    }
+
+    /** One cheap change-detector query; never throws. */
+    private boolean pollProbe() {
+        if (probe == null) {
+            return false;
+        }
+        try {
+            return probe.poll();
+        } catch (Throwable t) {
+            lastError = "probe poll failed: " + EffectManager.describe(t);
+            return false;
+        }
+    }
+
+    /**
+     * Runs exactly one full watcher pass (dumpsys + reconcile). Also used by {@code --selftest}.
+     *
+     * <p>Deliberately free of the work that must not delay a pass triggered by a change or a
+     * poke: the config flush lives in the AsyncPersister and the deferred switch transition has
+     * its own timer, both are only re-checked by {@link #slowMaintenance()}.
+     */
     public void pollOnce() {
         long t0 = System.currentTimeMillis();
-        // A rate limited "on" transition is applied FIRST: it must not queue behind
-        // the dumpsys + reconcile work of this tick (CoreApi also arms a timer for
-        // the exact deadline, this is the safety net only).
-        if (api != null) {
-            api.pollEnableSwitch();
-        }
         String dump = runDumpsys();
         ticks++;
         lastTickAt = t0;
         if (dump == null) {
             failures++;
-            config.saveIfDirty();
             return;
         }
+        fullPasses++;
         lastDumpBytes = dump.length();
         List<SessionInfo> list = DumpsysParser.parse(dump);
         policy.refresh();
@@ -216,8 +341,47 @@ public final class SessionWatcher {
             }
         }
         sessions = list;
+        long passMs = System.currentTimeMillis() - t0;
+        // Only interesting passes are logged: the 3 s fallback pass that found the same session set
+        // would otherwise write ~28k lines/day into the daemon log (it rotates three 1 MB files).
+        boolean changedSet = list.size() != lastLoggedSessionCount;
+        boolean interesting = changedSet || !"fallback".equals(lastPassReason);
+        if (interesting && System.currentTimeMillis() - lastPassLogAt >= 1000L) {
+            lastPassLogAt = System.currentTimeMillis();
+            lastLoggedSessionCount = list.size();
+            Log.i("watcher pass reason=" + lastPassReason + " sessions=" + list.size()
+                    + " dumpMs=" + passMs);
+        }
         reconcile(list);
-        config.saveIfDirty();
+    }
+
+    /**
+     * Work that must not run on a fast pass: the deferred global switch safety net (normally the
+     * {@link CoreApi}-owned timer fires first), the App endpoint file refresh (self throttled to
+     * {@link #ENDPOINT_REFRESH_MS}) and the config flush request. Runs at most every
+     * {@link WatcherPolicy#FALLBACK_MS} ms.
+     */
+    void slowMaintenance() {
+        long nowMs = System.currentTimeMillis();
+        if (nowMs - lastDiagAt >= DIAG_MS) {
+            lastDiagAt = nowMs;
+            Log.i("watcher: passes=" + fullPasses + " probePolls=" + probePolls()
+                    + " probeChanges=" + probeChanges() + " probeCostUs=" + probeCostUs()
+                    + " probe=" + (probeAvailable() ? "on" : "off")
+                    + " lastReason=" + lastPassReason);
+        }
+        try {
+            if (api != null) {
+                api.pollEnableSwitch();
+            }
+        } catch (Throwable t) {
+            Log.w("slow pass: deferred switch check failed: " + EffectManager.describe(t));
+        }
+        try {
+            config.saveIfDirty();
+        } catch (Throwable t) {
+            Log.w("slow pass: config flush failed: " + EffectManager.describe(t));
+        }
         refreshEndpointFiles();
     }
 
@@ -240,6 +404,14 @@ public final class SessionWatcher {
             service.refreshEndpointFiles();
         } catch (Throwable t) {
             Log.w("endpoint file refresh failed: " + EffectManager.describe(t));
+        }
+    }
+
+    private void sleepQuietly(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
         }
     }
 
@@ -401,6 +573,9 @@ public final class SessionWatcher {
         boolean globallyDisabled = !config.isEnabled();
         boolean storm = inStorm();
         final List<Runnable> attachTasks = new ArrayList<Runnable>();
+        // Earliest moment at which a still-too-young session becomes attachable (armed at the end).
+        long nextAttachAt = Long.MAX_VALUE;
+        final long debounceMs = storm ? ATTACH_DEBOUNCE_MS : ATTACH_DEBOUNCE_FAST_MS;
         for (int i = 0; i < list.size(); i++) {
             SessionInfo s = list.get(i);
             present.add(Integer.valueOf(s.sessionId));
@@ -444,11 +619,15 @@ public final class SessionWatcher {
                     // session is picked up on a later tick with parameters replayed.
                     Integer key = Integer.valueOf(s.sessionId);
                     Long seenAt = firstSeen.get(key);
+                    long nowMs0 = System.currentTimeMillis();
                     if (seenAt == null) {
-                        firstSeen.put(key, Long.valueOf(System.currentTimeMillis()));
+                        firstSeen.put(key, Long.valueOf(nowMs0));
+                        nextAttachAt = Math.min(nextAttachAt, nowMs0 + debounceMs);
                         continue;
                     }
-                    if (!mayAttach(seenAt, System.currentTimeMillis(), storm)) {
+                    if (!mayAttach(seenAt, nowMs0, storm)) {
+                        nextAttachAt = Math.min(nextAttachAt,
+                                seenAt.longValue() + debounceMs);
                         continue;
                     }
                     // The per-session attach work (AudioEffect ctor binder call 60-230 ms +
@@ -515,6 +694,25 @@ public final class SessionWatcher {
         // and vanished within one tick cannot start an attach for a corpse.
         for (int i = 0; i < attachTasks.size(); i++) {
             attachPool.submit(attachTasks.get(i));
+        }
+        // Event driven debounce: wake the loop exactly when the next session becomes attachable.
+        if (nextAttachAt != Long.MAX_VALUE) {
+            armDebounce(nextAttachAt - System.currentTimeMillis());
+        }
+    }
+
+    /** Arms the one-shot debounce wakeup (at most one pending). */
+    private void armDebounce(long delayMs) {
+        synchronized (debounceLock) {
+            if (debounceTask != null && !debounceTask.isDone()) {
+                return;
+            }
+            debounceTask = debounceTimer.schedule(new Runnable() {
+                @Override
+                public void run() {
+                    poke();
+                }
+            }, Math.max(1L, delayMs), java.util.concurrent.TimeUnit.MILLISECONDS);
         }
     }
 
@@ -599,6 +797,11 @@ public final class SessionWatcher {
         return ticks;
     }
 
+    /** Full dumpsys passes that produced a session list (diagnostics). */
+    public long fullPasses() {
+        return fullPasses;
+    }
+
     public long failures() {
         return failures;
     }
@@ -613,6 +816,36 @@ public final class SessionWatcher {
 
     public String lastError() {
         return lastError;
+    }
+
+    /** Why the last full pass ran: {@code poke}, {@code change} or {@code fallback}. */
+    public String lastPassReason() {
+        return lastPassReason;
+    }
+
+    /** True when the cheap change detector is usable. */
+    public boolean probeAvailable() {
+        return probeReady();
+    }
+
+    /** Cheap detector queries since start (diagnostics). */
+    public long probePolls() {
+        return probe == null ? 0L : probe.polls();
+    }
+
+    /** Active-set changes the cheap detector reported (diagnostics). */
+    public long probeChanges() {
+        return probe == null ? 0L : probe.changes();
+    }
+
+    /** Cost of the last cheap query in microseconds (diagnostics). */
+    public long probeCostUs() {
+        return probe == null ? 0L : probe.lastCostUs();
+    }
+
+    /** Last probe error, empty when it never failed. */
+    public String probeError() {
+        return probe == null ? "" : probe.lastError();
     }
 
     /** Applies parameters to every attached session (used by loadPreset). */

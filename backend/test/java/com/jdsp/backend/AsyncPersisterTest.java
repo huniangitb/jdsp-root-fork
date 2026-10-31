@@ -36,6 +36,31 @@ public final class AsyncPersisterTest {
                         "action ran off the caller thread");
             }
         });
+        suite.test("async persist: a delayed follow-up fires once and disarms",
+                new com.jdsp.cli.Body() {
+            public void run() throws Exception {
+                final AtomicInteger runs = new AtomicInteger();
+                AsyncPersister p = new AsyncPersister(new Runnable() {
+                    @Override
+                    public void run() {
+                        runs.incrementAndGet();
+                    }
+                });
+                p.requestAfter(20L);
+                Assert.isTrue(p.isDelayArmed(), "the follow-up is armed");
+                p.requestAfter(20L); // arming twice keeps exactly one pending follow-up
+                Assert.isTrue(p.isDelayArmed(), "still exactly one armed follow-up");
+                long deadline = System.currentTimeMillis() + 5000L;
+                while (runs.get() < 1 && System.currentTimeMillis() < deadline) {
+                    Thread.sleep(5L);
+                }
+                Assert.eq(1, runs.get(), "the delayed follow-up ran exactly once");
+                Thread.sleep(100L);
+                Assert.isTrue(!p.isDelayArmed(), "the follow-up disarmed itself");
+                Assert.eq(1, runs.get(), "no periodic re-arm (single shot)");
+            }
+        });
+
         suite.test("async persist: requests arriving during a run coalesce into it",
                 new com.jdsp.cli.Body() {
             public void run() throws Exception {
