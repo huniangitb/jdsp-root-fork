@@ -27,7 +27,7 @@ import org.json.JSONObject;
  */
 public final class CoreApi {
     /** Reported by getVersion / ping. */
-    public static final String VERSION = "jdspd 2.1.4";
+    public static final String VERSION = "jdspd 2.1.5";
     /** Returned by ping(). */
     public static final int PING_OK = 1;
     /**

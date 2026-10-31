@@ -66,14 +66,14 @@ AIDL_EFFECT_V=3 AIDL_TYPES_V=5 ./native/aidl/build-aidl.sh vendor
 
 ## 6. 版本基线
 
-当前模块源码 = v2.1.4-fork（versionCode 214），内置后端 jdspd 2.1.4、引擎补丁 0001-0006、
-App 1.6.18（versionCode 64；"UI 不持有参数，先从后端拉取、用户修改才写回"，另有总开关意图直投 /
+当前模块源码 = v2.1.5-fork（versionCode 215），内置后端 jdspd 2.1.5、引擎补丁 0001-0008、
+App 1.6.19（versionCode 65；参数写入一帧一批、全局参数 s=0，另有 1.6.18 的总开关意图直投 /
 -1006 业务码透传 / 20 s TCP 保活）。分发包
-`dist/JDSP-fork-v2.1.4.zip`（sha256 `b3ed97b80012ecc5a334a9ecd86a2e4b1dcef70e16ac21d75c0d412e9120d3e2`）。
+`dist/JDSP-fork-v2.1.5.zip`（sha256 `a5c9867a397d411084bdc1a73a82bfd4beb73938a811e30cb486ac722e4f9048`）。
 
 App 构建（源码路线，Gradle 离线）：`cd /home/bdy/work/loundess_git && ./gradlew --offline --no-daemon \
 -Dorg.gradle.jvmargs=-Xmx3g --max-workers=2 assembleRootFullRelease`，产物
-`app/build/outputs/apk/rootFull/release/JamesDSP-v1.6.18-64-root-full-universal-release.apk`
+`app/build/outputs/apk/rootFull/release/JamesDSP-v1.6.19-65-root-full-universal-release.apk`
 （debug 签名证书 `904ddf44…`，可直接覆盖升级），再拷到 `module/src/common/files/JamesDSPManagerThePBone.apk`。
 
 引擎侧补丁（`native/patches/`，arm64/arm 两路都已编入；arm64-sve/aidl/x86 仍是上游预编译，未含补丁）：
@@ -84,7 +84,10 @@ App 构建（源码路线，Gradle 离线）：`cd /home/bdy/work/loundess_git &
 - `0004-state-writer-thread-and-dump.patch`：state.bin 异步落盘 + EFFECT_CMD_DUMP + 禁用态语义
 - `0005-accumulate-output-contract.patch`：遵守 EFFECT_BUFFER_ACCESS_ACCUMULATE，修复同输出第二会话静音
 - `0006-async-engine-prime.patch`：EffectCreate 发布 pristine 直通实例，state 重放异步完成（attach ~90ms）
+- `0007-engine-capture-tap.patch`：采集 tap（32001/32002），effect 入/出两路 PCM 落 WAV；默认关闭、
+  未武装零开销。详见 `docs/ENGINE-TAP-AND-MIX-CHECK.md`
+- `0008-engine-mix-integrity-check.patch`：accumulate 路径上的 mix 保真自检（30023-30028）；默认关闭
 
 后端：`backend/`（jdspd + jdspcli），`./backend/build.sh` 产物进 `module/src/backend/` 后由
 `./module/package.sh` 打包。注意 `native/build.sh` 目前只编译不应用补丁（见
-`out/verify/dist-verify.md` R1/R2），补丁版 .so 需按 `native/setup-src.sh` + 手工应用 0004-0006。
+`out/verify/dist-verify.md` R1/R2），补丁版 .so 需按 `native/setup-src.sh` + 手工应用 0004-0008。

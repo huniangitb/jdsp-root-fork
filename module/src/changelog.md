@@ -1,3 +1,31 @@
+### v2.1.5-fork（引擎采集 tap + mix 保真自检；App 参数写入一帧一批）
+
+* **引擎 0007（capture tap，诊断设施，默认关闭）**：新增 `jdsp_tap.c/h` 与 `generic_process()` 里的
+  两处 hook——把 effect **输入**（lane 0）和引擎交回 AudioFlinger 的 **out buffer**（lane 1，与厂商
+  AF35 dump 同一个对象）拷进预分配环形，由 writer 线程排空成 44 字节头的 WAV。接口
+  **32001（SET）**：192 B `jdsp_tap_config_t`（magic "TAP1" / lanes bit0=IN bit1=OUT / frames
+  1024..2^18 / limit_frames / sample_rate / flags bit0=写 WAV / path[160]）、
+  **32002（GET）**：112 B 状态（captured / written / dropped / read_by_caller / overruns / files）。
+  渲染线程只做边界检查 + memcpy，环形满丢最旧并计数，**绝不阻塞音频线程**；参数在写锁 gate
+  **之前**处理，因此不需要 engine key、不进延迟参数队列、不写 state.bin。
+  **未武装零开销**：只剩每 lane 一次 NULL 检查——零分配、零 memcpy、零日志、零文件
+  （同输入同持久化状态下，新库对 0001-0006 产物逐字节复现，ref-out.raw md5 89f89ed3 一致）。
+  arm64 与 armv7a **两路都已重建**；主机测试新增 `test_tap`（五种格式逐位捕获回读、overrun 策略、
+  limit_frames、WAV 头、并发生产/消费），**8 组主机测试全绿**；真机 -20 dB@1 kHz 陷波实测
+  **-21.74 dB**（tap 侧 IN -70.19 / OUT -91.93 dBFS，每路 3.18 MB）。
+* **引擎 0008（mix 保真自检，默认关闭）**：新增 `jdsp_mixcheck.c/h`，把 0005 的 ACCUMULATE 契约
+  变成**计数器**——accumulate 路径上断言 `out_after == out_before + rendered`（float32/int32/int16，
+  整型按饱和；别名缓冲不检查），不一致的 buffer 数暴露为 **30023（broken）/ 30024（runs）**，
+  武装 **30025**、清零 **30026**、状态 **30027**、上次坏样本数 **30028**。计数是进程级的
+  （audioserver 内任何实例造成的损坏都计入）。未武装只多一次 relaxed atomic load + 一个分支；
+  真机正常播放实测 **runs=99 / broken=0**，武装与否渲染出的音频逐位相同。
+  这样"引擎吞了别人的混音"变成可测量，不必依赖厂商 PCM dump。
+  细节见 `docs/ENGINE-TAP-AND-MIX-CHECK.md` 与 `native/README.md`。
+* **App 1.6.19（versionCode 65）**：参数写入改**一帧一批**（同一帧内的多笔写合并成一次
+  `setparams` 批量操作，每帧只付一个往返），全局参数用 **`s=0`** 直发（不再先查会话列表再逐会话写）。
+  时延数字见 app-batch 报告（本条先记行为，数字随报告补）。
+* 模块 versionCode **215**；后端 **jdspd 2.1.5**；引擎补丁集 **0001-0008**（arm64/arm 两路）。
+
 ### v2.1.4-fork（最低操作链路时延：总开关 bypass 优先 + 事件唤醒 deferred + 后端批量/全局写 + App 直投）
 
 * **总开关改 bypass 优先、空闲兜底卸载（jdspd 2.1.4）**：`off` 不再拆链，只在活着的句柄上下一次
