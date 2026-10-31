@@ -15,6 +15,7 @@ public final class AllTests {
         com.jdsp.common.EngineWriteLockTest.run(suite);
         com.jdsp.common.ParamBaselineTest.run(suite);
         com.jdsp.common.ParamReplyTest.run(suite);
+        com.jdsp.common.ProbeScheduleTest.run(suite);
         com.jdsp.common.WatcherPolicyTest.run(suite);
         com.jdsp.backend.EffectManagerDetachTest.run(suite);
         com.jdsp.backend.AttachDebounceTest.run(suite);

@@ -1,3 +1,44 @@
+### v2.1.8-fork（daemon 事件驱动 + per-session 分锁；修复开机 probe 退化：jdspd CPU -75%，attach p95 -72%）
+
+* **EffectManager 改 per-session 锁 + 状态机（A1）**：原来的全局 `synchronized` 把"一条会话的 binder
+  写"变成"全体会话串行"。现在每会话一把锁 + `ST_LIVE/ST_CLOSING` 状态机与在飞写计数：detach 会等
+  在飞写完成，`CLOSING` 期间的新写立刻返回 `NO_HANDLE`（不再打到一个正在关闭的句柄上），
+  `gate.forget()` 挪到 release 之后；`enabled`/`hasControl` 加 **1 s TTL 缓存**，`states()/state()`
+  不再持锁调 binder。
+* **SessionWatcher 改事件驱动（B4）**：500 ms 定时 dumpsys → **100 ms 廉价 binder 探测**
+  （`IAudioService.getActivePlaybackConfigurations()`，实测 **64-93 µs/次**）算活跃集合签名，
+  签名变化才跑一次 dumpsys 取 sessionId，另加 **3 s 兜底全量**；`config.saveIfDirty()`、
+  `pollEnableSwitch()` 只在兜底 pass 的 `slowMaintenance()` 里跑。attach 去抖从"每 tick 轮询"改成
+  **一次性定时唤醒**。
+* **Daemon 主循环（B5）**：去掉 1 s 周期 sleep → `CountDownLatch` 等 shutdown；stop 文件（卸载用）
+  改用 **inotify WatchService**（不可用时退 5 s 复查兜底）。
+* **落盘彻底离开请求线程（A3）**：`applyEnabled`/`setAppPolicy`/`setMode` 里的内联
+  `saveThrottled`/`saveIfDirty` 换成异步 persister，并给 persister 加**单次自解除的延时补跑**
+  （`requestAfter()`）——节流窗口吞掉的那次保存最终且只写一次。
+* **实测（同机、同会话对、同脚本；latency-auditor）**：
+  - jdspd CPU（30 s utime+stime / 单核）**13.53% → 3.43%（-75%）**
+  - watcher 全量 dumpsys **1.733/s → 0.333/s（-81%）**
+  - 新播放会话 → effect attach 完成（8 次）p50 **1325 → 739 ms**、p95 **2723 → 755 ms（-72%）**
+  - 并发 2 客户端 / 2 会话 p95 **45.8 / 45.6 → 35.1 / 32.1 ms**
+  - 总开关 API 往返：off 5-19 → 7-10 ms、on 11-17 → **5-9 ms**；日志侧 off→bypass **4 ms**、
+    on→un-bypass **5 ms**（2 实例）
+  - 单参数 RTT **无回归**（引擎侧漂移主导：同时段 A/B/A 为 25.9 vs 25.3 ms）
+  - 慢参数（16 KB 分片）期间另一会话 p95 168.0 → 163.5 ms —— **阻塞点在 audioserver，不在 jdspd**
+* **修复"正常开机后事件驱动其实是关的"（v2.1.8，装机复验发现，P1）**：daemon 在开机时比 audio 服务
+  更早起，首次探测 `ServiceManager.getService("audio")` 必然拿到 `audio service not found`；v2.1.7 把这个
+  失败**永久缓存**，于是整次开机 `probe=off`，而退化路径又仍然等 **3 s 的 fallback**（日志却写着 500 ms），
+  实测新会话 attach **2.5-3.1 s**，比 v2.1.6 的 1.3 s **更差**。现在：
+  - 探测失败**不缓存**，每 **5 s** 重试一次，成功时打一行 `cheap playback-set probe available after N retries`；
+  - probe 不可用时整轮 pass 按 **`LEGACY_POLL_MS` 500 ms** 跑（不再等 3 s），日志文案改成实话
+    （`legacy 500 ms polling, retrying every 5000 ms`）；
+  - 状态行增加 `probeAttempts/probeSetupFail`，方便现场判断（详见 `docs/DAEMON-EVENT-DRIVEN.md`）。
+* 后端 **jdspd 2.1.8**；模块 versionCode **218**；引擎与 App 与 v2.1.6 相同（补丁 0001-0008、
+  arm64 `658aff86` / arm `b7aba479`、App 1.6.20-66）。
+* 测试：`./backend/test/run_tests.sh` → **273 passed**（原 258 + 新增 15：`EffectManagerConcurrencyTest`、
+  `WatcherPolicyTest`（含"probe 不可用 → 500 ms 一轮"与"probe 可用时 3 s"）、`ProbeScheduleTest`（重试
+  计划与 retry 计数文案）、`AsyncPersisterTest` 的 `requestAfter` 用例），设备选择 selftest **11 PASS**。
+* 细节与 Phase 0 探针（哪些事件源能用/不能用）见 `docs/DAEMON-EVENT-DRIVEN.md`。
+
 ### v2.1.6-fork（GET 返回值语义修正 + 诊断参数不再落盘；App 开关状态以后端为准）
 
 * **修复 `getParam` 的返回值语义（P1，装机复验发现）**：引擎的 `GET_PARAM` 成功时返回**写入的字节数**

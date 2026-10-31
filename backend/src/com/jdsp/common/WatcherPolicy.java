@@ -49,9 +49,26 @@ public final class WatcherPolicy {
         return poke || fallbackDue || changed;
     }
 
+    /**
+     * Period of a full (expensive) pass: {@value #FALLBACK_MS} ms with the cheap probe, but
+     * {@value #LEGACY_POLL_MS} ms without it. v2.1.7 kept the 3 s deadline in the degraded case
+     * while its log claimed 500 ms, so a normal boot - where the probe setup raced the audio
+     * service and the failure was cached forever - polled every three seconds and a new playback
+     * session waited 2.5-3.1 s for its attach (v2.1.6: 1.3 s). Degraded must never be slower than
+     * the pre-event-driven daemon.
+     */
+    public static long fullPassPeriodMs(boolean probeAvailable) {
+        return probeAvailable ? FALLBACK_MS : LEGACY_POLL_MS;
+    }
+
     /** True when the fallback pass is due (also true when no pass ran yet). */
+    public static boolean fallbackDue(boolean probeAvailable, long now, long lastPassAt) {
+        return lastPassAt <= 0L || now - lastPassAt >= fullPassPeriodMs(probeAvailable);
+    }
+
+    /** Fallback deadline assuming the cheap probe is available. */
     public static boolean fallbackDue(long now, long lastPassAt) {
-        return lastPassAt <= 0L || now - lastPassAt >= FALLBACK_MS;
+        return fallbackDue(true, now, lastPassAt);
     }
 
     /** How long the loop may sleep before it re-evaluates its triggers. */

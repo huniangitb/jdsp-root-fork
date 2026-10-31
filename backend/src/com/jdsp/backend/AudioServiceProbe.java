@@ -28,8 +28,13 @@ import java.util.List;
  *
  * <p>Everything is reflection because both {@code ServiceManager} and {@code IAudioService} are
  * hidden APIs; a plain root {@code app_process} may use them (the daemon already reflects into
- * the hidden {@code AudioEffect} constructor). Any failure permanently marks the probe
- * unavailable - the watcher then falls back to its timed dump, never to a busy loop.
+ * the hidden {@code AudioEffect} constructor).
+ *
+ * <p><b>A failure is retried, not remembered</b> (v2.1.8): the daemon starts before the audio
+ * service is registered on a normal boot, so the first setup attempt legitimately fails with
+ * "audio service not found". v2.1.7 cached that forever and spent the whole boot in the timed
+ * fallback; now a new setup attempt is made every {@link com.jdsp.common.ProbeSchedule#RETRY_MS}
+ * ms until it succeeds, and the watcher keeps its cheap cadence from then on.
  */
 final class AudioServiceProbe {
     private Object service;
@@ -37,21 +42,31 @@ final class AudioServiceProbe {
     private Method getClientUid;
     private Method getClientPid;
     private Method getPlayerState;
-    private boolean unavailable;
+    /** Last setup attempt (System.currentTimeMillis), 0 = never tried. */
+    private long lastAttemptAt;
+    private int setupAttempts;
+    private int setupFailures;
     private String lastError = "";
     private String lastSignature = "";
     private long polls;
     private long changes;
     private long lastCostUs;
 
-    /** True when the cheap query is usable (tries to set it up on first use). */
+    /**
+     * True when the cheap query is usable. Sets it up on first use and retries a failed setup
+     * every {@link com.jdsp.common.ProbeSchedule#RETRY_MS} ms (the audio service may simply not
+     * exist yet when the daemon starts during boot).
+     */
     synchronized boolean available() {
         if (service != null) {
             return true;
         }
-        if (unavailable) {
+        long now = System.currentTimeMillis();
+        if (!com.jdsp.common.ProbeSchedule.attemptDue(now, lastAttemptAt)) {
             return false;
         }
+        lastAttemptAt = now;
+        setupAttempts++;
         try {
             Class<?> serviceManager = Class.forName("android.os.ServiceManager");
             Object binder = serviceManager.getMethod("getService", String.class)
@@ -73,15 +88,17 @@ final class AudioServiceProbe {
             getClientPid = configGetter("getClientPid");
             getPlayerState = configGetter("getPlayerState");
             service = svc;
-            Log.i("session watcher: cheap playback-set probe available ("
-                    + "getActivePlaybackConfigurations)");
+            Log.i("session watcher: cheap playback-set probe available"
+                    + com.jdsp.common.ProbeSchedule.retryNote(setupFailures)
+                    + " (getActivePlaybackConfigurations)");
+            setupFailures = 0;
             return true;
         } catch (Throwable t) {
-            unavailable = true;
+            setupFailures++;
             lastError = EffectManager.describe(t);
-            Log.w("session watcher: cheap probe unavailable (" + lastError
-                    + "), falling back to the timed " + com.jdsp.common.WatcherPolicy.LEGACY_POLL_MS
-                    + " ms dump");
+            Log.w("session watcher: cheap probe unavailable (" + lastError + "), legacy "
+                    + com.jdsp.common.WatcherPolicy.LEGACY_POLL_MS + " ms polling, retrying every "
+                    + com.jdsp.common.ProbeSchedule.RETRY_MS + " ms");
             return false;
         }
     }
@@ -120,12 +137,16 @@ final class AudioServiceProbe {
             }
             return false;
         } catch (Throwable t) {
-            // A failure here must not cost more than the fallback timer: give up on the probe.
-            unavailable = true;
+            // A runtime failure costs one fallback period, then the setup is retried (the binder
+            // may have died with a restarted audioserver, which is exactly the case where the
+            // probe must come back on its own).
             service = null;
+            lastAttemptAt = System.currentTimeMillis();
+            setupFailures++;
             lastError = EffectManager.describe(t);
-            Log.w("session watcher: cheap probe failed (" + lastError
-                    + "), falling back to the timed dump");
+            Log.w("session watcher: cheap probe failed (" + lastError + "), legacy "
+                    + com.jdsp.common.WatcherPolicy.LEGACY_POLL_MS + " ms polling, retrying every "
+                    + com.jdsp.common.ProbeSchedule.RETRY_MS + " ms");
             return false;
         }
     }
@@ -171,7 +192,17 @@ final class AudioServiceProbe {
     }
 
     synchronized boolean isUnavailable() {
-        return unavailable;
+        return service == null;
+    }
+
+    /** Setup attempts so far (1 + retries), for the watcher's status line. */
+    synchronized int setupAttempts() {
+        return setupAttempts;
+    }
+
+    /** Failed setup attempts so far (reset to 0 by a success). */
+    synchronized int setupFailures() {
+        return setupFailures;
     }
 
     synchronized long polls() {

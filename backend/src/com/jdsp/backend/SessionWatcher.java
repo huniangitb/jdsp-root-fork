@@ -38,10 +38,13 @@ import com.jdsp.common.WatcherPolicy;
  *       endpoint file refresh and (through the AsyncPersister) the config flush.</li>
  * </ol>
  *
- * <p>If the cheap detector is unavailable (ROM without that transaction, SELinux denial), the
- * loop degrades to the timed {@link WatcherPolicy#LEGACY_POLL_MS} ms dump - the previous
- * behaviour. The shell command runs through {@code sh -c} with a hard 3 s watchdog; a hung
- * dumpsys can never wedge the daemon (the next pass simply tries again).
+ * <p>If the cheap detector is unavailable (ROM without that transaction, SELinux denial, or -
+ * the common case - the daemon starting before the audio service is registered), the loop
+ * degrades to a full pass every {@link WatcherPolicy#LEGACY_POLL_MS} ms, i.e. exactly the
+ * pre-event-driven behaviour, and keeps retrying the setup (v2.1.8; v2.1.7 cached the first
+ * failure forever and then still waited for the 3 s fallback). The shell command runs through
+ * {@code sh -c} with a hard 3 s watchdog; a hung dumpsys can never wedge the daemon (the next
+ * pass simply tries again).
  */
 public final class SessionWatcher {
     /**
@@ -190,7 +193,8 @@ public final class SessionWatcher {
         thread.setDaemon(true);
         thread.start();
         Log.i("session watcher started (event driven: probe " + WatcherPolicy.PROBE_MS
-                + "ms, full pass every " + WatcherPolicy.FALLBACK_MS + "ms)");
+                + "ms, full pass every " + WatcherPolicy.FALLBACK_MS
+                + "ms, legacy " + WatcherPolicy.LEGACY_POLL_MS + "ms when the probe is unavailable)");
     }
 
     public void stop() {
@@ -233,7 +237,9 @@ public final class SessionWatcher {
         while (running) {
             long now = System.currentTimeMillis();
             boolean poke = takeWake();
-            boolean fallback = WatcherPolicy.fallbackDue(now, lastPassAt);
+            // Without the cheap probe a full pass runs every LEGACY_POLL_MS (v2.1.8): the
+            // degraded path must never be slower than the pre-event-driven daemon.
+            boolean fallback = WatcherPolicy.fallbackDue(probeReady(), now, lastPassAt);
             boolean changed = false;
             if (!poke && !fallback) {
                 changed = pollProbe();
@@ -368,6 +374,8 @@ public final class SessionWatcher {
             Log.i("watcher: passes=" + fullPasses + " probePolls=" + probePolls()
                     + " probeChanges=" + probeChanges() + " probeCostUs=" + probeCostUs()
                     + " probe=" + (probeAvailable() ? "on" : "off")
+                    + (probe == null ? "" : " probeAttempts=" + probe.setupAttempts()
+                            + " probeSetupFail=" + probe.setupFailures())
                     + " lastReason=" + lastPassReason);
         }
         try {

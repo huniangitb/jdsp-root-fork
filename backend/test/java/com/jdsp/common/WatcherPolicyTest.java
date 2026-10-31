@@ -54,5 +54,34 @@ public final class WatcherPolicyTest {
                         "a detected change is coalesced before the pass");
             }
         });
+
+        suite.test("watcher policy: a detected change runs a pass immediately", () -> {
+            long now = 2000000L;
+            long justRan = now - 1L;
+            Assert.isTrue(!WatcherPolicy.fallbackDue(true, now, justRan),
+                    "the 3 s deadline has not passed");
+            Assert.isTrue(WatcherPolicy.shouldRunPass(false,
+                            WatcherPolicy.fallbackDue(true, now, justRan), true),
+                    "a changed probe signature runs the pass without waiting for the deadline");
+        });
+
+        suite.test("watcher policy: probe unavailable means a full pass every LEGACY_POLL_MS",
+                () -> {
+            long now = 3000000L;
+            Assert.eq(WatcherPolicy.LEGACY_POLL_MS, WatcherPolicy.fullPassPeriodMs(false),
+                    "degraded period is the pre-event-driven 500 ms");
+            Assert.eq(WatcherPolicy.FALLBACK_MS, WatcherPolicy.fullPassPeriodMs(true),
+                    "with the probe the fallback stays at 3 s");
+            long lastPass = now - WatcherPolicy.LEGACY_POLL_MS;
+            Assert.isTrue(WatcherPolicy.fallbackDue(false, now, lastPass),
+                    "500 ms after the last pass a new one is due while the probe is unavailable");
+            Assert.isTrue(!WatcherPolicy.fallbackDue(true, now, lastPass),
+                    "the same instant is not due when the probe drives the loop");
+            Assert.isTrue(!WatcherPolicy.fallbackDue(false, now,
+                            now - WatcherPolicy.LEGACY_POLL_MS + 1L),
+                    "degraded polling is not tighter than LEGACY_POLL_MS");
+            Assert.isTrue(WatcherPolicy.fullPassPeriodMs(false) < WatcherPolicy.FALLBACK_MS,
+                    "degraded must be faster than the event-driven fallback, never slower");
+        });
     }
 }
