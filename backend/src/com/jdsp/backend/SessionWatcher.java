@@ -107,6 +107,49 @@ public final class SessionWatcher {
     private volatile String lastError = "";
     private volatile String lastPassReason = "";
     private long lastEndpointCheck;
+    /** Last non hot maintenance pass (config flush, deferred switch, endpoint files). */
+    private long lastMaintenanceAt;
+    /** Last full dumpsys cross-check of the cheap view (0 = none since start). */
+    private volatile long lastCrosscheckAt;
+    /** Passes served straight from the probe rows (no dump). */
+    private volatile long probePasses;
+    /** Full dumpsys cross-checks of the probe view. */
+    private volatile long crossChecks;
+    /** Rows the probe reported in the last poll (players, including session 0). */
+    private volatile int probeRows;
+    /** "probe" when the last pass came from the cheap query, "dumpsys" otherwise. */
+    private volatile String discoveryMode = "dumpsys";
+    /**
+     * Session ids that only a dumpsys has ever reported: players that never register with
+     * AudioService (native AAudio / OpenSL ES, i.e. most games). A cheap pass must not retire
+     * them - only a dump that no longer lists them may - otherwise switching discovery to the
+     * probe would silently drop the effect chain of every native player.
+     */
+    private final java.util.Set<Integer> dumpOnly =
+            java.util.Collections.newSetFromMap(
+                    new java.util.concurrent.ConcurrentHashMap<Integer, Boolean>());
+    /** Session list of the last dumpsys pass (retained on cheap passes for {@link #dumpOnly}). */
+    private volatile List<SessionInfo> lastDumpSessions = new ArrayList<SessionInfo>();
+    /**
+     * True when the cheap query reports no playing player while the music stream is active: a
+     * native player is playing, so the probe's view is incomplete and the dump drives discovery
+     * until the two agree.
+     */
+    private volatile boolean probeBlind;
+    /** Iterations served by the ~10 us isStreamActive gate instead of the config query. */
+    private volatile long idleSkips;
+    /** Earliest next idle safety query (see {@link WatcherPolicy#IDLE_QUERY_MS}). */
+    private long nextIdleQueryAt;
+    /** Previous isStreamActive gate value (edge detection: a stream that just started). */
+    private boolean lastGateActive;
+    /** Last time the isStreamActive gate said "music playing" (blind-mode hysteresis). */
+    private volatile long lastGateTrueAt;
+    /** blind -> not blind transitions since start (diagnostics). */
+    private volatile long blindFlips;
+    /** True when the last pass saw a different attachable session set (drives the ladder). */
+    private volatile boolean dumpSetChanged;
+    /** Session ids of the last pass. */
+    private java.util.Set<Integer> lastDumpIds = java.util.Collections.emptySet();
     /** Diagnostic line period of the watcher counters. */
     private static final long DIAG_MS = 60000L;
     private long lastDiagAt;
@@ -192,9 +235,13 @@ public final class SessionWatcher {
         }, "jdspd-watcher");
         thread.setDaemon(true);
         thread.start();
-        Log.i("session watcher started (event driven: probe " + WatcherPolicy.PROBE_MS
-                + "ms, full pass every " + WatcherPolicy.FALLBACK_MS
-                + "ms, legacy " + WatcherPolicy.LEGACY_POLL_MS + "ms when the probe is unavailable)");
+        Log.i("session watcher started (event driven: query " + WatcherPolicy.PROBE_MS
+                + "ms while playing, isStreamActive gate " + WatcherPolicy.PROBE_IDLE_MS
+                + "ms / safety query " + WatcherPolicy.IDLE_QUERY_MS
+                + "ms while idle; dump only on " + (WatcherPolicy.CROSSCHECK_MS / 1000L)
+                + "s crosscheck, blind player or degraded (" + WatcherPolicy.FALLBACK_MS
+                + "ms dense rung), legacy " + WatcherPolicy.LEGACY_POLL_MS
+                + "ms when the probe is unavailable)");
     }
 
     public void stop() {
@@ -226,43 +273,126 @@ public final class SessionWatcher {
     }
 
     /**
-     * The event loop: sleep until a trigger, run a full pass, repeat.
+     * The event loop: sleep until a trigger, run a pass, repeat.
      *
-     * <p>Order per iteration: consume a pending poke, check the fallback deadline, otherwise ask
-     * the cheap detector whether the active playback set changed. Only then does a dumpsys pass
-     * run, so the expensive path is proportional to real audio activity instead of wall clock.
+     * <p>Three pass kinds, cheapest first:
+     * <ol>
+     *   <li><b>probe pass</b> - the cheap {@code getActivePlaybackConfigurations} query already
+     *       returned the session ids, so the pass is pure Java: build {@code SessionInfo}s, decide
+     *       policy, reconcile. Cost: tens of microseconds;</li>
+     *   <li><b>cross-check pass</b> - a real dumpsys, once per
+     *       {@link WatcherPolicy#CROSSCHECK_MS} ms (and once at startup), so a session the probe
+     *       cannot see is still reconciled;</li>
+     *   <li><b>degraded pass</b> - a real dumpsys when the probe is unusable, on the ladder
+     *       {@link WatcherPolicy#degradedFallbackMs(int)}.</li>
+     * </ol>
+     * The cheap query is polled every {@link WatcherPolicy#probeSleepMs(boolean)} ms: 100 ms while
+     * audio plays, 250 ms while nothing does (no dump is due then, so a slower poll is free).
      */
     private void loop() {
         long lastPassAt = 0L;
+        int stableDegradedPasses = 0;
         while (running) {
             long now = System.currentTimeMillis();
             boolean poke = takeWake();
-            // Without the cheap probe a full pass runs every LEGACY_POLL_MS (v2.1.8): the
-            // degraded path must never be slower than the pre-event-driven daemon.
-            boolean fallback = WatcherPolicy.fallbackDue(probeReady(), now, lastPassAt);
-            boolean changed = false;
-            if (!poke && !fallback) {
-                changed = pollProbe();
-                if (changed) {
-                    // Coalesce the burst of player events one track switch produces.
-                    sleepQuietly(WatcherPolicy.CHANGE_DEBOUNCE_MS);
-                }
+            boolean probeOk = probeReady();
+            // One gate call per iteration, reused by the idle path and the blind check.
+            boolean music = probeOk && probe.musicActive();
+            if (music) {
+                lastGateTrueAt = now;
             }
-            if (WatcherPolicy.shouldRunPass(poke, fallback, changed)) {
-                lastPassReason = poke ? "poke" : (changed ? "change" : "fallback");
+            // Hold the "music is active" verdict for a moment: the gate can dip between two loop
+            // iterations (a track that has not been fed yet, a silent AAudio stream), and every
+            // dip used to pull the blind ladder back to its dense rung - measured as 16 dumps/min
+            // for a whole AAudio stream instead of the intended 3 s -> 15 s ladder.
+            boolean musicRecent = music
+                    || (now - lastGateTrueAt < WatcherPolicy.GATE_HOLD_MS);
+            // Idle gate: with nothing playing and nothing attached the playback-configuration
+            // query cannot change, so only the isStreamActive gate is polled and the query itself
+            // only every WatcherPolicy.IDLE_QUERY_MS (safety net). The gate edge (a stream that
+            // just started) forces an immediate pass instead of waiting for the next timed one.
+            boolean idleSkip = false;
+            if (!poke && probeOk && sessions.isEmpty()) {
+                if (music && !lastGateActive) {
+                    lastPassAt = 0L;
+                }
+                if (!musicRecent) {
+                    // nothing plays (and nothing is attached): the next stream starts dense again
+                    stableDegradedPasses = 0;
+                }
+                lastGateActive = music;
+                if (!music && !WatcherPolicy.idleQueryDue(now, nextIdleQueryAt)) {
+                    idleSkip = true;
+                    idleSkips++;
+                } else if (!music) {
+                    nextIdleQueryAt = now + WatcherPolicy.IDLE_QUERY_MS;
+                }
+            } else {
+                nextIdleQueryAt = now;
+            }
+            boolean changed = false;
+            if (!poke && probeOk && !idleSkip) {
+                changed = pollProbe();
+            }
+            // The probe only knows players that registered with AudioService. If nothing is
+            // registered while the music stream is active, a native player (AAudio/OpenSL) is
+            // playing and the cheap view is incomplete: dump until the two agree again.
+            // Two ways the cheap view can be incomplete while audio is playing:
+            //   * nothing registered is playing but the music stream is active -> a native player
+            //     (AAudio/OpenSL ES) opened its track straight in AudioFlinger;
+            //   * something is playing but no row carries a session id -> this caller is not
+            //     privileged enough (AudioService anonymised the ids), so nothing is attachable.
+            // Both are handled by letting the dump drive discovery while the condition lasts.
+            boolean blind = probeOk && musicRecent
+                    && (!probe.playing() || !probe.anySessionId());
+            if (blind != probeBlind) {
+                blindFlips++;
+            }
+            probeBlind = blind;
+            boolean probeDiscovery = probeOk && probe.sessionIdsUsable() && !blind;
+            boolean crossDue = probeDiscovery && WatcherPolicy.crossCheckDue(now, lastCrosscheckAt);
+            // While blind the dump runs on the degraded ladder too: an AAudio (MMAP) player has no
+            // attachable session id at all (the dump lists it as session 0/-1), so dumping every
+            // 3 s for the whole length of a game would buy nothing - measured 20 dumps/min while an
+            // AAudio stream played. Three dense passes are enough to catch a session that is
+            // attachable but invisible to the probe; after that the ladder backs off.
+            boolean degradedDue = !probeDiscovery && WatcherPolicy.fallbackDue(now, lastPassAt,
+                    WatcherPolicy.degradedFallbackMs(stableDegradedPasses,
+                            blind ? WatcherPolicy.BLIND_MAX_MS
+                                    : WatcherPolicy.DEGRADED_MAX_MS));
+            if (WatcherPolicy.shouldRunPass(poke, crossDue || degradedDue, changed)) {
+                boolean full = crossDue || degradedDue;
+                lastPassReason = poke ? "poke"
+                        : (changed ? "change"
+                                : (crossDue ? "crosscheck"
+                                        : (blind ? "blind" : "degraded")));
                 try {
-                    pollOnce();
+                    if (full) {
+                        pollOnce();
+                        lastCrosscheckAt = System.currentTimeMillis();
+                        if (crossDue) {
+                            crossChecks++;
+                        }
+                    } else {
+                        passFromProbe();
+                    }
                 } catch (Throwable t) {
                     failures++;
                     lastError = EffectManager.describe(t);
                     Log.e("watcher tick failed: " + lastError, t);
                 }
                 lastPassAt = System.currentTimeMillis();
-                if (fallback) {
-                    // Only the slow pass carries the non hot maintenance work.
-                    slowMaintenance();
-                }
+                // The degraded ladder only escalates while the attachable session set stays the
+                // same. A poke or a full pass that found a different set snaps it back to the dense
+                // rung, so a new session is never discovered late; a cheap pass that saw the same
+                // set must not, or a flapping player would pin the ladder to 3 s forever.
+                stableDegradedPasses = WatcherPolicy.nextStablePasses(full,
+                        dumpSetChanged, stableDegradedPasses);
                 continue;
+            }
+            if (WatcherPolicy.maintenanceDue(now, lastMaintenanceAt)) {
+                lastMaintenanceAt = now;
+                slowMaintenance();
             }
             synchronized (wakeLock) {
                 if (!running) {
@@ -270,7 +400,9 @@ public final class SessionWatcher {
                 }
                 if (!wake) {
                     try {
-                        wakeLock.wait(WatcherPolicy.nextSleepMs(probeReady()));
+                        wakeLock.wait(probeOk
+                                ? WatcherPolicy.probeSleepMs(playingNow())
+                                : WatcherPolicy.degradedFallbackMs(stableDegradedPasses));
                     } catch (InterruptedException e) {
                         Thread.currentThread().interrupt();
                         break;
@@ -279,10 +411,110 @@ public final class SessionWatcher {
                 // Deliberately do NOT clear the wake flag here: takeWake() at the top of the next
                 // iteration consumes it and runs the pass. Clearing it here swallowed the poke
                 // that interrupted the wait (measured: a new stream then waited for the 3 s
-                // fallback pass instead of the 400 ms attach debounce).
+                // cross-check instead of the 400 ms attach debounce).
             }
         }
         Log.i("session watcher stopped");
+    }
+
+    /**
+     * One cheap pass: the probe already holds the session ids, so no dump is needed. This is the
+     * steady state path - the parameter/attach latency of the whole daemon no longer contains a
+     * 28-150 ms {@code dumpsys} step.
+     */
+    void passFromProbe() {
+        long t0 = System.currentTimeMillis();
+        List<AudioServiceProbe.Row> rows = probe == null ? null : probe.rows();
+        int n = rows == null ? 0 : rows.size();
+        List<SessionInfo> list = new ArrayList<SessionInfo>(n);
+        for (int i = 0; i < n; i++) {
+            AudioServiceProbe.Row row = rows.get(i);
+            if (row == null || row.sessionId <= 0) {
+                // 0 = default/global session (never attached) or an anonymised id: the degraded
+                // path exists for the latter.
+                continue;
+            }
+            SessionInfo s = new SessionInfo(row.sessionId);
+            s.uid = row.uid;
+            s.pid = row.pid;
+            s.active = row.active;
+            Integer key = Integer.valueOf(s.sessionId);
+            if (!firstSeen.containsKey(key)) {
+                firstSeen.put(key, Long.valueOf(t0));
+            }
+            list.add(s);
+        }
+        policy.refresh();
+        for (int i = 0; i < list.size(); i++) {
+            SessionInfo s = list.get(i);
+            if (s.pkg == null || s.pkg.length() == 0) {
+                s.pkg = policy.resolvePkg(s);
+            }
+        }
+        // Keep the sessions only a dump can see (native players) across cheap passes: dropping
+        // them here would detach the effect chain of every game that does not register a player
+        // with AudioService.
+        List<SessionInfo> prev = lastDumpSessions;
+        if (!prev.isEmpty() && !dumpOnly.isEmpty()) {
+            for (int i = 0; i < prev.size(); i++) {
+                SessionInfo s = prev.get(i);
+                if (!dumpOnly.contains(Integer.valueOf(s.sessionId))
+                        || !effects.isAttached(s.sessionId)) {
+                    continue;
+                }
+                boolean present = false;
+                for (int j = 0; j < list.size(); j++) {
+                    if (list.get(j).sessionId == s.sessionId) {
+                        present = true;
+                        break;
+                    }
+                }
+                if (!present) {
+                    list.add(s);
+                }
+            }
+        }
+        sessions = list;
+        ticks++;
+        probePasses++;
+        probeRows = n;
+        discoveryMode = "probe";
+        long passMs = System.currentTimeMillis() - t0;
+        boolean changedSet = list.size() != lastLoggedSessionCount;
+        if ((changedSet || !"change".equals(lastPassReason))
+                && System.currentTimeMillis() - lastPassLogAt >= 1000L) {
+            lastPassLogAt = System.currentTimeMillis();
+            lastLoggedSessionCount = list.size();
+            Log.i("watcher pass reason=" + lastPassReason + " mode=probe sessions="
+                    + list.size() + " costMs=" + passMs);
+        }
+        reconcile(list);
+    }
+
+    /**
+     * Remember whether the set of sessions a <em>dump</em> found changed. The degraded ladder keys
+     * on this and not on the probe's session list: while the cheap view is incomplete (blind mode)
+     * the probe pass legitimately sees an empty set and the next dump sees the real one, so keying
+     * on both views made every pass look like a change and pinned the ladder to the dense rung -
+     * measured 22 dumps in 75 s (CPU 2.47 %) for one AAudio stream. A probe pass never resets it;
+     * only a dump that finds a different set does, which is exactly the event that means "a new
+     * session became attachable".
+     */
+    private void noteDumpSet(List<SessionInfo> list) {
+        java.util.Set<Integer> ids = new java.util.HashSet<Integer>();
+        for (int i = 0; i < list.size(); i++) {
+            ids.add(Integer.valueOf(list.get(i).sessionId));
+        }
+        dumpSetChanged = !ids.equals(lastDumpIds);
+        lastDumpIds = ids;
+    }
+
+    /** True while audio plays (a probe row reports playing) or a handle is held. */
+    private boolean playingNow() {
+        if (probe != null && probe.playing()) {
+            return true;
+        }
+        return !effects.attachedSessions().isEmpty();
     }
 
     /** Reads and clears the pending poke flag. */
@@ -331,6 +563,12 @@ public final class SessionWatcher {
         fullPasses++;
         lastDumpBytes = dump.length();
         List<SessionInfo> list = DumpsysParser.parse(dump);
+        discoveryMode = "dumpsys";
+        if (probe != null && probe.available()) {
+            // Cross-check: the dump is the reference, the probe is the fast path. A mismatch is
+            // logged (and reconciled) instead of silently trusted either way.
+            crossCheckAgainstProbe(list);
+        }
         policy.refresh();
         for (int i = 0; i < list.size(); i++) {
             SessionInfo s = list.get(i);
@@ -355,10 +593,31 @@ public final class SessionWatcher {
         if (interesting && System.currentTimeMillis() - lastPassLogAt >= 1000L) {
             lastPassLogAt = System.currentTimeMillis();
             lastLoggedSessionCount = list.size();
-            Log.i("watcher pass reason=" + lastPassReason + " sessions=" + list.size()
-                    + " dumpMs=" + passMs);
+            Log.i("watcher pass reason=" + lastPassReason + " mode=dumpsys sessions="
+                    + list.size() + " dumpMs=" + passMs
+                    + (probeBlind ? " blind=1" : ""));
         }
+        noteDumpSet(list);
         reconcile(list);
+        lastDumpSessions = list;
+        // Remember which sessions the cheap query cannot see: only a later dump may retire them.
+        java.util.Set<Integer> probeIds = new java.util.HashSet<Integer>();
+        if (probe != null) {
+            List<AudioServiceProbe.Row> rows = probe.rows();
+            for (int i = 0; i < rows.size(); i++) {
+                AudioServiceProbe.Row row = rows.get(i);
+                if (row != null && row.sessionId > 0) {
+                    probeIds.add(Integer.valueOf(row.sessionId));
+                }
+            }
+        }
+        dumpOnly.clear();
+        for (int i = 0; i < list.size(); i++) {
+            Integer key = Integer.valueOf(list.get(i).sessionId);
+            if (!probeIds.contains(key)) {
+                dumpOnly.add(key);
+            }
+        }
     }
 
     /**
@@ -371,7 +630,11 @@ public final class SessionWatcher {
         long nowMs = System.currentTimeMillis();
         if (nowMs - lastDiagAt >= DIAG_MS) {
             lastDiagAt = nowMs;
-            Log.i("watcher: passes=" + fullPasses + " probePolls=" + probePolls()
+            Log.i("watcher: passes=" + fullPasses + " mode=" + discoveryMode
+                    + " probePasses=" + probePasses + " idleSkips=" + idleSkips
+                    + " dumpOnly=" + dumpOnly.size() + " blind=" + probeBlind
+                    + " music=" + (probe != null && probe.lastMusicActive())
+                    + " probePolls=" + probePolls()
                     + " probeChanges=" + probeChanges() + " probeCostUs=" + probeCostUs()
                     + " probe=" + (probeAvailable() ? "on" : "off")
                     + (probe == null ? "" : " probeAttempts=" + probe.setupAttempts()
@@ -766,6 +1029,32 @@ public final class SessionWatcher {
         }
     }
 
+    /**
+     * Compares the dump's session set with the probe's view and logs a mismatch. Called only on a
+     * full dumpsys pass (startup, five-minute cross-check, degraded path), so the allocation of
+     * the two id sets is irrelevant.
+     */
+    void crossCheckAgainstProbe(List<SessionInfo> dumpList) {
+        List<AudioServiceProbe.Row> rows = probe.rows();
+        java.util.TreeSet<Integer> probeIds = new java.util.TreeSet<Integer>();
+        for (int i = 0; i < rows.size(); i++) {
+            if (rows.get(i).sessionId > 0) {
+                probeIds.add(Integer.valueOf(rows.get(i).sessionId));
+            }
+        }
+        java.util.TreeSet<Integer> dumpIds = new java.util.TreeSet<Integer>();
+        for (int i = 0; i < dumpList.size(); i++) {
+            SessionInfo s = dumpList.get(i);
+            if (s.sessionId > 0) {
+                dumpIds.add(Integer.valueOf(s.sessionId));
+            }
+        }
+        probeRows = rows.size();
+        if (!probeIds.equals(dumpIds)) {
+            Log.w("watcher crosscheck mismatch: probe=" + probeIds + " dumpsys=" + dumpIds);
+        }
+    }
+
     /** uid of a pid: /proc/<pid> is owned by the process' real uid. */
     static int uidOfPid(int pid) {
         if (pid <= 0) {
@@ -854,6 +1143,77 @@ public final class SessionWatcher {
     /** Last probe error, empty when it never failed. */
     public String probeError() {
         return probe == null ? "" : probe.lastError();
+    }
+
+    /** "probe" when the last pass was served from the cheap query, "dumpsys" otherwise. */
+    public String discoveryMode() {
+        return discoveryMode;
+    }
+
+    /** Passes served straight from the probe rows since start (no dump). */
+    public long probePasses() {
+        return probePasses;
+    }
+
+    /** Sessions only a dump can see (native players) currently retained across cheap passes. */
+    public int dumpOnlyCount() {
+        return dumpOnly.size();
+    }
+
+    /** True while a native player is playing and the dump therefore drives discovery. */
+    public boolean probeBlind() {
+        return probeBlind;
+    }
+
+    /** Loop iterations served by the cheap isStreamActive gate instead of the config query. */
+    public long idleSkips() {
+        return idleSkips;
+    }
+
+    /** blind -> not blind transitions since start (diagnostics: the ladder must stay stable). */
+    public long blindFlips() {
+        return blindFlips;
+    }
+
+    /** Last isStreamActive(MUSIC) gate value (diagnostics). */
+    public boolean probeMusicActive() {
+        return probe != null && probe.lastMusicActive();
+    }
+
+    /** isStreamActive(MUSIC) gate calls since start (diagnostics). */
+    public long probeMusicPolls() {
+        return probe != null ? probe.musicPolls() : 0L;
+    }
+
+    /** Cost of the last isStreamActive(MUSIC) gate call in microseconds (diagnostics). */
+    public long probeMusicCostUs() {
+        return probe != null ? probe.lastMusicCostUs() : 0L;
+    }
+
+    /** True when at least one probed row carries a real session id (diagnostics). */
+    public boolean probeAnySessionId() {
+        return probe != null && probe.anySessionId();
+    }
+
+    /** Full dumpsys cross-checks of the probe view since start. */
+    public long crossChecks() {
+        return crossChecks;
+    }
+
+    /** Rows (registered players) the probe reported in the last poll. */
+    public int probeRows() {
+        return probeRows;
+    }
+
+    /** Age of the last dumpsys cross-check in ms, -1 when none ran yet. */
+    public long lastCrosscheckAgoMs() {
+        long at = lastCrosscheckAt;
+        return at <= 0L ? -1L : System.currentTimeMillis() - at;
+    }
+
+    /** True when the probe can act as the discovery source (real session ids). */
+    public boolean probeDiscovering() {
+        return probeReady() && probe.sessionIdsUsable();
     }
 
     /** Applies parameters to every attached session (used by loadPreset). */

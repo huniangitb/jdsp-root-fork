@@ -29,7 +29,7 @@ import org.json.JSONObject;
  */
 public final class CoreApi {
     /** Reported by getVersion / ping. */
-    public static final String VERSION = "jdspd 2.1.8";
+    public static final String VERSION = "jdspd 2.1.9";
     /** Returned by ping(). */
     public static final int PING_OK = 1;
     /**
@@ -869,6 +869,26 @@ public final class CoreApi {
             o.put("dumpsysChars", watcher.lastDumpBytes());
             o.put("watcherError", watcher.lastError());
             o.put("stormDeaths", watcher.stormDeathCount());
+            o.put("watcherMode", watcher.discoveryMode());
+            o.put("watcherProbePasses", watcher.probePasses());
+            o.put("fullPasses", watcher.fullPasses());
+            o.put("watcherDumpOnly", watcher.dumpOnlyCount());
+            o.put("watcherBlind", watcher.probeBlind());
+            o.put("watcherIdleSkips", watcher.idleSkips());
+            o.put("watcherBlindFlips", watcher.blindFlips());
+            o.put("watcherCrossChecks", watcher.crossChecks());
+            o.put("watcherCrosscheckAgoMs", watcher.lastCrosscheckAgoMs());
+            o.put("watcherProbeRows", watcher.probeRows());
+            o.put("watcherProbeAvailable", watcher.probeAvailable());
+            o.put("probeDiscovering", watcher.probeDiscovering());
+            o.put("probeMusicActive", watcher.probeMusicActive());
+            o.put("probeMusicPolls", watcher.probeMusicPolls());
+            o.put("probeMusicCostUs", watcher.probeMusicCostUs());
+            o.put("probeAnySessionId", watcher.probeAnySessionId());
+            o.put("probePolls", watcher.probePolls());
+            o.put("probeChanges", watcher.probeChanges());
+            o.put("probeCostUs", watcher.probeCostUs());
+            o.put("probeError", watcher.probeError());
             o.put("mode", config.getMode());
             o.put("modeName", config.getMode() == JdspConst.MODE_BACKEND ? "backend" : "auto");
             o.put("enabled", config.isEnabled());

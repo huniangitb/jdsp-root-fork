@@ -1,3 +1,27 @@
+### v2.1.9-fork（会话发现改用 IAudioService 查询 + 空转闸门：jdspd 空闲 CPU -91%，稳态 dumpsys 归零，attach p50 -53%）
+
+* **发现路径不再用 dumpsys（P1）**：`IAudioService.getActivePlaybackConfigurations()` 一次 binder 调用就给出每个
+  已注册播放器的 `(sessionId, uid, pid)`；uid 0 的 jdspd 拿到的是**真实 sessionId**
+  （`AudioPlaybackConfiguration.getSessionId()`，Android 12+；`AudioService` 只对没有 `MODIFY_AUDIO_ROUTING`
+  的调用方做匿名化），包名走 `/proc/<pid>/cmdline`。dumpsys 只保留三种用途：**5 min 交叉校验**、
+  **原生播放器盲区**、**查询不可用时的降级阶梯**。实测 attach 全程 dump 增量为 0。
+* **空转闸门（P2）**：`AudioSystem.isStreamActive(STREAM_MUSIC, 0)`（实测 0.18-0.4 ms）做闸门；无会话且没在播时
+  查询只在闸门翻转 / 每 5 s 安全查询时跑，其余 tick 只打闸门（500 ms）；播放期仍 100 ms 查询；闸门上升沿
+  立即出 pass，带 3 s 保持抗抖动。
+* **原生播放器盲区（P3）**：AAudio/OpenSL 这类不注册 AudioService 的播放器（dump 里 session 0/-1，**没有可挂载的**
+  sessionId）会让廉价视图不完整；`blind` 判定 = 音乐流活跃但「无已注册播放器在播」或「无一行带真实 sessionId」
+  → 改由 dump 驱动，走 3 s→15 s 阶梯；`dumpOnly` 保证「只有 dump 见过」的会话不被廉价 pass 误摘。
+* **降级阶梯（P4）**：查询不可用 → 500 ms 密集档起步，3 个无变化 pass 升一档（3 s→15 s→30 s），任何会话集合
+  变化立刻回密集档；启动期失败每 5 s 重试（保留 v2.1.8 的修复）。
+* **维护改为独立时基（P5）**：配置落盘 / 延后开关 / 端点文件刷新从「顺带在 dump pass 里」改成独立 3 s 维护定时。
+* **实测（同机、同脚本，3 场景 × 3 轮 × 60 s 中位数；before = v2.1.8，after = v2.1.9）**：
+  - jdspd CPU：空闲 **2.38% → 0.22%**（开机后复测 0.183%）、播放 2.18% → **1.05%**、会话抖动 2.22% → **0.97%**
+  - `dumpsys` / 分钟：19 → **0**（三场景全零）；空闲配置查询 570/min → **12/min**
+  - 新会话 attach p50：1255 ms → **584 ms**（n=8，p95 969 ms，全程 0 次 dump；交付版复测 p50 507 ms）
+  - 盲区（AAudio 流）CPU：2.4-2.7% → **1.38%**
+* 单测 273 → **280 passed**、device-selection selftest 11 PASS、`git diff --check` 干净。
+* 文档：`docs/DAEMON-PROBE-COST.md`（优化点逐条、分级参数表、日志样例、before/after、未做项与理由、回滚、
+  AOSP 最佳实践评估、**Android 12-16 兼容矩阵**）。
 ### v2.1.8-fork（daemon 事件驱动 + per-session 分锁；修复开机 probe 退化：jdspd CPU -75%，attach p95 -72%）
 
 * **EffectManager 改 per-session 锁 + 状态机（A1）**：原来的全局 `synchronized` 把"一条会话的 binder

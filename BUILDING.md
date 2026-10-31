@@ -66,10 +66,10 @@ AIDL_EFFECT_V=3 AIDL_TYPES_V=5 ./native/aidl/build-aidl.sh vendor
 
 ## 6. 版本基线
 
-当前模块源码 = v2.1.8-fork（versionCode 218），内置后端 jdspd 2.1.8、引擎补丁 0001-0008、
+当前模块源码 = v2.1.9-fork（versionCode 219），内置后端 jdspd 2.1.9、引擎补丁 0001-0008、
 App 1.6.20（versionCode 66；重连后以**后端**开关状态为准，另有 1.6.19 的一帧一批 / 全局参数 s=0、
 1.6.18 的总开关意图直投 / -1006 业务码透传 / 20 s TCP 保活）。分发包
-`dist/JDSP-fork-v2.1.8.zip`（sha256 `b3e791c740f43f17aea18542cce7d52eed040159ec50ec29e4a5fd5d8b0cc139`）。
+`dist/JDSP-fork-v2.1.9.zip`（33,274,174 B，sha256 `4918908cc089d38e12aff749b78557f1a0143400622bfd6675c5826960beec6f`）。
 
 App 构建（源码路线，Gradle 离线）：`cd /home/bdy/work/loundess_git && ./gradlew --offline --no-daemon \
 -Dorg.gradle.jvmargs=-Xmx3g --max-workers=2 assembleRootFullRelease`，产物

@@ -83,5 +83,107 @@ public final class WatcherPolicyTest {
             Assert.isTrue(WatcherPolicy.fullPassPeriodMs(false) < WatcherPolicy.FALLBACK_MS,
                     "degraded must be faster than the event-driven fallback, never slower");
         });
+
+        suite.test("watcher policy: the probe cadence is relaxed while nothing plays", () -> {
+            Assert.eq(WatcherPolicy.PROBE_MS, WatcherPolicy.probeSleepMs(true),
+                    "playing: the cheap query runs every 100 ms");
+            Assert.eq(WatcherPolicy.PROBE_IDLE_MS, WatcherPolicy.probeSleepMs(false),
+                    "idle: only the isStreamActive gate runs, no dump is due anyway");
+            Assert.isTrue(WatcherPolicy.PROBE_IDLE_MS > WatcherPolicy.PROBE_MS,
+                    "idle polling must be the cheaper one");
+            Assert.isTrue(WatcherPolicy.PROBE_IDLE_MS <= WatcherPolicy.LEGACY_POLL_MS,
+                    "even the idle gate is not slower than the degraded dump");
+        });
+
+        suite.test("watcher policy: the dumpsys cross-check runs once per CROSSCHECK_MS", () -> {
+            long now = 4000000L;
+            Assert.isTrue(WatcherPolicy.crossCheckDue(now, 0L), "no cross-check yet: due");
+            Assert.isTrue(!WatcherPolicy.crossCheckDue(now, now), "one just ran");
+            Assert.isTrue(!WatcherPolicy.crossCheckDue(now,
+                            now - WatcherPolicy.CROSSCHECK_MS + 1L), "just before the deadline");
+            Assert.isTrue(WatcherPolicy.crossCheckDue(now,
+                            now - WatcherPolicy.CROSSCHECK_MS), "at the deadline");
+            Assert.isTrue(WatcherPolicy.CROSSCHECK_MS > WatcherPolicy.FALLBACK_MS,
+                    "steady state must dump far less often than the fallback");
+        });
+
+        suite.test("watcher policy: maintenance runs on its own timer", () -> {
+            long now = 5000000L;
+            Assert.isTrue(WatcherPolicy.maintenanceDue(now, 0L), "no maintenance yet: due");
+            Assert.isTrue(!WatcherPolicy.maintenanceDue(now,
+                            now - WatcherPolicy.MAINTENANCE_MS + 1L), "just before the deadline");
+            Assert.isTrue(WatcherPolicy.maintenanceDue(now,
+                            now - WatcherPolicy.MAINTENANCE_MS), "at the deadline");
+            Assert.isTrue(WatcherPolicy.MAINTENANCE_MS <= WatcherPolicy.FALLBACK_MS,
+                    "the config flush must not wait for a full pass");
+        });
+
+        suite.test("watcher policy: the degraded ladder backs off, never delays the first session",
+                () -> {
+            Assert.eq(WatcherPolicy.FALLBACK_MS, WatcherPolicy.degradedFallbackMs(0),
+                    "no session known yet: dense rung, a new player is discovered at once");
+            Assert.eq(WatcherPolicy.FALLBACK_MS,
+                    WatcherPolicy.degradedFallbackMs(WatcherPolicy.DEGRADED_STABLE_PASSES - 1),
+                    "fewer than DEGRADED_STABLE_PASSES unchanged passes: still dense");
+            Assert.eq(15000L,
+                    WatcherPolicy.degradedFallbackMs(WatcherPolicy.DEGRADED_STABLE_PASSES),
+                    "first back-off rung");
+            Assert.eq(WatcherPolicy.DEGRADED_MAX_MS,
+                    WatcherPolicy.degradedFallbackMs(
+                            WatcherPolicy.DEGRADED_STABLE_PASSES * 2), "cap rung");
+            Assert.eq(WatcherPolicy.DEGRADED_MAX_MS, WatcherPolicy.degradedFallbackMs(10000),
+                    "the ladder is clamped at the cap");
+            Assert.eq(WatcherPolicy.FALLBACK_MS, WatcherPolicy.degradedFallbackMs(0, 0L),
+                    "a cap below the dense rung is floored to FALLBACK_MS");
+            Assert.eq(15000L, WatcherPolicy.degradedFallbackMs(
+                            WatcherPolicy.DEGRADED_STABLE_PASSES, 20000L), "explicit cap");
+            Assert.isTrue(WatcherPolicy.degradedFallbackMs(0)
+                            < WatcherPolicy.degradedFallbackMs(10000),
+                    "back-off only ever loosens, never tightens");
+
+            long now = 6000000L;
+            Assert.isTrue(WatcherPolicy.fallbackDue(now, 0L, 15000L),
+                    "no pass yet: due whatever the rung");
+            Assert.isTrue(!WatcherPolicy.fallbackDue(now, now - 14000L, 15000L),
+                    "before the rung period");
+            Assert.isTrue(WatcherPolicy.fallbackDue(now, now - 15000L, 15000L),
+                    "at the rung period");
+            Assert.isTrue(WatcherPolicy.fallbackDue(now, now - 1L, 0L),
+                    "a zero period is clamped, never a busy loop");
+        });
+        suite.test("watcher policy: the degraded ladder ignores cheap passes", () -> {
+            // A cheap pass says nothing about whether a dump is worth running: a native player
+            // flapping in and out of the playback-configuration list must not pin it to 3 s.
+            Assert.eq(5, WatcherPolicy.nextStablePasses(false, true, 5),
+                    "cheap pass: the ladder is left alone");
+            Assert.eq(2, WatcherPolicy.nextStablePasses(true, false, 1), "full, same set: +1");
+            Assert.eq(0, WatcherPolicy.nextStablePasses(true, true, 7), "full, new set: reset");
+        });
+        suite.test("watcher policy: the blind ladder is capped tighter than the degraded one", () -> {
+            Assert.isTrue(WatcherPolicy.BLIND_MAX_MS <= WatcherPolicy.DEGRADED_MAX_MS,
+                    "blind: never looser than degraded");
+            Assert.isTrue(WatcherPolicy.BLIND_MAX_MS > WatcherPolicy.FALLBACK_MS,
+                    "blind: still backs off from the dense rung");
+            Assert.eq(WatcherPolicy.BLIND_MAX_MS, WatcherPolicy.degradedFallbackMs(10000,
+                    WatcherPolicy.BLIND_MAX_MS), "blind: clamped at 15 s");
+            Assert.isTrue(WatcherPolicy.GATE_HOLD_MS >= WatcherPolicy.PROBE_IDLE_MS,
+                    "the gate verdict outlives one idle tick");
+        });
+        suite.test("watcher policy: the idle gate only re-runs the query every IDLE_QUERY_MS",
+                new com.jdsp.cli.Body() {
+            public void run() {
+                long now = 5000000L;
+                Assert.isTrue(WatcherPolicy.idleQueryDue(now, 0L),
+                        "never queried since start: due");
+                Assert.isTrue(!WatcherPolicy.idleQueryDue(now, now + 1L),
+                        "before the safety deadline: the isStreamActive gate is enough");
+                Assert.isTrue(WatcherPolicy.idleQueryDue(now, now),
+                        "at the safety deadline: due");
+                Assert.isTrue(WatcherPolicy.IDLE_QUERY_MS >= WatcherPolicy.PROBE_IDLE_MS,
+                        "the safety query is never denser than the idle gate cadence");
+                Assert.isTrue(WatcherPolicy.IDLE_QUERY_MS < WatcherPolicy.CROSSCHECK_MS,
+                        "the idle safety query is far denser than the dump cross-check");
+            }
+        });
     }
 }
