@@ -472,7 +472,7 @@ adb -s 64a4bad0 reboot
 | 模块版本 | `version=v2.1.11-fork (2026-11-02)` / `versionCode=221`；`backend/jdspd.dex` md5 `e4275e74272cc713ae1b27a9efebede2`（与 dist 内一致） |
 | 守护进程 | `jdspd 2.1.11`；`watcherFailures=2`（正是开机那两次残缺 dump，未解析） |
 | 原生播放器 attach | **1200 ms**（`attach session=105 effectId=51 … in 39845us`，dump 发现后 400 ms 防抖到期即挂） |
-| `SIGKILL` → `released session` | **2030 ms**（`reason=confirm` 的 dump 当次 detach+release） |
+| `SIGKILL` → `released session` | **2030-2140 ms**（两次运行；`reason=confirm` 的 dump 当次 detach+release） |
 | 暂停中的原生播放器 | 确认 dump **恰好 4 次**后静默：4.2 s / 12.8 s / 29.7 s / 61.6 s（`CONFIRM_MAX_REPEATS`=4 生效，无 dump 循环） |
 | 暂停后被杀（最坏路径） | **200 s** 后由 5 min 交叉校验释放（`reason=crosscheck`），无听感影响 |
 | 空闲 120 s CPU | **0.183 %**（22 ticks / 120.1 s），期间 **0 次 dumpsys**，`idleSkips=937` |
