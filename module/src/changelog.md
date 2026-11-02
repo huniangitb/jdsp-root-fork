@@ -1,3 +1,30 @@
+### v2.1.11-fork（静态审查收口：截断 dump 不再拆链、失败 dump 不再记账、dump 失败退避）
+
+* **截断/失败的 dump 不再被当成"真的没有会话"（P1）**：`runDumpsys` 改为有界等待，并抽出纯函数
+  `WatcherPolicy.dumpProblem` 判定四类残缺（超出大小上限 / 非 0 退出 / 无输出 / 缺 `Output thread` 段）；
+  另外只要 jdspd 自己还持有句柄，dump 里就必须出现自身 effect UUID。任何一条不满足都**不解析**——
+  以前截断的 dump 会解析成空会话列表，让 reconcile 把正在播放的效果链整条拆掉（可听见断音）。
+* **失败的 dump 不再消耗确认/attach/交叉校验的记账（P1）**：`pollOnce` 返回 `boolean`，确认退避、
+  attach 放弃预算、5 min 交叉校验这些"截止时间"只在 dump 真的成功时推进。以前 5 次失败就能把确认退避
+  顶到 60 s、把真实原生播放器的 `firstSeen` 清掉，让本版要修的残会话问题以另一种形态复发。
+* **attach dump 先过策略闸门（P1）**：新增 `attachAllowed()`（总开关 + 不 in-flight + `policy.decide().attach`）。
+  被 exclude 或总开关关闭的原生会话以前永远挂不上、却持续按 ≈6-7 dump/min 烧 dumpsys，现在一次都不烧。
+* **dump 失败退避（P1，审查新发现）**：失败后 3 s→6 s→12 s→24 s→48 s→60 s 重试（`WatcherPolicy.nextDumpRetryMs`），
+  且失败时改用廉价 pass（探针可用时）继续挂载/执行策略。以前失败不记账 → 调度器永远"到期" →
+  每轮 fork 一次 dumpsys，同时跳过维护定时与等待，等于热循环且守护进程整体停摆（开机早期最容易撞上）。
+* **其它收紧**：attach 放弃计数改为 per-id（不再一个无望会话陪绑把健康原生播放器一起 park 30 s-5 min）；
+  off-by-one（第 6 次才放弃）；5 min 交叉校验不再被 confirm/attach dump 饿死；`confirmArmedAt` 改 volatile；
+  确认 dump 上限 4 次（**暂停中再被杀**的最坏释放回退到 ≤5 min 交叉校验，无听感影响）；
+  watcher 线程外层 catch 重启；`attachSession` 异常兜底；`dumpOnly` 过滤 sessionId<=0；
+  poke 推迟改为有界（`POKE_DEFER_MAX_MS`=250 ms），连续滑条不会饿死到期的 dump。
+* **诊断**：`stats` 新增 `watcherDumpFails` / `watcherDumpRetryInMs`；60 s 诊断行新增 `dumpFails` / `dumpRetryIn`；
+  `--selftest` 的 `ok` 现在取决于 dump 是否成功（新增 `dumpOk`），dump 全失败时不再报 ok。
+* **实测（ColorOS 16 / OPD2404，v2.1.11）**：原生播放器（AAudio）attach **1110-1370 ms**；
+  `SIGKILL` → `released session` **2040 ms**；暂停中的原生播放器确认 dump 4 次后静默
+  （4.2 / 12.8 / 29.7 / 61.6 s 各一次）；暂停后被杀的最坏释放 200 s（≤5 min 交叉校验）；
+  空闲 120 s CPU **0.183%**、期间 0 次 dumpsys；App 滑条 0.00→6.13 dB，后端 `1500=[-0.1, 60.0, 6.131]`，
+  配置键数不变（26）。单测 283 → **287 passed** + 自检 11 PASS，`javac -Xlint:all` 0 告警。
+
 ### v2.1.10-fork（残会话 5 min → 1.4 s；修 v2.1.9 原生播放器从不挂载的回归）
 
 * **残会话确认（P1，用户的"小问题"）**：播放器被强杀/崩溃时不关闭 track，audioserver 里会留下 jdspd 自己的

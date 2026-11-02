@@ -218,7 +218,115 @@ public final class WatcherPolicy {
         return present || dumpOnly;
     }
 
-    /** True when the non hot maintenance work is due. */
+    /**
+     * Minimum spacing of the "attach a dump-only session" dumps. One dumpsys costs 90-120 ms, and
+     * the trigger exists to save one wait, not to poll audioserver.
+     */
+    public static final long ATTACH_DUMP_MIN_MS = 1000L;
+    /**
+     * Consecutive attach dumps without a handle before the session is parked. An unattachable
+     * session (effect limit reached, a chain audioserver refuses to build) must not turn the
+     * trigger into a one-dump-per-second loop.
+     */
+    public static final int ATTACH_DUMP_MAX_MISSES = 5;
+    /** First park delay after giving up on a dump-only session's attach. */
+    public static final long ATTACH_GIVEUP_START_MS = 30000L;
+    /** Ceiling of the park delay: a permanently unattachable session costs one round per 5 min. */
+    public static final long ATTACH_GIVEUP_MAX_MS = 300000L;
+    /** First retry delay after a failed attach (each attempt is a 60-230 ms AudioEffect ctor). */
+    public static final long ATTACH_RETRY_START_MS = 400L;
+    /** Ceiling of the attach retry delay. */
+    public static final long ATTACH_RETRY_MAX_MS = 10000L;
+    /**
+     * Consecutive confirmation dumps that found the session alive before the trigger sleeps until
+     * the state changes. A paused native player legitimately keeps its session, and a session that
+     * dies later is still caught by the {@link #CROSSCHECK_MS} cross-check.
+     */
+    public static final int CONFIRM_MAX_REPEATS = 4;
+
+    /** Next park delay after an attach gave up (doubles up to {@link #ATTACH_GIVEUP_MAX_MS}). */
+    public static long nextAttachGiveUpMs(long currentMs) {
+        if (currentMs <= 0L) {
+            return ATTACH_GIVEUP_START_MS;
+        }
+        long next = currentMs * 2L;
+        return next > ATTACH_GIVEUP_MAX_MS ? ATTACH_GIVEUP_MAX_MS : next;
+    }
+
+    /** Next retry delay after a failed attach (doubles up to {@link #ATTACH_RETRY_MAX_MS}). */
+    public static long nextAttachRetryMs(long currentMs) {
+        if (currentMs <= 0L) {
+            return ATTACH_RETRY_START_MS;
+        }
+        long next = currentMs * 2L;
+        return next > ATTACH_RETRY_MAX_MS ? ATTACH_RETRY_MAX_MS : next;
+    }
+
+    /** First retry delay after a failed dump (see {@link #nextDumpRetryMs(int)}). */
+    public static final long DUMP_RETRY_START_MS = 3000L;
+
+    /** Cap of the dump retry delay: a dump that keeps failing is retried at most once a minute. */
+    public static final long DUMP_RETRY_MAX_MS = 60000L;
+
+    /**
+     * Retry delay after {@code streak} consecutive failed dumps: 3 s, 6 s, 12 s, ... capped at
+     * {@link #DUMP_RETRY_MAX_MS}. A failing dump must not be retried in a hot loop: without a
+     * back-off the pass scheduler stays "due" forever (nothing was recorded), and the loop would
+     * fork a dumpsys per iteration (90-120 ms, or 3 s when it hits the timeout) while skipping the
+     * maintenance timer and the wake wait.
+     */
+    public static long nextDumpRetryMs(int streak) {
+        if (streak <= 1) {
+            return DUMP_RETRY_START_MS;
+        }
+        long delay = DUMP_RETRY_START_MS;
+        for (int i = 1; i < streak && delay < DUMP_RETRY_MAX_MS; i++) {
+            delay *= 2L;
+        }
+        return Math.min(delay, DUMP_RETRY_MAX_MS);
+    }
+
+    /**
+     * Why a dumpsys run is unusable, or {@code null} when it is usable. Extracted so the rule "a
+     * partial dump is worse than no dump" is host-testable: the parser cannot tell a truncated table
+     * from an empty one, and an empty session list makes the reconcile pass release every handle it
+     * holds - an audible gap on a stream that is playing fine.
+     *
+     * @param exitCode    the dumpsys process exit code
+     * @param tooLarge    the reader stopped at the size cap
+     * @param length      characters captured
+     * @param hasThreads  the captured text contains an "Output thread" section
+     * @return the reason to log, or {@code null} when the dump can be parsed
+     */
+    public static String dumpProblem(int exitCode, boolean tooLarge, int length,
+            boolean hasThreads) {
+        if (tooLarge) {
+            return "dumpsys output too large";
+        }
+        if (exitCode != 0) {
+            return "dumpsys exit " + exitCode;
+        }
+        if (length <= 0) {
+            return "dumpsys produced no output";
+        }
+        if (!hasThreads) {
+            return "dumpsys output incomplete";
+        }
+        return null;
+    }
+
+    /**
+     * Upper bound of the "a poke is served from the cheap view" postponement. The App pokes on every
+     * slider frame (tens per second), and a due dump would add its 90-120 ms to that frame; bounding
+     * the postponement keeps a stream of pokes from starving the dump a trigger asked for.
+     */
+    public static final long POKE_DEFER_MAX_MS = 250L;
+
+    /** True when the confirmation trigger already used up its repeats for this state. */
+    public static boolean confirmExhausted(int repeats) {
+        return repeats >= CONFIRM_MAX_REPEATS;
+    }
+
     /**
      * True when the idle safety query is due: nothing is playing and no session is attached, so
      * only the every-{@value #IDLE_QUERY_MS} safety query (and the {@code isStreamActive} gate in
@@ -248,6 +356,7 @@ public final class WatcherPolicy {
         return current;
     }
 
+    /** True when the non hot maintenance work (config flush, endpoint refresh) is due. */
     public static boolean maintenanceDue(long now, long lastMaintenanceAt) {
         return lastMaintenanceAt <= 0L || now - lastMaintenanceAt >= MAINTENANCE_MS;
     }

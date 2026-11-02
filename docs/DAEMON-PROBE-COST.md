@@ -423,3 +423,64 @@ adb -s 64a4bad0 reboot
 jdspcli.dex `ed1cc121…`）。
 
 
+### 13.3 v2.1.11：静态审查收口（3 个 P1 + 1 个审查新发现）
+
+审查方式：以 `git show a0a605b` 逐 hunk 读 v2.1.10 的实现，通读 `SessionWatcher` 的循环/reconcile/pollOnce，
+`javac --release 8 -Xlint:all` 全量告警、跨线程字段审计，并另开一份**独立只读复审**（`out/review/v2.1.10-review.md`、
+`out/review/v2.1.11-review.md`，共 410 行；行号基准分别是 `a0a605b` 的 blob 与当前工作树）。
+
+| # | 问题 | 后果 | 修法 |
+|---|---|---|---|
+| P1-1 | 截断/空 dump 被当成"真的没有会话" | `reconcile` 把正在播放的链整条拆掉（可听断音） | `runDumpsys` 改有界 `waitFor`；抽出纯函数 `WatcherPolicy.dumpProblem(exit, tooLarge, length, hasThreads)` 判四类残缺；持有句柄时还要求 dump 含自身 effect UUID |
+| P1-2 | 失败的 dump 仍被记成一次"确认/attach dump" | 5 次失败把确认退避顶到 60 s；把真实原生播放器的 `firstSeen` 清掉（v2.1.10 修的 bug 复发） | `pollOnce` 返回 `boolean`；确认退避、attach 放弃预算、交叉校验截止时间只在 `dumped` 时推进（7 个记账点全部收进 `if (dumped …)`） |
+| P1-3 | attach 触发只问"有没有句柄"，不问"该不该挂" | 被 exclude / 总开关关闭的原生会话永远挂不上，却持续 ≈6-7 dump/min | 新增 `attachAllowed(sid)`：`config.isEnabled() && !isAttachInFlight(sid) && policy.decide(info, config).attach`，与 reconcile 同源 |
+| P1-4（复审新发现） | dump 持续失败 → 调度器永远"到期" | 每轮 fork 一次 dumpsys（90-120 ms，超时路径 3 s），且跳过维护定时与等待 → **热循环 + 守护进程停摆** | 失败退避 `nextDumpRetryMs` 3→6→12→24→48→60 s（`dumpRetryAt` 进 `needDump` 闸门）；失败时若探针可用改走 `passFromProbe()`，挂载/策略/诊断继续工作 |
+
+P2 一并修掉：attach 放弃计数改 per-id（不再一个无望会话陪绑 park 健康原生播放器）、off-by-one（`>=`）、
+5 min 交叉校验被 confirm/attach dump 饿死（只在 `dumped && (crossDue || degradedDue)` 时更新）、
+`confirmArmedAt` 改 volatile、watcher 线程外层 `catch (Throwable)` 重启、`attachSession` 异常兜底、
+`dumpOnly` 过滤 `sessionId <= 0`、poke 推迟改有界（`POKE_DEFER_MAX_MS`=250 ms）、
+`--selftest` 的 `ok` 取决于 `dumpOk`、`stats` 新增 `watcherDumpFails`/`watcherDumpRetryInMs`。
+
+刻意保留：`confirmBase` 要求"确有已挂句柄"（`dumpOnlyAttached`）——"句柄已丢但 dump 仍列会话"的 corpse
+交给 attach 触发器（1 s 限速 + per-id park 退避），因此**暂停中再被杀**的最坏释放回退到 ≤5 min 交叉校验
+（实测 200 s，无听感影响）。
+
+验证：`./backend/test/run_tests.sh` **287 passed / 0 failed**（新增 `dumpProblem` 四类残缺、`nextDumpRetryMs`
+阶梯、park/retry/confirmExhausted 用例）+ 自检 `PASS=11 FAIL=0`；`javac --release 8 -Xlint:all` 全量 **0 告警**。
+
+### 13.4 v2.1.11 发版安装与真机验收
+
+```bash
+adb -s 64a4bad0 push dist/JDSP-fork-v2.1.11.zip /data/local/tmp/
+adb -s 64a4bad0 shell su -c 'ksud module install /data/local/tmp/JDSP-fork-v2.1.11.zip'
+adb -s 64a4bad0 reboot
+```
+
+**开机自证（P1-4 的直接证据）**——早期 boot 里 `dumpsys` 确实不完整，新代码按阶梯退避而不是热循环：
+
+```
+08:21:59.470 W/jdspd: dumpsys output incomplete
+08:21:59.471 W/jdspd: watcher: dump failed (dumpsys output incomplete), retry in 3000 ms, serving the cheap view meanwhile
+08:22:02.588 W/jdspd: watcher: dump failed (dumpsys output incomplete), retry in 6000 ms, serving the cheap view meanwhile
+08:22:08.738 I/jdspd: watcher pass reason=degraded mode=dumpsys sessions=0 dumpMs=148
+08:22:23.739 I/jdspd: session watcher: cheap playback probe available after 2 retries
+```
+
+| 验收项 | 结果（v2.1.11 最终包） |
+|---|---|
+| 模块版本 | `version=v2.1.11-fork (2026-11-02)` / `versionCode=221`；`backend/jdspd.dex` md5 `e4275e74272cc713ae1b27a9efebede2`（与 dist 内一致） |
+| 守护进程 | `jdspd 2.1.11`；`watcherFailures=2`（正是开机那两次残缺 dump，未解析） |
+| 原生播放器 attach | **1200 ms**（`attach session=105 effectId=51 … in 39845us`，dump 发现后 400 ms 防抖到期即挂） |
+| `SIGKILL` → `released session` | **2030 ms**（`reason=confirm` 的 dump 当次 detach+release） |
+| 暂停中的原生播放器 | 确认 dump **恰好 4 次**后静默：4.2 s / 12.8 s / 29.7 s / 61.6 s（`CONFIRM_MAX_REPEATS`=4 生效，无 dump 循环） |
+| 暂停后被杀（最坏路径） | **200 s** 后由 5 min 交叉校验释放（`reason=crosscheck`），无听感影响 |
+| 空闲 120 s CPU | **0.183 %**（22 ticks / 120.1 s），期间 **0 次 dumpsys**，`idleSkips=937` |
+| App（1.6.20 / 66）冷启动 | 显示后端值 `-0.10 dB / 60.00 ms / 0.00 dB`（UI 不持有参数） |
+| App 滑条写后端 | 拖动后 `1500=[-0.1, 60.0, 6.131]`，UI 同步 6.13 dB，配置键数仍 **26**（零污染）；`baseline` 复位回 0.00 dB |
+| 单测/自检/打包 | 287 passed、11 PASS、`module/package.sh` 四段自检全绿、`git diff --check` 干净 |
+
+分发包 `dist/JDSP-fork-v2.1.11.zip`：33,280,516 B，sha256
+`6fd4f7192e7412513b59ccaff20f256e45c24d7869888107048ac00e378ec5cd`
+（jdspd.dex `e4275e74…`、jdspcli.dex `8452eb53…`）。验收脚本：`out/accept-v211/phase-ab.sh`（挂载+强杀计时）、
+`out/accept-v211/phase-cd.sh`（确认上限+空闲 CPU）、`out/accept-v211/idle-cpu.sh`（App 停止后的空闲 CPU）。

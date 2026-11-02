@@ -205,6 +205,69 @@ public final class WatcherPolicyTest {
             Assert.isTrue(WatcherPolicy.CONFIRM_BACKOFF_START_MS > WatcherPolicy.PROBE_IDLE_MS,
                     "no retry denser than the idle probe cadence");
         });
+        suite.test("watcher policy: a failing dump is retried with a back-off, never in a hot loop", () -> {
+            // Nothing is recorded when a dump fails, so the pass scheduler stays "due": without a
+            // back-off the loop forks one dumpsys per iteration (90-120 ms each).
+            Assert.isTrue(WatcherPolicy.nextDumpRetryMs(1) == 3000L, "first retry is 3 s");
+            Assert.isTrue(WatcherPolicy.nextDumpRetryMs(2) == 6000L, "second retry doubles");
+            Assert.isTrue(WatcherPolicy.nextDumpRetryMs(3) == 12000L, "third retry doubles");
+            Assert.isTrue(WatcherPolicy.nextDumpRetryMs(4) == 24000L, "fourth retry doubles");
+            Assert.isTrue(WatcherPolicy.nextDumpRetryMs(5) == 48000L, "fifth retry doubles");
+            Assert.isTrue(WatcherPolicy.nextDumpRetryMs(6) == 60000L, "capped at a minute");
+            Assert.isTrue(WatcherPolicy.nextDumpRetryMs(60) == 60000L, "cap is stable");
+            Assert.isTrue(WatcherPolicy.nextDumpRetryMs(0) == 3000L, "a zero streak behaves like one");
+        });
+        suite.test("watcher policy: a truncated or failed dump is never parsed", () -> {
+            // An incomplete dump parses to an empty session list, and an empty list makes reconcile
+            // release every handle it holds (audible gap). Every incomplete outcome must be rejected.
+            Assert.isTrue(WatcherPolicy.dumpProblem(0, false, 4096, true) == null,
+                    "complete dump: usable");
+            Assert.isTrue("dumpsys output too large".equals(
+                    WatcherPolicy.dumpProblem(0, true, 4096, true)), "size cap: rejected");
+            Assert.isTrue(WatcherPolicy.dumpProblem(137, false, 4096, true) != null,
+                    "killed by the watchdog: rejected");
+            Assert.isTrue(WatcherPolicy.dumpProblem(0, false, 0, false) != null,
+                    "no output: rejected");
+            Assert.isTrue(WatcherPolicy.dumpProblem(0, false, 4096, false) != null,
+                    "no output-thread section: rejected");
+            Assert.isTrue("dumpsys output too large".equals(
+                    WatcherPolicy.dumpProblem(1, true, 0, false)),
+                    "the size cap is reported first (it is the actionable cause)");
+        });
+        suite.test("watcher policy: an unattachable dump-only session is parked, not retried", () -> {
+            // A dump-only session whose attach never produces a handle used to be re-dumped once per
+            // second forever: the miss counter was reset on every give-up, so the loop restarted. The
+            // park delay doubles up to its ceiling, so the worst case settles at one round per 5 min.
+            Assert.eq(WatcherPolicy.ATTACH_GIVEUP_START_MS, WatcherPolicy.nextAttachGiveUpMs(0L),
+                    "invalid input: start value");
+            long park = WatcherPolicy.nextAttachGiveUpMs(WatcherPolicy.ATTACH_GIVEUP_START_MS);
+            Assert.eq(WatcherPolicy.ATTACH_GIVEUP_START_MS * 2L, park, "first park doubles");
+            for (int i = 0; i < 20; i++) {
+                park = WatcherPolicy.nextAttachGiveUpMs(park);
+            }
+            Assert.eq(WatcherPolicy.ATTACH_GIVEUP_MAX_MS, park, "clamped at the ceiling");
+            Assert.isTrue(WatcherPolicy.ATTACH_GIVEUP_MAX_MS >= WatcherPolicy.CROSSCHECK_MS / 2L,
+                    "never more dumps than the cross-check for an unattachable session");
+            Assert.isTrue(WatcherPolicy.ATTACH_DUMP_MIN_MS > 0L, "the trigger is rate limited");
+            Assert.isTrue(WatcherPolicy.ATTACH_DUMP_MAX_MISSES > 0,
+                    "give up after a bounded number of dumps");
+        });
+        suite.test("watcher policy: a failed attach backs off, the confirmation stops repeating", () -> {
+            Assert.eq(WatcherPolicy.ATTACH_RETRY_START_MS, WatcherPolicy.nextAttachRetryMs(0L),
+                    "invalid input: start value");
+            long retry = WatcherPolicy.ATTACH_RETRY_START_MS;
+            for (int i = 0; i < 20; i++) {
+                retry = WatcherPolicy.nextAttachRetryMs(retry);
+            }
+            Assert.eq(WatcherPolicy.ATTACH_RETRY_MAX_MS, retry, "clamped at the ceiling");
+            Assert.isTrue(WatcherPolicy.ATTACH_RETRY_START_MS < WatcherPolicy.ATTACH_RETRY_MAX_MS,
+                    "the retry ladder really climbs");
+            Assert.isTrue(!WatcherPolicy.confirmExhausted(0), "a fresh state still confirms");
+            Assert.isTrue(!WatcherPolicy.confirmExhausted(WatcherPolicy.CONFIRM_MAX_REPEATS - 1),
+                    "the last repeat is still allowed");
+            Assert.isTrue(WatcherPolicy.confirmExhausted(WatcherPolicy.CONFIRM_MAX_REPEATS),
+                    "the ceiling stops the repeats");
+        });
         suite.test("watcher policy: a dump-only session keeps its attach debounce stamp", () -> {
             // The cheap playback query cannot see a native player, so its session list is empty on
             // every cheap pass. Forgetting the stamp there restarted the debounce window on every

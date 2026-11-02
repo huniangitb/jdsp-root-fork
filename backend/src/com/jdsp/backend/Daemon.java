@@ -242,7 +242,7 @@ public final class Daemon {
     private static void runSelftest(String configPath, String dataDir, String tcpDir, int tcpPort) {
         long t0 = System.currentTimeMillis();
         Log.i("selftest: one watcher pass");
-        watcher.pollOnce();
+        boolean dumpOk = watcher.pollOnce();
         long passMs = System.currentTimeMillis() - t0;
 
         BinderService b = new BinderService(api);
@@ -256,7 +256,8 @@ public final class Daemon {
 
         JSONObject out = new JSONObject();
         try {
-            out.put("ok", true);
+            // A selftest that cannot read the dump is not a pass: the watcher would run blind.
+            out.put("ok", Boolean.valueOf(dumpOk));
             out.put("version", CoreApi.VERSION);
             out.put("pid", android.os.Process.myPid());
             out.put("dataDir", dataDir);
@@ -270,6 +271,8 @@ public final class Daemon {
             out.put("watcherPassMs", passMs);
             out.put("dumpsysChars", watcher.lastDumpBytes());
             out.put("watcherError", watcher.lastError());
+            out.put("dumpOk", dumpOk);
+            out.put("dumpFailStreak", watcher.dumpFailStreak());
             out.put("policyPackages", policy.packageCount());
             out.put("binder", binderOk);
             out.put("binderError", b.lastError());

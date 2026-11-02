@@ -29,7 +29,7 @@ import org.json.JSONObject;
  */
 public final class CoreApi {
     /** Reported by getVersion / ping. */
-    public static final String VERSION = "jdspd 2.1.10";
+    public static final String VERSION = "jdspd 2.1.11";
     /** Returned by ping(). */
     public static final int PING_OK = 1;
     /**
@@ -880,6 +880,8 @@ public final class CoreApi {
             o.put("watcherCrosscheckAgoMs", watcher.lastCrosscheckAgoMs());
             o.put("watcherConfirmDumps", watcher.confirmDumps());
             o.put("watcherConfirmAgoMs", watcher.lastConfirmAgoMs());
+            o.put("watcherDumpFails", watcher.dumpFailStreak());
+            o.put("watcherDumpRetryInMs", watcher.dumpRetryInMs());
             o.put("watcherProbeRows", watcher.probeRows());
             o.put("watcherProbeAvailable", watcher.probeAvailable());
             o.put("probeDiscovering", watcher.probeDiscovering());

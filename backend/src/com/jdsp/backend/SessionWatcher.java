@@ -52,6 +52,7 @@ public final class SessionWatcher {
      *
      * @deprecated the loop is event driven; use {@link WatcherPolicy#LEGACY_POLL_MS}.
      */
+    @Deprecated
     public static final long POLL_MS = WatcherPolicy.LEGACY_POLL_MS;
     /** Hard timeout for one dumpsys invocation. */
     public static final long DUMPSYS_TIMEOUT_MS = 3000L;
@@ -149,21 +150,37 @@ public final class SessionWatcher {
     /** True when the last pass saw a different attachable session set (drives the ladder). */
     private volatile boolean dumpSetChanged;
     /** When "sessions attached but nothing plays" was first seen (0 = not armed). */
-    private long confirmArmedAt;
+    private volatile long confirmArmedAt;
     /** When the last confirmation dump ran (0 = none since start). */
     private volatile long lastConfirmAt;
     /** Current confirmation retry delay (see {@link WatcherPolicy#nextConfirmBackoff(long)}). */
     private long confirmBackoffMs = WatcherPolicy.CONFIRM_BACKOFF_START_MS;
+    /** Confirmation dumps that found the session alive (see {@link WatcherPolicy#confirmExhausted}). */
+    private int confirmRepeats;
     /** Confirmation dumps since start (diagnostics). */
     private volatile long confirmDumps;
     /** When the last "attach a dump-only session" dump ran (rate limit, 0 = never). */
     private volatile long lastDumpAttachAt;
     /** Consecutive attach dumps that did not produce a handle (loop guard). */
-    private int dumpAttachMisses;
-    /** Minimum spacing of the attach dumps (they only cost 90-120 ms, but never in a loop). */
-    private static final long DUMP_ATTACH_MIN_MS = 1000L;
-    /** Give up after this many consecutive attach dumps for the same corpse. */
-    private static final int DUMP_ATTACH_MAX_MISSES = 5;
+    /** Consecutive failed dumps (see {@link WatcherPolicy#nextDumpRetryMs(int)}). */
+    private int dumpFailStreak;
+    /** No dump is attempted before this instant, so a failing dump cannot spin the loop. */
+    private long dumpRetryAt;
+    /** Attach-dump misses per session id (a hopeless id must not park a healthy neighbour). */
+    private final Map<Integer, Integer> attachMissById = new HashMap<Integer, Integer>();
+    /** The dump-only ids the current dump was asked to attach. */
+    private final java.util.Set<Integer> attachCandidates = new java.util.HashSet<Integer>();
+    /** sessionId -> end of its attach park: no more attach dumps for this id until then. */
+    private final Map<Integer, Long> attachParkedUntil = new HashMap<Integer, Long>();
+    /** Current attach park delay (see {@link WatcherPolicy#nextAttachGiveUpMs(long)}). */
+    private long attachGiveUpMs = WatcherPolicy.ATTACH_GIVEUP_START_MS;
+    /** sessionId -> earliest time the next attach may be attempted (failed-attach back-off). */
+    private final Map<Integer, Long> attachRetryAt =
+            new java.util.concurrent.ConcurrentHashMap<Integer, Long>();
+    /** Current attach retry delay (see {@link WatcherPolicy#nextAttachRetryMs(long)}). */
+    private volatile long attachRetryMs = WatcherPolicy.ATTACH_RETRY_START_MS;
+    /** A due dump may be postponed for a poke at most until here (see POKE_DEFER_MAX_MS). */
+    private long dumpDeferUntil;
     /** Session ids of the last pass. */
     private java.util.Set<Integer> lastDumpIds = java.util.Collections.emptySet();
     /** Diagnostic line period of the watcher counters. */
@@ -246,7 +263,19 @@ public final class SessionWatcher {
         thread = new Thread(new Runnable() {
             @Override
             public void run() {
-                loop();
+                // The loop guards every pass, but a bug in the trigger arithmetic (or in the wake
+                // wait) must not kill the watcher thread silently: log it and restart the loop.
+                while (running) {
+                    try {
+                        loop();
+                        return;
+                    } catch (Throwable t) {
+                        failures++;
+                        lastError = "watcher loop failed: " + EffectManager.describe(t);
+                        Log.e(lastError, t);
+                        sleepQuietly(WatcherPolicy.FALLBACK_MS);
+                    }
+                }
             }
         }, "jdspd-watcher");
         thread.setDaemon(true);
@@ -376,6 +405,50 @@ public final class SessionWatcher {
                     WatcherPolicy.degradedFallbackMs(stableDegradedPasses,
                             blind ? WatcherPolicy.BLIND_MAX_MS
                                     : WatcherPolicy.DEGRADED_MAX_MS));
+            // One scan of the dump-only set answers both triggers below: "is a real session still
+            // attached?" (a confirmation only makes sense for a handle that exists - an unattached
+            // corpse is the attach trigger's business) and "does an unattached dump-only session
+            // need one more dump?".
+            //
+            // A dump-only session (native player) that survived its attach debounce needs exactly
+            // one more dump: the cheap pass cannot see it, so without this trigger its handle
+            // waited for the next ladder rung (3-15 s). The trigger is rate limited and every
+            // give-up parks the id, so it can never turn into a dump loop.
+            boolean dumpOnlyAttached = false;
+            boolean dumpAttachDue = false;
+            attachCandidates.clear();
+            if (probeOk && !dumpOnly.isEmpty()) {
+                boolean stormNow = inStorm();
+                boolean rateOk = now - lastDumpAttachAt >= WatcherPolicy.ATTACH_DUMP_MIN_MS;
+                java.util.Iterator<Integer> it = dumpOnly.iterator();
+                while (it.hasNext()) {
+                    Integer id = it.next();
+                    int sid = id.intValue();
+                    if (effects.isAttached(sid)) {
+                        dumpOnlyAttached = true;
+                        attachParkedUntil.remove(id);
+                        continue;
+                    }
+                    if (!rateOk) {
+                        continue;
+                    }
+                    Long parked = attachParkedUntil.get(id);
+                    if (parked != null && parked.longValue() > now) {
+                        continue;
+                    }
+                    if (!attachAllowed(sid)) {
+                        // Nothing may attach this session right now (excluded app, global switch
+                        // off, attach already in flight): a dump cannot change that, so spending
+                        // one would only burn 90-120 ms per second for nothing.
+                        continue;
+                    }
+                    Long seenAt = firstSeen.get(id);
+                    if (seenAt != null && mayAttach(seenAt, now, stormNow)) {
+                        attachCandidates.add(id);
+                        dumpAttachDue = true;
+                    }
+                }
+            }
             // Stale-session confirmation. A player that dies without closing its track (SIGTERM,
             // crash, kernel kill, or a player that simply stops feeding) leaves jdspd's own effect
             // handle behind in audioserver: the dump still lists "1 effects for session N" while the
@@ -383,42 +456,35 @@ public final class SessionWatcher {
             // dump-only session (that is what keeps native players attached), the dead session used
             // to sit there until the five-minute cross-check - measured 5 min 40 s. Ask for one dump
             // shortly after "attached but nothing plays" appears; if the session survives that dump
-            // it is real (a paused native player), so the repeats back off to one per minute.
-            boolean confirmWanted = probeOk && !dumpOnly.isEmpty() && !music && !probe.playing();
-            if (!confirmWanted) {
+            // it is real (a paused native player), so the repeats back off and finally stop until
+            // the state changes again (a session that dies later is still caught by the cross-check).
+            boolean confirmBase = probeOk && dumpOnlyAttached && !music && !probe.playing();
+            if (!confirmBase) {
                 confirmArmedAt = 0L;
+                lastConfirmAt = 0L;
                 confirmBackoffMs = WatcherPolicy.CONFIRM_BACKOFF_START_MS;
+                confirmRepeats = 0;
             } else if (confirmArmedAt == 0L) {
                 confirmArmedAt = now;
             }
-            boolean confirmDue = WatcherPolicy.confirmDue(now, confirmArmedAt, lastConfirmAt,
-                    confirmBackoffMs);
-            // A dump-only session (native player) that survived its attach debounce needs exactly
-            // one more dump: the cheap pass cannot see it, so without this trigger its handle
-            // waited for the next ladder rung (3-15 s). The stamp is consumed when the dump is
-            // armed, so a session whose attach fails is re-observed from scratch on the next dump
-            // instead of turning this trigger into a dump loop.
-            boolean dumpAttachDue = false;
-            if (probeOk && !dumpOnly.isEmpty() && now - lastDumpAttachAt >= DUMP_ATTACH_MIN_MS) {
-                java.util.Iterator<Integer> it = dumpOnly.iterator();
-                while (it.hasNext()) {
-                    Integer id = it.next();
-                    if (effects.isAttached(id.intValue())) {
-                        continue;
-                    }
-                    Long seenAt = firstSeen.get(id);
-                    if (seenAt != null && mayAttach(seenAt, now, inStorm())) {
-                        dumpAttachDue = true;
-                        break;
-                    }
+            boolean confirmDue = !WatcherPolicy.confirmExhausted(confirmRepeats)
+                    && WatcherPolicy.confirmDue(now, confirmArmedAt, lastConfirmAt,
+                            confirmBackoffMs);
+            boolean needDump = crossDue || degradedDue || confirmDue || dumpAttachDue;
+            // A dump that just failed is not retried at once: the deadline it was meant to answer is
+            // still open, so without this gate the scheduler stays "due" forever and the loop forks
+            // one dumpsys per iteration - and, worse, skips the maintenance timer and the wake wait.
+            boolean dumpDue = needDump && now >= dumpRetryAt;
+            if (WatcherPolicy.shouldRunPass(poke, dumpDue, changed)) {
+                // A poke is served from the cheap view whenever the probe is usable: the App pokes
+                // on every slider frame, and a due dump would add its 90-120 ms to that frame. The
+                // deferral is bounded by POKE_DEFER_MAX_MS, so a stream of pokes cannot starve the
+                // dump a trigger asked for (and the attach debounce it has to beat is 400 ms).
+                boolean deferDump = poke && probeOk && dumpDue && now >= dumpDeferUntil;
+                if (deferDump) {
+                    dumpDeferUntil = now + WatcherPolicy.POKE_DEFER_MAX_MS;
                 }
-                if (!dumpAttachDue) {
-                    dumpAttachMisses = 0;
-                }
-            }
-            if (WatcherPolicy.shouldRunPass(poke,
-                    crossDue || degradedDue || confirmDue || dumpAttachDue, changed)) {
-                boolean full = crossDue || degradedDue || confirmDue || dumpAttachDue;
+                boolean full = dumpDue && !deferDump;
                 lastPassReason = poke ? "poke"
                         : (changed ? "change"
                                 : (crossDue ? "crosscheck"
@@ -427,28 +493,51 @@ public final class SessionWatcher {
                                                         : (blind ? "blind" : "degraded")))));
                 try {
                     if (full) {
-                        pollOnce();
-                        lastCrosscheckAt = System.currentTimeMillis();
-                        if (crossDue) {
+                        // Only a dump that really succeeded answers a deadline: a failed one
+                        // (timeout, killed, truncated output) must not consume the confirmation
+                        // back-off, the attach give-up budget or the cross-check deadline.
+                        boolean dumped = pollOnce();
+                        if (!dumped) {
+                            dumpFailStreak++;
+                            long retry = WatcherPolicy.nextDumpRetryMs(dumpFailStreak);
+                            dumpRetryAt = System.currentTimeMillis() + retry;
+                            Log.w("watcher: dump failed (" + lastError + "), retry in " + retry
+                                    + " ms, serving the cheap view meanwhile");
+                            // Attach, policy and detach decisions must keep working while the dump
+                            // does not: the cheap view is exactly what the steady state uses. Only
+                            // when that view is usable, though - a probe that cannot answer would
+                            // make every session look gone and release live handles.
+                            if (probeOk) {
+                                passFromProbe();
+                            }
+                        } else {
+                            dumpFailStreak = 0;
+                            dumpRetryAt = 0L;
+                        }
+                        if (dumped && crossDue) {
                             crossChecks++;
                         }
-                        if (confirmDue) {
-                            // A dump is a dump: it also answers the cross-check deadline.
+                        if (dumped && (crossDue || degradedDue)) {
+                            // Discovery dumps (five-minute cross-check, degraded ladder) also answer
+                            // the cross-check deadline; a confirmation or attach dump must not, or a
+                            // busy trigger could starve the periodic probe/dump comparison.
+                            lastCrosscheckAt = System.currentTimeMillis();
+                        }
+                        if (dumped && confirmDue) {
+                            // A confirmation only counts when the dump really answered it; the
+                            // back-off then grows so a paused native player costs at most a
+                            // handful of dumps before it goes quiet.
                             lastConfirmAt = System.currentTimeMillis();
                             confirmBackoffMs = WatcherPolicy.nextConfirmBackoff(confirmBackoffMs);
                             confirmDumps++;
+                            // A confirmation that found a different session set answered the
+                            // question (something appeared or vanished) and starts the repeats
+                            // over; one that found the same set counts towards the ceiling.
+                            confirmRepeats = dumpSetChanged ? 0 : confirmRepeats + 1;
                         }
-                        if (dumpAttachDue) {
+                        if (dumped && dumpAttachDue) {
                             lastDumpAttachAt = System.currentTimeMillis();
-                            dumpAttachMisses++;
-                            if (dumpAttachMisses > DUMP_ATTACH_MAX_MISSES) {
-                                // The session is a corpse the probe never saw and the attach cannot
-                                // succeed: stop spending dumps on it. Forgetting the stamps restarts
-                                // the observation window; the next dump retires the id from
-                                // dumpOnly if it is really gone.
-                                forgetUnattachedDumpOnly();
-                                dumpAttachMisses = 0;
-                            }
+                            noteAttachDumpResult();
                         }
                     } else {
                         passFromProbe();
@@ -632,14 +721,14 @@ public final class SessionWatcher {
      * poke: the config flush lives in the AsyncPersister and the deferred switch transition has
      * its own timer, both are only re-checked by {@link #slowMaintenance()}.
      */
-    public void pollOnce() {
+    public boolean pollOnce() {
         long t0 = System.currentTimeMillis();
         String dump = runDumpsys();
         ticks++;
         lastTickAt = t0;
         if (dump == null) {
             failures++;
-            return;
+            return false;
         }
         fullPasses++;
         lastDumpBytes = dump.length();
@@ -694,11 +783,30 @@ public final class SessionWatcher {
         }
         dumpOnly.clear();
         for (int i = 0; i < list.size(); i++) {
-            Integer key = Integer.valueOf(list.get(i).sessionId);
+            int sid = list.get(i).sessionId;
+            if (sid <= 0) {
+                // 0 / -1 are the global mix sessions: never attachable, never a corpse.
+                continue;
+            }
+            Integer key = Integer.valueOf(sid);
             if (!probeIds.contains(key)) {
                 dumpOnly.add(key);
             }
         }
+        // Park and retry bookkeeping follows the dump-only set: ids that left it are forgotten, and
+        // an empty set restarts both ladders (the next native player gets the dense behaviour).
+        if (dumpOnly.isEmpty()) {
+            attachParkedUntil.clear();
+            attachRetryAt.clear();
+            attachMissById.clear();
+            attachGiveUpMs = WatcherPolicy.ATTACH_GIVEUP_START_MS;
+            attachRetryMs = WatcherPolicy.ATTACH_RETRY_START_MS;
+        } else {
+            attachParkedUntil.keySet().retainAll(dumpOnly);
+            attachRetryAt.keySet().retainAll(dumpOnly);
+            attachMissById.keySet().retainAll(dumpOnly);
+        }
+        return true;
     }
 
     /**
@@ -721,6 +829,8 @@ public final class SessionWatcher {
                     + " probe=" + (probeAvailable() ? "on" : "off")
                     + (probe == null ? "" : " probeAttempts=" + probe.setupAttempts()
                             + " probeSetupFail=" + probe.setupFailures())
+                    + " dumpFails=" + dumpFailStreak
+                    + (dumpRetryAt > nowMs ? " dumpRetryIn=" + (dumpRetryAt - nowMs) : "")
                     + " lastReason=" + lastPassReason);
         }
         try {
@@ -795,16 +905,40 @@ public final class SessionWatcher {
                     new InputStreamReader(process.getInputStream(), "UTF-8"), 16 * 1024);
             String line;
             int total = 0;
+            boolean tooLarge = false;
             while ((line = reader.readLine()) != null) {
                 total += line.length() + 1;
                 if (total > MAX_DUMP_BYTES) {
-                    lastError = "dumpsys output too large";
-                    Log.w(lastError);
+                    tooLarge = true;
                     break;
                 }
                 sb.append(line).append('\n');
             }
-            process.waitFor();
+            // A partial dump is worse than no dump: the parser cannot tell a truncated table from
+            // an empty one, and an empty session list makes the reconcile pass release every handle
+            // it holds (audible gap on a playing stream). Every incomplete outcome therefore returns
+            // null, and the caller advances its bookkeeping only for a dump that really succeeded.
+            if (!process.waitFor(DUMPSYS_TIMEOUT_MS, java.util.concurrent.TimeUnit.MILLISECONDS)) {
+                lastError = "dumpsys did not exit";
+                Log.w(lastError);
+                return null;
+            }
+            // audio_flinger always dumps its output threads; without that section the output was cut
+            // short (killed mid-write, or a shell wrapper that failed) and must not be parsed.
+            String problem = WatcherPolicy.dumpProblem(process.exitValue(), tooLarge, sb.length(),
+                    sb.indexOf("Output thread") >= 0);
+            if (problem == null && effects.handleCount() > 0
+                    && sb.indexOf(DumpsysParser.JDSP_UUID) < 0) {
+                // We hold at least one effect handle, so our own chain must appear in the dump: its
+                // absence means the text was cut after the output threads but before the effect
+                // chains. Parsing it would report "no jdsp effect" for a live session.
+                problem = "dumpsys output incomplete (own effect chain missing)";
+            }
+            if (problem != null) {
+                lastError = problem;
+                Log.w(lastError);
+                return null;
+            }
             lastError = "";
             return sb.toString();
         } catch (Throwable t) {
@@ -868,18 +1002,71 @@ public final class SessionWatcher {
     }
 
     /**
-     * Drops the attach-debounce stamp of every dump-only session that has no handle: the loop's
-     * attach dump gave up on it (see {@link #DUMP_ATTACH_MAX_MISSES}), so the id has to earn a new
-     * observation window before it costs another dump.
+     * Parks every dump-only session that still has no handle: the attach dump gave up on it (see
+     * {@link WatcherPolicy#ATTACH_DUMP_MAX_MISSES}), so the id must not cost another dump until the
+     * park expires. The park delay doubles per round up to
+     * {@link WatcherPolicy#ATTACH_GIVEUP_MAX_MS}, so a permanently unattachable session settles at
+     * one dump per five minutes instead of one per second.
+     *
+     * <p>The {@code firstSeen} stamp is deliberately kept: the session is real (a dump sees it), it
+     * just cannot be attached, and dropping the stamp would also feed the short-session storm
+     * detector with a bogus lifetime. Parking is per id and cleared as soon as a handle appears.
      */
-    private void forgetUnattachedDumpOnly() {
-        java.util.Iterator<Integer> it = dumpOnly.iterator();
-        while (it.hasNext()) {
-            Integer id = it.next();
-            if (!effects.isAttached(id.intValue())) {
-                firstSeen.remove(id);
+    /** The dump's view of one session, or null when the last dump did not list it. */
+    private SessionInfo dumpSession(int sessionId) {
+        List<SessionInfo> prev = lastDumpSessions;
+        for (int i = 0; i < prev.size(); i++) {
+            if (prev.get(i).sessionId == sessionId) {
+                return prev.get(i);
             }
         }
+        return null;
+    }
+
+    /**
+     * True when the reconcile pass would actually build a chain for this session now: the global
+     * switch is on, the policy does not exclude it and no attach for it is in flight. The attach
+     * dump exists to close the gap between "the dump sees it" and "a dump is due anyway", not to
+     * re-attempt what policy forbids.
+     */
+    private boolean attachAllowed(int sessionId) {
+        if (!config.isEnabled() || isAttachInFlight(sessionId)) {
+            return false;
+        }
+        SessionInfo info = dumpSession(sessionId);
+        return info != null && policy.decide(info, config).attach;
+    }
+
+    /**
+     * Per-id bookkeeping after a dump that was supposed to attach something: an id that is still
+     * not attached used up one of its {@link WatcherPolicy#ATTACH_DUMP_MAX_MISSES} dumps and is then
+     * parked for an escalating window; an id that got its handle forgets its misses. Counting per id
+     * keeps one hopeless session (a corpse the probe never saw, or a chain audioserver refuses) from
+     * parking a healthy native player that appeared in the same dump.
+     */
+    private void noteAttachDumpResult() {
+        long now = System.currentTimeMillis();
+        java.util.Iterator<Integer> it = attachCandidates.iterator();
+        while (it.hasNext()) {
+            Integer id = it.next();
+            int sid = id.intValue();
+            if (effects.isAttached(sid)) {
+                attachMissById.remove(id);
+                continue;
+            }
+            Integer miss = attachMissById.get(id);
+            int misses = (miss == null ? 0 : miss.intValue()) + 1;
+            if (misses < WatcherPolicy.ATTACH_DUMP_MAX_MISSES) {
+                attachMissById.put(id, Integer.valueOf(misses));
+                continue;
+            }
+            attachMissById.remove(id);
+            attachParkedUntil.put(id, Long.valueOf(now + attachGiveUpMs));
+            Log.w("watcher: session " + sid + " still unattached after " + misses
+                    + " dumps, parked for " + attachGiveUpMs + " ms");
+            attachGiveUpMs = WatcherPolicy.nextAttachGiveUpMs(attachGiveUpMs);
+        }
+        attachCandidates.clear();
     }
 
     /** Records one vanished session (called from the reconcile pass). */
@@ -998,6 +1185,14 @@ public final class SessionWatcher {
                                 seenAt.longValue() + debounceMs);
                         continue;
                     }
+                    // A session whose last attach failed waits for its retry deadline: retrying on
+                    // every tick meant one 60-230 ms AudioEffect ctor per 100-500 ms against a
+                    // session audioserver refuses to build a chain for.
+                    Long retryAt = attachRetryAt.get(key);
+                    if (retryAt != null && retryAt.longValue() > nowMs0) {
+                        nextAttachAt = Math.min(nextAttachAt, retryAt.longValue());
+                        continue;
+                    }
                     // The per-session attach work (AudioEffect ctor binder call 60-230 ms +
                     // the parameter replay) runs on the bounded shared pool: sessions are
                     // attached in parallel instead of serially, and the watcher tick itself
@@ -1091,6 +1286,23 @@ public final class SessionWatcher {
         }
     }
 
+    /** Records a successful attach: the retry ladder restarts for the next failure. */
+    private void noteAttachSuccess(int sessionId) {
+        attachRetryAt.remove(Integer.valueOf(sessionId));
+        attachRetryMs = WatcherPolicy.ATTACH_RETRY_START_MS;
+    }
+
+    /**
+     * Records a failed attach: the session is retried after a delay that doubles up to
+     * {@link WatcherPolicy#ATTACH_RETRY_MAX_MS}. Without it a session audioserver refuses to build
+     * a chain for was retried on every tick (100-500 ms), each attempt a 60-230 ms binder call.
+     */
+    private void noteAttachFailure(int sessionId) {
+        attachRetryAt.put(Integer.valueOf(sessionId),
+                Long.valueOf(System.currentTimeMillis() + attachRetryMs));
+        attachRetryMs = WatcherPolicy.nextAttachRetryMs(attachRetryMs);
+    }
+
     /** Marks a session's attach as in flight (package private, host tested). */
     void markAttachInFlight(int sessionId) {
         synchronized (attachInFlight) {
@@ -1117,6 +1329,7 @@ public final class SessionWatcher {
         try {
             int rc = effects.attach(s.sessionId, s.effectId);
             if (rc == EffectManager.OK) {
+                noteAttachSuccess(s.sessionId);
                 effects.setOwner(s.sessionId, s.uid, s.pkg, s.pid);
                 bus.applyAll(s.sessionId, d.params);
                 effects.setEnabled(s.sessionId, true);
@@ -1124,8 +1337,16 @@ public final class SessionWatcher {
                         + " pkg=" + s.pkg + " (" + d.reason + ")");
             } else if (rc != EffectManager.ERR_BUSY) {
                 // BUSY means another task is already attaching this session: silent, it will be.
+                noteAttachFailure(s.sessionId);
                 Log.w("attach session=" + s.sessionId + " failed rc=" + rc);
             }
+        } catch (Throwable t) {
+            // The attach runs on the shared pool: an escaping exception would kill the task
+            // silently and leave the session without a chain until the next pass retried it.
+            noteAttachFailure(s.sessionId);
+            failures++;
+            lastError = "attach session=" + s.sessionId + " threw: " + EffectManager.describe(t);
+            Log.e(lastError, t);
         } finally {
             // The in-flight marker must go away whatever the outcome, otherwise the reconcile
             // pass would skip this session's re-enable path forever.
@@ -1312,6 +1533,21 @@ public final class SessionWatcher {
     /** Confirmation dumps ("attached but nothing plays") since start. */
     public long confirmDumps() {
         return confirmDumps;
+    }
+
+    /** Consecutive failed dumps (0 = the last dump was usable). */
+    public int dumpFailStreak() {
+        return dumpFailStreak;
+    }
+
+    /** Milliseconds until the next dump attempt, 0 when nothing is pending. */
+    public long dumpRetryInMs() {
+        long at = dumpRetryAt;
+        if (at <= 0L) {
+            return 0L;
+        }
+        long left = at - System.currentTimeMillis();
+        return left > 0L ? left : 0L;
     }
 
     /**
