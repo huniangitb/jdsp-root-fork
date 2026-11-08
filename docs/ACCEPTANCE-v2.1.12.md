@@ -16,7 +16,9 @@
 
 ```
 dist/JDSP-fork-v2.1.12.zip   33,292,370 B
-sha256 55406d5805b398a6e61c28374647940b6913b2d90eb9c3cd98515e577e9e3f77
+sha256 a64760cd43d51c75dbdc234288edeec435fb055441e0ab96eba557a878277673
+   （重新打包只会改 zip 头里的 mtime；内容哈希固定：jdspd.dex 6d26a236…、jdspcli.dex 45777f6c…、
+     JamesDSPManagerThePBone.apk md5 9a6d51a1…，三者与设备上运行/安装的完全一致）
 内置 APK  JamesDSP-v1.6.21-67-root-full-universal-release.apk (39,793,045 B)
           md5 9a6d51a125aff7b7c2fe9422a142f72f  versionCode=67 versionName=1.6.21
 ```
