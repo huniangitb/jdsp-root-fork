@@ -29,7 +29,7 @@ import org.json.JSONObject;
  */
 public final class CoreApi {
     /** Reported by getVersion / ping. */
-    public static final String VERSION = "jdspd 2.1.12";
+    public static final String VERSION = "jdspd 2.1.13";
     /** Returned by ping(). */
     public static final int PING_OK = 1;
     /**
@@ -421,6 +421,11 @@ public final class CoreApi {
         if (persistable) {
             config.setParamFor("", paramId, value);
             persister.request();
+        } else {
+            // Content (LiveProg script, DDC/ArbEQ blobs): no config record exists, so remember it
+            // to replay into the next session that is attached. That is what makes the script a
+            // hot parameter instead of "press run again while music plays".
+            ContentReplay.get().record(paramId, value);
         }
         if (applied > 0) {
             return 0;
@@ -431,12 +436,13 @@ public final class CoreApi {
                 return 0;
             }
             // Content parameters (EEL/DDC/ArbEQ script, impulse response chunks, diagnostics) are
-            // forwarded only: with nothing mounted there is no instance to hold them and no
-            // config record to replay them from. Reporting success here is what made a LiveProg
-            // "run" with no playback session disappear without a trace.
-            Log.w("setParamGlobal: no mounted session for non-persistable param " + paramId
-                    + " (vsize=" + value.length + "), dropped");
-            return EffectManager.ERR_NO_SESSION;
+            // forwarded only: with nothing mounted there is no instance to hold them. They are not
+            // lost any more - ContentReplay holds the last transfer and applies it on the next
+            // attach - so this is a success with a note, not the silent drop (v2.1.12 reported
+            // -1002 and dropped) that forced a re-send while playing.
+            Log.i("setParamGlobal: no mounted session for content param " + paramId + " (vsize="
+                    + value.length + "), queued for the next session");
+            return 0;
         }
         // Mounted sessions exist but every write failed: report the engine status.
         return last;
@@ -799,6 +805,11 @@ public final class CoreApi {
         }
         config.setMode(mode);
         persister.request(); // never fsync on the request thread
+        // v2.1.13: the mode is a scope, not the insertion path, so a switch is applied by the
+        // running daemon on the next watcher tick - no audioserver restart, no reboot. Only the
+        // XML probe cache has to be dropped so a getmode right after the switch reports what is
+        // really mounted.
+        ModeEffective.reset();
         watcher.poke();
         return config.getMode();
     }
@@ -900,6 +911,11 @@ public final class CoreApi {
             o.put("watcherConfirmDumps", watcher.confirmDumps());
             o.put("watcherConfirmAgoMs", watcher.lastConfirmAgoMs());
             o.put("watcherDumpFails", watcher.dumpFailStreak());
+            // Content parameters (LiveProg script, DDC/ArbEQ blobs) are not in config.json; this is
+            // how many values are queued for the next session and how often they were replayed.
+            o.put("contentParams", ContentReplay.get().size());
+            o.put("contentBytes", ContentReplay.get().bytes());
+            o.put("contentReplays", ContentReplay.get().replays());
             o.put("watcherDumpRetryInMs", watcher.dumpRetryInMs());
             o.put("watcherProbeRows", watcher.probeRows());
             o.put("watcherProbeAvailable", watcher.probeAvailable());

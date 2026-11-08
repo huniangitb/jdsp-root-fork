@@ -11,14 +11,20 @@ import java.util.Map;
 /**
  * Maps uids to packages (/data/system/packages.list) and decides what to do with a session.
  *
- * <p>Decision inputs: the per app policy (follow / force on / exclude), the global enable flag
- * and the architecture mode:
+ * <p>Decision inputs: the per app policy (follow / force on / exclude) and the mode, which since
+ * v2.1.13 is a <em>scope</em> and no longer the insertion path (the insertion path is decided at
+ * runtime by {@link ModeEffective}):
  * <ul>
- *   <li>{@code auto}: only attach to sessions that already carry a JamesDSP instance created by
- *       the framework postprocess, so jdspd never creates a second one.</li>
- *   <li>{@code backend}: attach every eligible session, creating the instance when missing.</li>
+ *   <li>{@code auto} (传统模式, scope = global): every session is processed; the per app blacklist is
+ *       ignored, because the App hides it in this mode.</li>
+ *   <li>{@code backend} (按应用): the blacklist applies - an excluded app is bypassed by disabling
+ *       the framework instance it got (or by never attaching one when the daemon has to build the
+ *       chain itself).</li>
  * </ul>
- * Session 0 (the global mix) is never attached: the framework applies effects per session.
+ * Switching the mode therefore changes only this decision, which is what makes the switch instant:
+ * no audioserver restart, no reboot, no chain rebuild for the sessions that keep their handle.
+ *
+ * <p>Session 0 (the global mix) is never attached: the framework applies effects per session.
  */
 public final class PolicyEngine {
     /** Package database maintained by PackageManagerService (root readable). */
@@ -47,11 +53,6 @@ public final class PolicyEngine {
         public boolean attach;
         /** True when the policy forbids any effect for this session (must be released). */
         public boolean excluded;
-        /**
-         * True when the current view cannot answer the attach question yet: keep whatever
-         * handle is held and attach nothing new (auto mode, cheap-probe row).
-         */
-        public boolean keep;
         /** Effective policy mode (0 follow / 1 on / 2 exclude). */
         public int policyMode = JdspConst.POLICY_FOLLOW;
         /** Human readable reason, for logs and stats. */
@@ -182,8 +183,18 @@ public final class PolicyEngine {
         return pkg == null ? "" : pkg;
     }
 
-    /** Decides whether a session gets a handle and with which parameters. */
+    /** Decides with the scope of the configured mode (see {@link #decide(SessionInfo, ConfigStore, boolean)}). */
     public Decision decide(SessionInfo info, ConfigStore cfg) {
+        return decide(info, cfg, cfg.getMode() == JdspConst.MODE_BACKEND);
+    }
+
+    /**
+     * Decides whether a session gets a handle and with which parameters.
+     *
+     * @param perApp true for {@code mode=backend} (按应用: the blacklist applies), false for
+     *        {@code mode=auto} (传统模式: global, every session is processed)
+     */
+    public Decision decide(SessionInfo info, ConfigStore cfg, boolean perApp) {
         Decision d = new Decision();
         if (info == null) {
             d.reason = "no info";
@@ -199,34 +210,21 @@ public final class PolicyEngine {
         d.policyMode = policy;
         d.params = cfg.paramsFor(pkg);
 
+        if (!perApp) {
+            // Global scope: the App hides the per app blacklist in this mode, so honouring a
+            // leftover entry would bypass an app the user cannot even see in the list.
+            d.attach = true;
+            d.reason = policy == JdspConst.POLICY_EXCLUDE ? "global: blacklist ignored" : "global";
+            return d;
+        }
         if (policy == JdspConst.POLICY_EXCLUDE) {
             d.attach = false;
             d.excluded = true;
             d.reason = "excluded by policy";
             return d;
         }
-        if (policy == JdspConst.POLICY_ON) {
-            d.attach = true;
-            d.reason = "forced on by policy";
-            return d;
-        }
-        // follow global
-        if (cfg.getMode() == JdspConst.MODE_BACKEND) {
-            d.attach = true;
-            d.reason = "backend mode";
-            return d;
-        }
-        if (info.probeOnly) {
-            // Auto mode turns on info.jdspPresent, and only a dump can answer it. Deriving it
-            // from the cheap view (always false there) made jdspd attach and detach the very
-            // same handle within 1 ms - measured on ColorOS 16: the daemon never held a handle
-            // in auto mode and parameters never reached the framework instance.
-            d.keep = true;
-            d.reason = "auto: cheap view, handle kept";
-            return d;
-        }
-        d.attach = info.jdspPresent;
-        d.reason = info.jdspPresent ? "auto: framework instance present" : "auto: no instance, not created";
+        d.attach = true;
+        d.reason = policy == JdspConst.POLICY_ON ? "per app: forced on by policy" : "per app: follow global";
         return d;
     }
 }

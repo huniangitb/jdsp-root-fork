@@ -51,6 +51,19 @@ public final class WatcherPolicy {
     /** Cheap query cadence while something plays (v2.1.8: also while idle). */
     public static final long PROBE_MS = 100L;
     /**
+     * Cheap query cadence in auto ("traditional") mode, where the framework creates the effect
+     * instance itself at track creation and the engine restores its own parameter state.
+     *
+     * <p>There is nothing for the daemon to <em>discover</em> at 10 Hz: a new track already runs
+     * with the last applied parameters (restored from the engine state file), and jdspd only has
+     * to join the instance lazily to apply <em>new</em> user edits and to notice a vanished
+     * session. Measured on the target device the playback-time cost of the 10 Hz query is the
+     * dominant daemon CPU (1.05 % of one core, of which ~0.9-1.0 % is the query itself); at 2 Hz
+     * the same bookkeeping costs a quarter of that, and an App poke (a slider frame) still wakes
+     * the loop immediately, so live parameter latency is unchanged.
+     */
+    public static final long AUTO_PROBE_MS = 500L;
+    /**
      * Idle gate cadence. The gate itself is a binder call to AudioFlinger (~0.3-0.4 ms measured on
      * the target device; the playback-configuration query is 1-2.8 ms because it also parcels a
      * config per player and builds a {@code List}), so at 4 Hz the gate alone was 0.16 % of one
@@ -162,6 +175,18 @@ public final class WatcherPolicy {
 
     /** Cheap query cadence: fast while audio plays, relaxed while nothing does. */
     public static long probeSleepMs(boolean playing) {
+        return probeSleepMs(playing, false);
+    }
+
+    /**
+     * Cheap query cadence with the processing mode taken into account. Backend (per-app) mode
+     * keeps the dense rung - there the daemon itself builds the chain, so a late discovery is a
+     * late effect. Auto mode runs on {@link #AUTO_PROBE_MS}: see there.
+     */
+    public static long probeSleepMs(boolean playing, boolean autoMode) {
+        if (autoMode) {
+            return AUTO_PROBE_MS;
+        }
         return playing ? PROBE_MS : PROBE_IDLE_MS;
     }
 
@@ -234,6 +259,17 @@ public final class WatcherPolicy {
     /** Ceiling of the park delay: a permanently unattachable session costs one round per 5 min. */
     public static final long ATTACH_GIVEUP_MAX_MS = 300000L;
     /** First retry delay after a failed attach (each attempt is a 60-230 ms AudioEffect ctor). */
+    /**
+     * Park window for a session the framework did not build an instance for yet (traditional mode).
+     *
+     * <p>The dump that names a framework instance can legitimately run before audioserver adds the
+     * effect to the output chain: a track exists (the probe sees its session) for a few dozen
+     * milliseconds before the chain is built. The first park is therefore short - 1 s, 3 s, 10 s,
+     * then {@link #ATTACH_GIVEUP_START_MS} and up - and every rung costs exactly one dump. Parking
+     * for the full 30 s straight away would leave a freshly started track without parameter control
+     * for half a minute even though its instance appears a moment later.
+     */
+    public static final long ATTACH_AUTO_PARK_START_MS = 1000L;
     public static final long ATTACH_RETRY_START_MS = 400L;
     /** Ceiling of the attach retry delay. */
     public static final long ATTACH_RETRY_MAX_MS = 10000L;
@@ -243,6 +279,18 @@ public final class WatcherPolicy {
      * dies later is still caught by the {@link #CROSSCHECK_MS} cross-check.
      */
     public static final int CONFIRM_MAX_REPEATS = 4;
+
+    /** Ceiling for the "no framework instance yet" park (see {@link #ATTACH_AUTO_PARK_START_MS}). */
+    public static final long ATTACH_AUTO_PARK_MAX_MS = 30000L;
+
+    /** Next park delay for a session whose framework instance has not appeared (1 s, 2 s, ... 30 s). */
+    public static long nextAutoParkMs(long currentMs) {
+        if (currentMs <= 0L) {
+            return ATTACH_AUTO_PARK_START_MS;
+        }
+        long next = currentMs * 2L;
+        return next > ATTACH_AUTO_PARK_MAX_MS ? ATTACH_AUTO_PARK_MAX_MS : next;
+    }
 
     /** Next park delay after an attach gave up (doubles up to {@link #ATTACH_GIVEUP_MAX_MS}). */
     public static long nextAttachGiveUpMs(long currentMs) {

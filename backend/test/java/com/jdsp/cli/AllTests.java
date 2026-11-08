@@ -26,6 +26,7 @@ public final class AllTests {
         com.jdsp.backend.AsyncPersisterTest.run(suite);
         com.jdsp.backend.DiagnosticParamPersistenceTest.run(suite);
         com.jdsp.backend.AutoModeDecisionTest.run(suite);
+        com.jdsp.backend.ContentReplayTest.run(suite);
         ParserTest.run(suite);
         ValueCodecTest.run(suite);
         FormatTest.run(suite);

@@ -340,3 +340,56 @@ su -c 'grep -E "attach|detach" /data/adb/jdspd/jdspd.log | tail -20'
 su -c 'dumpsys media.audio_flinger' | grep -c 'UUID: f27317f4'
 ```
 
+
+## 8. v2.1.13：两种模式热切换（不重启 audioserver）
+
+### 8.1 mode 的含义变了
+
+| 概念 | v2.1.12 及以前 | v2.1.13 |
+| --- | --- | --- |
+| `mode` | 谁建链（auto=框架 / backend=jdspd） | **处理范围**（传统=全局，按应用=尊重黑名单） |
+| 插入路径 | 由 mode 决定 | 运行期探测：`ModeEffective.detect()` 读已挂载 XML 的 `effect="jamesdsp"` 标记 |
+| 切模式 | 写 XML + 重启（XML 是 ro 快照） | 只改策略，下一个 watcher tick 生效，**无需重启** |
+
+XML 里的 `postprocess` 注入依旧存在，但它只在 audioserver 启动时被读一次；一旦注入在，框架就会为每个
+被覆盖的流建实例，jdspd 只能 join、不能自己再建（否则同一条链上有两个 DSP）。反过来，开机时没注入，
+jdspd 就必须自己建链。`mode` 不再参与这个判断。
+
+### 8.2 三种情形
+
+| 探测到 insertion | 传统模式（auto） | 按应用模式（backend） |
+| --- | --- | --- |
+| `framework` | join 框架实例，忽略黑名单 → 全局处理 | join 框架实例；黑名单内应用把该实例 `setEnabled(false)` = 旁路 |
+| `daemon` | jdspd 自己建链（每会话，有 52-112 ms 建链延迟） | jdspd 自己建链；黑名单内不建 |
+| `unknown`（XML 不可读） | 按 daemon 处理 | 同左 |
+
+"传统模式没有爆音/没有附加延迟"的前提是 insertion=framework：链在 track 创建时由 audioserver 建好，
+jdspd 只是第二个 client（`EffectChain::addEffect_l` 引用计数），此后纯 `setParameter`（0.25 ms）。
+insertion=daemon 时传统模式仍可用，但每次新建会话都会有 backend 模式那条固有延迟——这由开机时的 XML 快照
+决定，与 App 里点了哪个开关无关。
+
+### 8.3 传统模式为什么必须先 dump 再 join
+
+`AudioEffect` 构造器不传 id 时无法区分"join 已有实例"和"新建实例"。v2.1.13 早期版本靠"实例是否 enabled"
+来推断，在框架还没建链的新 track 上实测构造耗时 **222 240 µs**（`createEffect_l` 全程持有混音线程锁，
+就是用户听到的爆音）。现在改为：先买一次 dumpsys 拿到该会话的框架实例 id，再 join —— 实测 3.7-16 ms，
+且每个新会话只买一次（限速 1/s）；dump 没看到实例的会话按 1 s → 2 s → 4 s → … → 30 s 阶梯 park。
+
+### 8.4 所有参数热切换
+
+可持久化参数本来就走 `config.json` + attach 时 `applyAll`。不可持久化的内容参数（LiveProg 脚本
+`8888/12001/10010/25002`、DDC/ArbEQ blob、脉冲响应）现在由 `ContentReplay` 记录，并在每个新会话 attach
+后按到达顺序回放（引擎要求 8888 先于 12001）。没有挂载会话时写这些参数返回 0 并入队，不再 `-1002` 丢弃。
+
+### 8.5 三条排查命令
+
+```sh
+# 1) 当前选择与插入路径（insertion 应等于 framework 才可能"零插入延迟"）
+su -c 'cat /data/adb/jdspd/mode'; su -c 'grep -c "effect=\"jamesdsp\"" /odm/etc/audio_effects.xml'
+
+# 2) 模式切换是否热生效（应只有 "mode -> auto/backend"，没有 audioserver 重启）
+su -c 'grep -E "mode ->|watcher pass" /data/adb/jdspd/jdspd.log | tail -5'
+
+# 3) join 是否走的是 dump 拿到的 id（应看到 "effectId=N (dump said N)" 与 3-16 ms）
+su -c 'grep -E "attach session=" /data/adb/jdspd/jdspd.log | tail -5'
+```

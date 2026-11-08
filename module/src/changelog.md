@@ -1,3 +1,35 @@
+### v2.1.13-fork（两种模式热切换 + 全部参数热切换 + App 崩溃修复）
+
+* **模式不再需要重启：mode 只是"范围"，插入路径改成运行期探测**：模块的 `<postprocess>` 注入是
+  启动时属性（mounted `audio_effects.xml` 是 ro 快照，audioserver 只在开机读一次），所以「传统模式 /
+  按应用模式」不再表示"由谁建链"，只表示**处理范围**：传统 = 全局（忽略按应用黑名单）、按应用 = 尊重黑名单。
+  实际由谁建链由 `ModeEffective.detect()` 读已挂载 XML 的 `effect="jamesdsp"` 标记决定（5 s 缓存）：
+  有标记 → 框架建实例、jdspd 只 join；无标记 → jdspd 自己建。切模式 = 改策略，下一个 watcher tick 生效，
+  **零重启、零 audioserver 重启**。`mode/getmode/setmode` 回复里 `modeEffective` 现在等于当前选择，
+  新增 `insertion=framework|daemon|unknown` 报告插入路径，`reboot_required` 恒为 false（只为老 App 保留）。
+* **传统模式零插入延迟（修 222 ms 建链）**：v2.1.13 早期版本用 `attachJoined`（不传 id，靠"实例是否 enabled"
+  推断是否 join），在框架还没建链的新 track 上实测 **222 240 µs** 的构造 + 立刻释放——那 222 ms 里
+  `createEffect_l` 一直持有混音线程锁，正是用户听到的爆音来源。现在传统模式**先买一次 dump 拿到框架实例的
+  effect id 再 join**：实测 `attach session=129 effectId=75 (dump said 75) … in 3723us`（3.7-16 ms），
+  且每个新会话只买一次 dump（限速 1/s），框架没建实例的会话按 **1 s → 2 s → … → 30 s** 阶梯 park，
+  不再按 tick 重试。join 来的句柄在 detach 时只 release、不 disable（否则等于把全局 DSP 偷偷关掉）。
+* **探节流**：传统模式且框架已注入时探测间隔 10 Hz → 2 Hz（`WatcherPolicy.AUTO_PROBE_MS = 500 ms`），
+  可用探针在传统模式下不再跑 blind/degraded dump 阶梯（那两种 dump 存在的意义是找廉价视图看不到的会话、
+  给它建链，而传统模式这两件事都不需要）。空闲态实测 0.183 % CPU、0 次 dumpsys。
+* **所有参数热切换**：非持久化内容参数（LiveProg 脚本 `8888/12001/10010/25002`、DDC/ArbEQ blob、脉冲响应）
+  过去"没会话就丢"，现在由新的 `ContentReplay` 记录并**在下一个会话 attach 时按到达顺序回放**
+  （8888 先于 12001，引擎的硬校验顺序）；没有挂载会话时 `setParamGlobal` 返回 0 并打
+  `queued for the next session`（v2.1.12 是 `-1002` 丢弃）。日志上限 8192 条 / 1 MiB，超限只记一次。
+* **App 1.6.22 (68)：修"前端打不开"的崩溃**：`FileLibraryPreference.onSetInitialValue` 在
+  `getExternalFilesDir(null)` 返回 null（`/data/media/0/Android/data/james.dsp` 不存在）且偏好里存了
+  **绝对路径**时 NPE，而崩溃发生在"恢复上次所在偏好屏"的 inflation 阶段 → App 冷启动直接崩、完全打不开。
+  修法：`toRelativePath()` 兜底（外部目录不可用时原样保留、转换失败不抛）、`Preset`/`BackupManager`/
+  `LiveprogParamsFragment` 同类路径统一改 `getExternalFilesDir(null) ?: filesDir`、偏好屏 inflation
+  失败时自动清本页保存值并重试一次 + 提示（`preference_inflation_failed`）。模式开关文案改为"切换立即生效"。
+* **新增 `scripts/ui_smoke.sh`**：逐个点开 App 能看到的每个入口并在崩溃时失败——上一版验收只用手点过
+  DSP 主屏，没碰过包含 `FileLibraryPreference` 的那个偏好屏，所以"前端打不开"没被发现。
+* 单测 298 → 307（`ContentReplayTest` 7 例 + park 阶梯 2 例），`--selftest` 11 PASS。
+
 ### v2.1.12-fork（"传统模式"真正全局生效：jdspd join 框架实例；App 模式开关接后端、参数值域对齐、LiveProg 恢复）
 
 * **auto 模式下 DSP「时有时无」的两个真因（两个 P0）**：
@@ -823,4 +855,3 @@
 * Module [GitHub](https://github.com/therealahrion/JamesDSPManager)
 
 App [GitHub](https://github.com/james34602/JamesDSPManager)
-

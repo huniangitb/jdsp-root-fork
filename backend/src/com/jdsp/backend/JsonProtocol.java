@@ -285,19 +285,23 @@ public final class JsonProtocol {
             }
             int mode = api.getMode();
             String modeName = mode == 1 ? "backend" : "auto";
-            // Selected vs effective: audio_effects.xml is mounted read only from an image
-            // snapshot at boot, so the XML side of a mode change can only be applied by the
-            // module on the next boot, while the daemon follows setmode at once. The App shows
-            // both, otherwise the switch looks applied while the audio path still does the old
-            // thing (the exact confusion this command exists for).
-            String effective = ModeEffective.detect();
-            boolean pending = effective.length() > 0 && !effective.equals(modeName);
+            // Scope switch, no reboot. Since v2.1.13 the mode selects the *scope* (global vs per
+            // app) and the daemon applies it on the next watcher tick, so "selected" and "in
+            // effect" are the same thing and modeEffective repeats modeName: an App that shows
+            // "selected X, in effect Y" must not have anything to report. The insertion path is a
+            // different question - the module's postprocess injection is a boot-time property of
+            // the mounted audio_effects.xml and decides whether jdspd joins the framework's
+            // instance or creates its own - so it is reported separately as "insertion".
+            // reboot_required stays in the reply for older Apps and is always false now.
+            String insertion = ModeEffective.detect();
             Reply reply = Reply.ok().with("mode", mode)
                     .with("modeName", modeName)
-                    .with("modeEffective", effective)
+                    .with("modeEffective", modeName)
+                    .with("insertion", insertion.length() == 0 ? "unknown"
+                            : ("auto".equals(insertion) ? "framework" : "daemon"))
                     .with("changed", changed)
-                    .with("reboot_required", pending)
-                    .with("rebootRequired", pending);
+                    .with("reboot_required", false)
+                    .with("rebootRequired", false);
             return reply;
         }
         if ("policy".equals(cmd) || "getpolicy".equals(cmd) || "setpolicy".equals(cmd)) {
