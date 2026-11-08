@@ -284,13 +284,20 @@ public final class JsonProtocol {
                 changed = true;
             }
             int mode = api.getMode();
+            String modeName = mode == 1 ? "backend" : "auto";
+            // Selected vs effective: audio_effects.xml is mounted read only from an image
+            // snapshot at boot, so the XML side of a mode change can only be applied by the
+            // module on the next boot, while the daemon follows setmode at once. The App shows
+            // both, otherwise the switch looks applied while the audio path still does the old
+            // thing (the exact confusion this command exists for).
+            String effective = ModeEffective.detect();
+            boolean pending = effective.length() > 0 && !effective.equals(modeName);
             Reply reply = Reply.ok().with("mode", mode)
-                    .with("modeName", mode == 1 ? "backend" : "auto");
-            if (changed) {
-                // audio_effects.xml is mounted read only from an image snapshot at boot, so the
-                // XML side of a mode change can only be applied by the module on the next boot.
-                reply.with("reboot_required", true).with("rebootRequired", true);
-            }
+                    .with("modeName", modeName)
+                    .with("modeEffective", effective)
+                    .with("changed", changed)
+                    .with("reboot_required", pending)
+                    .with("rebootRequired", pending);
             return reply;
         }
         if ("policy".equals(cmd) || "getpolicy".equals(cmd) || "setpolicy".equals(cmd)) {

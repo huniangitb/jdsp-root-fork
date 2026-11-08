@@ -1,3 +1,45 @@
+### v2.1.12-fork（"传统模式"真正全局生效：jdspd join 框架实例；App 模式开关接后端、参数值域对齐、LiveProg 恢复）
+
+* **auto 模式下 DSP「时有时无」的两个真因（两个 P0）**：
+  * *attach 后 1 ms 被拆*：廉价探针（`getActivePlaybackConfigurations`）看不到 effect chain，`SessionInfo.jdspPresent`
+    恒 false，`PolicyEngine.decide` 在 auto 模式下据此回 `attach=false`，reconcile 立刻把刚 join 上的句柄 detach
+    （实测日志 `attach session=137 effectId=155` 后 1 ms `detach … (auto: no instance, not created)`），
+    daemon 因此**几乎从不持有句柄**，参数只能靠偶发的交叉校验 dump 撞上。
+    修法：`SessionInfo.probeOnly` + `Decision.keep`（auto 模式下廉价行既不 attach 也不 detach，只维持 owner 记账），
+    attach/release 全部交给 dump 视图。
+  * *detach 把框架实例关掉*：`detach()` 原来无条件 `setEnabled(false)`，对 join 来的**框架拥有**的实例等于把
+    用户正在听的 DSP 静默关掉（实测残留 `enabled=false`）。修法：`Handle.joined`（`attach(sid, knownEffectId>0)` 即 join），
+    `detach()` 对 joined 只 release，只有"被排除的 App / 总开关关闭"才走新的 `detachHard()` 强制 disable。
+* **传统模式（全局挂载）现在真的是全局**：auto 模式下 audioserver 按 `<postprocess><stream type="music">` 在
+  **track 创建时**建实例（早于出声 ⇒ 无爆音、无附加延迟），jdspd 用同一个 `(type, uuid, sessionId)` 构造器
+  **加入**该实例（AOSP `EffectChain::addEffect_l` refcount++，不是第二个实例：实测 `jdsp instances=1`、该 effect
+  `2 Clients` = audioserver + jdspd），之后只做纯 `setParam`（0.25 ms）。这解释并落实了"按应用追加处理有一瞬底噪/生效延迟，
+  不如全局挂载稳定"的现场结论：差别不在引擎，而在**谁在什么时候建链**（backend 模式的 `createEffect_l` 要持混音线程锁
+  52-112 ms，还要 crossfade）。
+* **auto 模式的 dump 预算**：新增"未挂载的廉价会话最多花一次 dump"（`autoAttachCandidates`）；该 dump 里没有框架实例
+  （游戏/语音流不在 postprocess 覆盖范围）就固定 park 30 s，不再每秒问一次；attach in-flight 时不算 miss。
+* **控制通道：选择 vs 生效**：`mode`/`getmode`/`setmode` 回复新增 `modeEffective`（读已挂载 XML 里的
+  `effect="jamesdsp"` 标记，新类 `ModeEffective`，5 s TTL，读不到就回 `""` 绝不猜）、`changed`、
+  `reboot_required`/`rebootRequired`（= modeName ≠ modeEffective）。以前只回 `mode`，App 无法区分"已切换"与"已生效"。
+* **App（1.6.21 / 67）**：
+  * "传统模式"开关 → 后端 `setmode auto`，"增强处理" → `setmode backend`，以 `modeEffective` 渲染
+    "当前生效"，`rebootRequired` 时提示重启（不自动重启）；删掉只发 `ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION`
+    给旧 root 服务、对 jdspd 毫无影响的 `updateLegacyMode` 调用。
+  * 两个开关改成**单选**（后端只有两个 mode，界面上不存在"两个都关"）：关掉"传统模式"= 选"增强处理"，
+    关掉"增强处理"= 回"传统模式"；顺带修掉 root 模式下点"增强处理"会弹"没有 Root 权限"onboarding 的误导
+    （DUMP 权限门只留给 rootless 采集回路），开关也不再启停 `RootAudioProcessorService`；
+    两行 summary 文案改成描述真实语义（不再有"附加到会话 0"字样）。
+  * 参数值域按引擎语义对齐 + 绑定路径 clamp：低音最大增益控件原来 `min 3 / default 5`，而引擎与基线允 0..15，
+    后端值 1.0 直接塞 Slider 触发 `IllegalStateException: Slider value(1.0) must be greater or equal to valueFrom(3.0)`
+    （用户上报的崩溃）——现在 clamp + 域改 0..15（`MaterialSeekbarPreference.clampToRange`，注意**不能**放在
+    `onGetDefaultValue`，那时 mMin/mMax 还是 0）；谐波/次谐波 gain 键名错位一格且百分数未除 100（引擎要 0..1 线性）、
+    `iso_q` scale 1000→100、`loudness_mode` 映射删除（1301 只有 5 个 float）、`cast()` 补 Number→String（8 个下拉读路径）。
+  * LiveProg 恢复：编辑器"运行"现在**无条件**把脚本下发（`8888 → 12001×N → 10010 → 25002 → 1213`，顺序由引擎
+    `jamesdsp.c:853-877` 的容量校验决定），并新增 RELOAD_LIVEPROG 接收器（预设切换/恢复默认一并修好）。
+* **后端**：`setParamGlobal` 在没有任何已挂载会话且参数不可持久化时返回 `ERR_NO_SESSION(-1002)`，不再假成功。
+* **单测**：287 → **297 passed** + 自检 11 PASS（新增 `AutoModeDecisionTest` 10 例：auto 廉价行 keep、dump 无实例不挂、
+  dump 有实例挂、backend 廉价行挂、排除优先、session 0、marker 计数、无文件=unknown、有文件无 marker=backend、有 marker=auto）。
+
 ### v2.1.11-fork（静态审查收口：截断 dump 不再拆链、失败 dump 不再记账、dump 失败退避）
 
 * **截断/失败的 dump 不再被当成"真的没有会话"（P1）**：`runDumpsys` 改为有界等待，并抽出纯函数

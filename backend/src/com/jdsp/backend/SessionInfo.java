@@ -34,6 +34,17 @@ public final class SessionInfo {
     /** True when that existing JamesDSP instance reports "enabled". */
     public boolean jdspEnabled;
 
+    /**
+     * True when this row comes from the cheap probe view instead of a dump.
+     *
+     * <p>The probe knows the session ids but nothing about effect chains, so it cannot answer
+     * "does the framework already own a JamesDSP instance here" - that is exactly the question
+     * the auto mode turns on (see {@link PolicyEngine}). Such a row must never be used to
+     * attach (it would create an instance the auto mode must not create) or to detach (it would
+     * tear down a working framework instance on every cheap pass).
+     */
+    public boolean probeOnly;
+
     public SessionInfo() {
     }
 

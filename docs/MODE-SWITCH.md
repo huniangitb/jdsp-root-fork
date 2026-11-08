@@ -225,3 +225,118 @@ backend 模式时 FAIL 并直接给出 provider 路径；auto 模式 PASS 但把
 **验完务必恢复**：删掉 `disable`（或恢复文件）、`jdsp_mode.sh set auto` → 重启。
 本机的最终交付状态是 **auto + XagaSoundBoostTest 保持原样**（见 `docs/ACCEPTANCE-V2.md`）。
 
+
+---
+
+## 7. v2.1.12：运行期 mode 语义（auto = jdspd **join** 框架实例）
+
+> 本节是 v2.1.12 新增内容。§1-§6 讲的是"注入/挂载/切换"，本节讲**同一个 mode 在运行期到底谁在建效果链**。
+
+### 7.1 先分清两个"模式"
+
+| 名字 | 存在哪 | 谁在读 | 什么时候生效 |
+|---|---|---|---|
+| 选择的 mode | `/data/adb/jdspd/mode` + `config.json` 的 `mode` | jdspd | `setmode` **立即**生效 |
+| 生效的 mode | 已挂载的 `audio_effects.xml`（有无 `<apply effect="jamesdsp"/>`） | audioserver | **只有重启**才变（§1.2） |
+
+两者可以不一致，而且这种不一致正是旧版 App 最误导人的地方：用户点了"传统模式"，daemon 已经切了，
+框架还按旧 XML 跑，界面上却看不出差别。v2.1.12 起控制通道把两者一起返回：
+
+```json
+{"cmd":"setmode","mode":"backend"}
+{"ok":true,"mode":1,"modeName":"backend","modeEffective":"auto","changed":true,
+ "reboot_required":true,"rebootRequired":true}
+```
+
+- `modeName`：daemon 现在的做法；
+- `modeEffective`：**本机已挂载的 XML 判定出来的**值（`ModeEffective`：统计 `/odm|/vendor|/system/etc/audio_effects.xml`
+  与 `/vendor/etc/audio/sku_*/audio_effects.xml` 里的 `effect="jamesdsp"` 标记，≥1 → `auto`，可读但为 0 → `backend`，
+  全都读不到 → `""` = 不知道，绝不猜）；
+- `rebootRequired` = `modeName != modeEffective`（`changed` 只表示"这次请求真的改了值"）。
+
+### 7.2 auto 模式在运行期到底发生什么（ColorOS 16 / OPD2404 实测）
+
+1. **框架建链**：audioserver 按 `<postprocess><stream type="music">` 在 **track 创建时**（音频流动之前）为该
+   session 建一个实例。实测：播 1 kHz 正弦 → `Output thread` 里出现 `1 effects for session 89`，
+   `UUID: f27317f4-…`、`Clients: Pid 2276`（audioserver）。因为建链早于出声，**没有爆音、没有附加延迟**。
+2. **jdspd 加入（join）**：dump 确认该 session 已有实例后，`EffectManager.attach(sid, knownEffectId)` 带
+   `knownEffectId > 0` 走 `Effect(EFFECT_TYPE, UUID, 0, sessionId)` —— 对 AOSP 来说这是
+   `EffectChain::addEffect_l` 的 refcount++，**不是第二个实例**（实测 `jdsp instances=1`、该 effect `2 Clients`：
+   audioserver + jdspd）。
+3. **参数下发**：join 后 `set <session> 1500 …` 返回 `ok`（引擎写锁只认 jdspd 的 engine key），
+   `get` 读回字节完全一致。
+4. **释放**：会话消失 → 只 release 句柄，**不** `setEnabled(false)`（见 §7.4 bug B）。
+
+⇒ 「传统模式（全局挂载）」之所以更稳，机理就是：**链是框架在输出流启动时一次性建好的，daemon 只做纯
+setParam（0.25 ms）**；没有 `createEffect_l` 持混音线程锁（52-112 ms）、没有 crossfade，也就没有那一下底噪。
+
+### 7.3 为什么必须 join，而不是 daemon 自己再建一个
+
+引擎带写锁（`EngineWriteKey`/`EngineUnlockGate`）：只有持 key 的 jdspd 能 SET_PARAM。
+若 daemon 在 auto 模式下再自己 create 一个实例，同一个 session 会有两条处理链（双处理），
+参数还分成两份，听感与耗电都不可接受。所以 auto 模式的唯一正确动作是"找到框架实例并加入"。
+
+### 7.4 v2.1.12 修掉的两个真 bug（"传统模式 DSP 时有时无"的直接机理）
+
+- **bug A（attach 后 1 ms 被拆）**：廉价 probe 视图（`getActivePlaybackConfigurations`）看不到 effect chain，
+  所以 `SessionInfo.jdspPresent` 恒为 false，`PolicyEngine.decide` 在 auto 模式下回 `attach=false`
+  → reconcile 把刚 join 上的句柄立刻 detach。实测日志：`attach session=137 effectId=155` 后 1 ms
+  `detach session=137 (auto: no instance, not created)`，daemon 因此在 auto 模式下**几乎从不持有句柄**。
+  修法：`SessionInfo.probeOnly` + `PolicyEngine.Decision.keep`（auto 模式下的廉价行：既不 attach 也不 detach，
+  只维持 owner 记账），attach/release 全部交给 dump 视图。
+- **bug B（detach 把框架实例关掉）**：`detach()` 原来无条件 `setEnabled(false)`。对 join 来的框架实例，
+  这等于把用户正在听的 DSP 静默关掉（实测残留 `enabled=false`）。修法：`EffectManager.Handle.joined`，
+  `detach()` 对 joined 只 release；只有"被排除的 App / 总开关关闭"才走 `detachHard()` 强制 disable。
+- **附带收紧**：auto 模式下"廉价视图看得见、但还没挂上"的会话**最多花一次 dump**（`autoAttachCandidates`）；
+  该 dump 里没有框架实例（游戏/语音流等不在 postprocess 覆盖范围）就固定 park 30 s，不再每秒问一次；
+  attach 正在 in-flight 时不算 miss（否则会在 attach 完成的 22 ms 前打一条误导性的 park 日志）。
+
+### 7.5 App 侧契约
+
+| 动作 | 协议 | 说明 |
+|---|---|---|
+| 读模式 | `{"cmd":"getmode"}` | 取 `modeName`/`modeEffective`/`rebootRequired` |
+| 切模式 | `{"cmd":"setmode","mode":"auto"\|"backend"}` | 同时写 `/data/adb/jdspd/mode` 与 `config.json` |
+| 开关总闸 | `{"cmd":"enabled","on":true}` | 与 mode 正交 |
+
+- `rebootRequired=true` 时 UI 必须明确提示"重启后生效"，**不能**假装已经生效；
+- `modeEffective=""`（读不到 XML，例如非 root 或路径不同）时只显示选择值，不显示"生效值"；
+- 未重启就切模式的后果不对称：`auto→backend` 通常仍只有一条链（daemon 会 join 框架那份），
+  **`backend→auto` 会让 DSP 静默失效直到重启**（框架没建实例，daemon 无可 join）。
+
+#### 7.5.1 两个开关是单选，不是两个独立功能（App 1.6.21）
+
+后端只有两个 mode，所以界面上这两行**不能**表达"两个开关都关"的状态：
+
+| 用户动作 | App 行为 | 后端 |
+|---|---|---|
+| 打开「传统模式」 | `setmode auto`，并把「增强处理」置为关 | `mode=auto` |
+| 关掉「传统模式」 | `setmode backend`，并把「增强处理」置为开 | `mode=backend` |
+| 打开「增强处理」 | `setmode backend`，并把「传统模式」置为关 | `mode=backend` |
+| 关掉「增强处理」 | `setmode auto`，并把「传统模式」置为开 | `mode=auto` |
+
+配套的取舍（都是"前端对齐后端"的直接结果，v2.1.12 之前的行为已删除）：
+
+- **root 模式下不再要求 DUMP 权限**：会话发现、attach、探活全在 jdspd；App 的 `hasDumpPermission()`
+  门只保留给 rootless 的采集回路（`isRootless() && !hasDumpPermission()` 才弹 onboarding）。
+  实测反例：root 设备上点「增强处理」会弹"没有 Root 权限"的 onboarding，因为旧代码把 DUMP 门
+  当成了 root 门的替代品。
+- **不再起旧服务**：开关不再调 `RootAudioProcessorService.startServiceEnhanced()` / `stopService()`
+  / `updateLegacyMode()`（后者是给已删除的 session-0 链路发 `ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION`）。
+  服务的生命周期由 `MainActivity`/`BootCompletedReceiver` 负责，与模式无关。
+- **「当前生效」是只读行**：渲染 `modeEffective`，与开关（= 选择值）分开显示，
+  这样"选了但没重启"一眼可见；切完弹一次重启提示，不自动重启。
+
+### 7.6 三条排查命令
+
+```sh
+# 1) 两端状态（选择 vs 生效）
+su -c 'cat /data/adb/jdspd/mode'; su -c 'grep -c "effect=\"jamesdsp\"" /vendor/etc/audio_effects.xml'
+
+# 2) daemon 是否真的 join 上了（应有 "attached session=… (auto: framework instance present)"）
+su -c 'grep -E "attach|detach" /data/adb/jdspd/jdspd.log | tail -20'
+
+# 3) 框架实例是否只此一个（instances 应为 1，Clients 应为 2）
+su -c 'dumpsys media.audio_flinger' | grep -c 'UUID: f27317f4'
+```
+

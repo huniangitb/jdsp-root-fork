@@ -321,12 +321,48 @@ public class EffectCtl {
         System.exit(0);
     }
 
+    /**
+     * takeover <session> [paramId floats...] — join a framework-created instance (auto mode),
+     * ask for control, then try SET_PARAM. Answers whether a joined handle can drive the engine
+     * after setControl(true), which decides if auto mode can be parameter-controlled at all.
+     */
+    static void takeover(String[] a) throws Exception {
+        int session = Integer.parseInt(a[1]);
+        AudioEffect fx = attach("jdsp", session);
+        describe(fx, "TAKEOVER session=" + session);
+        try {
+            java.lang.reflect.Method sc = AudioEffect.class.getMethod("setControl", boolean.class);
+            System.out.println("setControl(true)=" + sc.invoke(fx, Boolean.TRUE));
+        } catch (Throwable t) {
+            System.out.println("setControl threw " + t);
+        }
+        Thread.sleep(500);
+        System.out.println("setEnabled(true)=" + fx.setEnabled(true));
+        if (a.length >= 3) {
+            int paramId = Integer.parseInt(a[2]);
+            int n = a.length - 3;
+            ByteBuffer vb = ByteBuffer.allocate(n * 4).order(ByteOrder.LITTLE_ENDIAN);
+            for (int i = 0; i < n; i++) {
+                vb.putFloat(Float.parseFloat(a[3 + i]));
+            }
+            int rc = setParam(fx, paramId, vb.array());
+            System.out.println("setParameter(" + paramId + ", " + n + " floats) rc=" + rc);
+            Thread.sleep(300);
+            int rc2 = setParam(fx, paramId, vb.array());
+            System.out.println("setParameter#2 rc=" + rc2);
+        }
+        Thread.sleep(300);
+        try { fx.release(); } catch (Throwable ignored) {}
+        System.exit(0);
+    }
+
     public static void main(String[] args) throws Exception {
         String mode = args.length > 0 ? args[0] : "";
         if (mode.equals("matrix")) matrix(args);
         else if (mode.equals("getq")) getq(args);
         else if (mode.equals("setf")) setf(args);
         else if (mode.equals("ctl")) ctl(args);
+        else if (mode.equals("takeover")) takeover(args);
         else { System.out.println("unknown mode " + mode); System.exit(1); }
     }
 }

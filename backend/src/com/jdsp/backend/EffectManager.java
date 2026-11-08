@@ -131,17 +131,25 @@ public final class EffectManager {
         public volatile int uid = -1;
         public volatile String pkg = "";
         public volatile int pid = -1;
+        /**
+         * True when the instance already existed when the handle was created (the framework
+         * postprocess built it per track, auto mode): the audio chain then owns the instance and
+         * disabling it on release left the framework client with a disabled effect - measured as
+         * "DSP silently off after any attach/detach cycle". Released, never disabled.
+         */
+        final boolean joined;
         /** Cached getEnabled()/hasControl() reads (see {@link #STATE_TTL_MS}); 0 = unknown. */
         volatile long enabledAtMs;
         volatile boolean enabledCached;
         volatile long controlAtMs;
         volatile boolean controlCached;
 
-        Handle(int sessionId, AudioEffect effect, int effectId, long attachedAt) {
+        Handle(int sessionId, AudioEffect effect, int effectId, long attachedAt, boolean joined) {
             this.sessionId = sessionId;
             this.effect = effect;
             this.effectId = effectId;
             this.attachedAt = attachedAt;
+            this.joined = joined;
         }
     }
 
@@ -266,7 +274,9 @@ public final class EffectManager {
             AudioEffect fx = ctor.newInstance(JdspConst.EFFECT_TYPE, JdspConst.EFFECT_UUID,
                     Integer.valueOf(0), Integer.valueOf(sessionId));
             int id = safeEffectId(fx);
-            Handle h = new Handle(sessionId, fx, id, System.currentTimeMillis());
+            // A dump that named an existing instance means the ctor joined it (AOSP
+            // EffectChain::addEffect_l reference counting) instead of creating one.
+            Handle h = new Handle(sessionId, fx, id, System.currentTimeMillis(), knownEffectId > 0);
             synchronized (this) {
                 if (handles.containsKey(key)) {
                     // Lost a race that the in-flight set should have prevented; keep exactly
@@ -315,6 +325,12 @@ public final class EffectManager {
     /**
      * Releases the handle. Idempotent: detaching a session without a handle returns OK.
      *
+     * <p><b>Ownership</b>: a handle that joined a framework-owned instance (auto mode) is only
+     * released, never disabled - the audio chain keeps its own client on that instance and a
+     * disable would silently switch the global DSP off. {@link #detachHard(int)} overrides this
+     * for the cases where the user really asked for "no processing here" (policy exclusion,
+     * master switch off).
+     *
      * <p><b>Disable before release (bypass-then-unload)</b>: first a synchronous
      * {@code setEnabled(false)} (an immediate bypass that reaches the HAL), then
      * {@code release()}. On ROMs that tear the EffectHandle down promptly this destroys the
@@ -324,6 +340,19 @@ public final class EffectManager {
      * either way.
      */
     public int detach(int sessionId) {
+        return detach(sessionId, false);
+    }
+
+    /**
+     * Releases the handle and disables the instance first even when it belongs to the framework
+     * (policy exclusion, master switch off): the user asked for "no processing on this session",
+     * so leaving a live framework instance enabled would contradict the setting.
+     */
+    public int detachHard(int sessionId) {
+        return detach(sessionId, true);
+    }
+
+    private int detach(int sessionId, boolean disableJoined) {
         Handle h = handles.remove(Integer.valueOf(sessionId));
         if (h == null) {
             return OK;
@@ -354,7 +383,10 @@ public final class EffectManager {
          * monitor so a parallel detachAll overlaps them, and no in-flight write can reach the
          * instance any more. */
         try {
-            if (safeEnabled(h.effect)) {
+            if (!disableJoined && h.joined) {
+                Log.i("detach session=" + sessionId
+                        + " (framework instance, released enabled)");
+            } else if (safeEnabled(h.effect)) {
                 h.effect.setEnabled(false);
                 Log.i("detach session=" + sessionId + " disabled before release");
             }
@@ -412,6 +444,25 @@ public final class EffectManager {
 
     public boolean isAttached(int sessionId) {
         return handles.containsKey(Integer.valueOf(sessionId));
+    }
+
+    /** True when the held handle joined a framework-owned instance (auto mode). */
+    public boolean isJoined(int sessionId) {
+        Handle h = handles.get(Integer.valueOf(sessionId));
+        return h != null && h.joined;
+    }
+
+    /** Number of held handles that joined a pre-existing (framework) instance. */
+    public int joinedCount() {
+        int n = 0;
+        synchronized (this) {
+            for (Handle h : handles.values()) {
+                if (h.joined) {
+                    n++;
+                }
+            }
+        }
+        return n;
     }
 
     /**

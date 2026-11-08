@@ -29,7 +29,7 @@ import org.json.JSONObject;
  */
 public final class CoreApi {
     /** Reported by getVersion / ping. */
-    public static final String VERSION = "jdspd 2.1.11";
+    public static final String VERSION = "jdspd 2.1.12";
     /** Returned by ping(). */
     public static final int PING_OK = 1;
     /**
@@ -393,8 +393,13 @@ public final class CoreApi {
      * the per-session writes happen in process.
      *
      * @return 0 when at least one session accepted the write (or the intent was
-     *         stored while the backend is off / nothing is mounted),
-     *         {@link #ERR_DISABLED} when the master switch is off
+     *         stored in the configuration, i.e. the parameter is persistable),
+     *         {@link #ERR_DISABLED} when the master switch is off,
+     *         {@link EffectManager#ERR_NO_SESSION} when nothing is mounted **and** the
+     *         parameter is not persistable: such a value can neither be applied (no
+     *         engine instance) nor stored (no config record), so it must not report
+     *         success - a LiveProg/DDC/ArbEQ script pushed while nothing plays used to
+     *         vanish silently that way
      */
     public int setParamGlobal(int paramId, byte[] value) {
         if (value == null || value.length == 0) {
@@ -412,15 +417,29 @@ public final class CoreApi {
                 applied++;
             }
         }
-        if (isPersistable(paramId, value)) {
+        boolean persistable = isPersistable(paramId, value);
+        if (persistable) {
             config.setParamFor("", paramId, value);
             persister.request();
         }
         if (applied > 0) {
             return 0;
         }
-        // Nothing mounted: keep the value (the config replay applies it on attach).
-        return targets.isEmpty() ? 0 : last;
+        if (targets.isEmpty()) {
+            if (persistable) {
+                // Stored in the configuration: the replay on attach applies it later.
+                return 0;
+            }
+            // Content parameters (EEL/DDC/ArbEQ script, impulse response chunks, diagnostics) are
+            // forwarded only: with nothing mounted there is no instance to hold them and no
+            // config record to replay them from. Reporting success here is what made a LiveProg
+            // "run" with no playback session disappear without a trace.
+            Log.w("setParamGlobal: no mounted session for non-persistable param " + paramId
+                    + " (vsize=" + value.length + "), dropped");
+            return EffectManager.ERR_NO_SESSION;
+        }
+        // Mounted sessions exist but every write failed: report the engine status.
+        return last;
     }
 
     /** One GET_PARAM; returns the value bytes, or an empty array on failure. */

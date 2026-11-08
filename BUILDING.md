@@ -66,15 +66,16 @@ AIDL_EFFECT_V=3 AIDL_TYPES_V=5 ./native/aidl/build-aidl.sh vendor
 
 ## 6. 版本基线
 
-当前模块源码 = v2.1.11-fork（versionCode 221），内置后端 jdspd 2.1.11、引擎补丁 0001-0008、
-App 1.6.20（versionCode 66；重连后以**后端**开关状态为准，另有 1.6.19 的一帧一批 / 全局参数 s=0、
-1.6.18 的总开关意图直投 / -1006 业务码透传 / 20 s TCP 保活）。分发包
-`dist/JDSP-fork-v2.1.11.zip`（33,280,516 B / `6fd4f7192e7412513b59ccaff20f256e45c24d7869888107048ac00e378ec5cd`；
+当前模块源码 = v2.1.12-fork（versionCode 222），内置后端 jdspd 2.1.12、引擎补丁 0001-0008、
+App 1.6.21（versionCode 67；模式开关接后端 setmode 并按 `modeEffective` 显示"当前生效"、参数值域对齐引擎 +
+绑定路径 clamp、LiveProg 无条件下发；1.6.20 起重连后以**后端**开关状态为准，另有 1.6.19 的一帧一批 /
+全局参数 s=0、1.6.18 的总开关意图直投 / -1006 业务码透传 / 20 s TCP 保活）。分发包
+`dist/JDSP-fork-v2.1.12.zip`（2.1.11 为 33,280,516 B / `6fd4f7192e7412513b59ccaff20f256e45c24d7869888107048ac00e378ec5cd`；
 2.1.10 为 33,276,424 B / `32879bca…c0fb4`，2.1.9 为 33,274,174 B / `4918908cc0…ec6f`）。
 
 App 构建（源码路线，Gradle 离线）：`cd /home/bdy/work/loundess_git && ./gradlew --offline --no-daemon \
 -Dorg.gradle.jvmargs=-Xmx3g --max-workers=2 assembleRootFullRelease`，产物
-`app/build/outputs/apk/rootFull/release/JamesDSP-v1.6.20-66-root-full-universal-release.apk`
+`app/build/outputs/apk/rootFull/release/JamesDSP-v1.6.21-67-root-full-universal-release.apk`
 （debug 签名证书 `904ddf44…`，可直接覆盖升级），再拷到 `module/src/common/files/JamesDSPManagerThePBone.apk`。
 
 引擎侧补丁（`native/patches/`，arm64/arm 两路都已编入；arm64-sve/aidl/x86 仍是上游预编译，未含补丁）：

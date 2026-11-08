@@ -12,6 +12,7 @@ import java.util.Set;
 
 import com.jdsp.common.BypassRule;
 import com.jdsp.common.EnableGate;
+import com.jdsp.common.JdspConst;
 import com.jdsp.common.WatcherPolicy;
 
 /**
@@ -170,6 +171,11 @@ public final class SessionWatcher {
     private final Map<Integer, Integer> attachMissById = new HashMap<Integer, Integer>();
     /** The dump-only ids the current dump was asked to attach. */
     private final java.util.Set<Integer> attachCandidates = new java.util.HashSet<Integer>();
+    /**
+     * Attach candidates that came from the cheap view (auto mode): one dump decides them, see
+     * {@link #noteAttachDumpResult()}.
+     */
+    private final java.util.Set<Integer> autoAttachCandidates = new java.util.HashSet<Integer>();
     /** sessionId -> end of its attach park: no more attach dumps for this id until then. */
     private final Map<Integer, Long> attachParkedUntil = new HashMap<Integer, Long>();
     /** Current attach park delay (see {@link WatcherPolicy#nextAttachGiveUpMs(long)}). */
@@ -417,7 +423,14 @@ public final class SessionWatcher {
             boolean dumpOnlyAttached = false;
             boolean dumpAttachDue = false;
             attachCandidates.clear();
-            if (probeOk && !dumpOnly.isEmpty()) {
+            autoAttachCandidates.clear();
+            // Auto mode's attach question ("does the framework already own an instance on this
+            // session") can only be answered by a dump, because jdspd has to name the effect id
+            // it wants to join. A probe-visible session that is not attached yet therefore costs
+            // exactly one dump; when that dump shows no instance for it the id is parked instead
+            // of costing a dump per second (see noteAttachDumpResult).
+            boolean autoMode = config.getMode() == JdspConst.MODE_AUTO;
+            if (probeOk && (!dumpOnly.isEmpty() || autoMode)) {
                 boolean stormNow = inStorm();
                 boolean rateOk = now - lastDumpAttachAt >= WatcherPolicy.ATTACH_DUMP_MIN_MS;
                 java.util.Iterator<Integer> it = dumpOnly.iterator();
@@ -446,6 +459,32 @@ public final class SessionWatcher {
                     if (seenAt != null && mayAttach(seenAt, now, stormNow)) {
                         attachCandidates.add(id);
                         dumpAttachDue = true;
+                    }
+                }
+                if (autoMode && rateOk) {
+                    List<AudioServiceProbe.Row> rows = probe.rows();
+                    for (int i = 0; i < rows.size(); i++) {
+                        int sid = rows.get(i).sessionId;
+                        if (sid <= 0) {
+                            continue;
+                        }
+                        Integer id = Integer.valueOf(sid);
+                        if (effects.isAttached(sid) || attachCandidates.contains(id)) {
+                            continue;
+                        }
+                        Long parked = attachParkedUntil.get(id);
+                        if (parked != null && parked.longValue() > now) {
+                            continue;
+                        }
+                        if (!autoAttachAllowed(sid)) {
+                            continue;
+                        }
+                        Long seenAt = firstSeen.get(id);
+                        if (seenAt != null && mayAttach(seenAt, now, stormNow)) {
+                            attachCandidates.add(id);
+                            autoAttachCandidates.add(id);
+                            dumpAttachDue = true;
+                        }
                     }
                 }
             }
@@ -604,6 +643,9 @@ public final class SessionWatcher {
             s.uid = row.uid;
             s.pid = row.pid;
             s.active = row.active;
+            // The probe cannot see effect chains: "does the framework already own an instance"
+            // (the auto mode's whole question) is unknowable from here.
+            s.probeOnly = true;
             Integer key = Integer.valueOf(s.sessionId);
             if (!firstSeen.containsKey(key)) {
                 firstSeen.put(key, Long.valueOf(t0));
@@ -1012,6 +1054,38 @@ public final class SessionWatcher {
      * just cannot be attached, and dropping the stamp would also feed the short-session storm
      * detector with a bogus lifetime. Parking is per id and cleared as soon as a handle appears.
      */
+    /**
+     * The most recent view of one session: the dump's row when it listed it, otherwise the cheap
+     * pass list (which carries pid/uid but no effect information, see
+     * {@link SessionInfo#probeOnly}).
+     */
+    private SessionInfo knownSession(int sessionId) {
+        SessionInfo s = dumpSession(sessionId);
+        if (s != null) {
+            return s;
+        }
+        List<SessionInfo> cur = sessions;
+        for (int i = 0; i < cur.size(); i++) {
+            if (cur.get(i).sessionId == sessionId) {
+                return cur.get(i);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * True when a cheap-view session is worth one dump in auto mode: the master switch is on, the
+     * app is not excluded and no attach for it is in flight. Everything else (does the framework
+     * actually own an instance here) is what the dump answers.
+     */
+    private boolean autoAttachAllowed(int sessionId) {
+        if (!config.isEnabled() || isAttachInFlight(sessionId)) {
+            return false;
+        }
+        SessionInfo info = knownSession(sessionId);
+        return info != null && !policy.decide(info, config).excluded;
+    }
+
     /** The dump's view of one session, or null when the last dump did not list it. */
     private SessionInfo dumpSession(int sessionId) {
         List<SessionInfo> prev = lastDumpSessions;
@@ -1050,7 +1124,7 @@ public final class SessionWatcher {
         while (it.hasNext()) {
             Integer id = it.next();
             int sid = id.intValue();
-            if (effects.isAttached(sid)) {
+            if (effects.isAttached(sid) || isAttachInFlight(sid)) {
                 attachMissById.remove(id);
                 continue;
             }
@@ -1066,6 +1140,29 @@ public final class SessionWatcher {
                     + " dumps, parked for " + attachGiveUpMs + " ms");
             attachGiveUpMs = WatcherPolicy.nextAttachGiveUpMs(attachGiveUpMs);
         }
+        java.util.Iterator<Integer> auto = autoAttachCandidates.iterator();
+        while (auto.hasNext()) {
+            Integer id = auto.next();
+            if (effects.isAttached(id.intValue()) || isAttachInFlight(id.intValue())) {
+                // In flight: the dump found the instance and the attach task is building the
+                // handle right now. Counting that as "no framework instance" parked a session
+                // that was attaching in the same pass (measured: the park log appeared 22 ms
+                // before "attached session=145").
+                attachParkedUntil.remove(id);
+                continue;
+            }
+            // One dump is all a cheap-view session gets in auto mode: the framework builds its
+            // instance when the track is created, so "no instance" means this stream is not one
+            // the postprocess XML covers (a game/voice stream), and asking again a second later
+            // buys nothing. Park it for the fixed start window - deliberately not through the
+            // shared give-up ladder, which a music session would then inherit.
+            attachMissById.remove(id);
+            attachParkedUntil.put(id,
+                    Long.valueOf(now + WatcherPolicy.ATTACH_GIVEUP_START_MS));
+            Log.i("watcher: no framework instance for session " + id
+                    + " (auto mode), parked for " + WatcherPolicy.ATTACH_GIVEUP_START_MS + " ms");
+        }
+        autoAttachCandidates.clear();
         attachCandidates.clear();
     }
 
@@ -1135,11 +1232,24 @@ public final class SessionWatcher {
             SessionInfo s = list.get(i);
             present.add(Integer.valueOf(s.sessionId));
             PolicyEngine.Decision d = policy.decide(s, config);
+            if (d.keep && !globallyDisabled) {
+                // Keep: a cheap pass may neither attach (auto mode must never create an instance
+                // and cannot tell whether the framework built one) nor detach (that tore down a
+                // working framework instance on every pass - measured: attached and detached
+                // within 1 ms, so auto mode never held a handle at all). Only the owner
+                // bookkeeping of a held handle continues.
+                if (effects.isAttached(s.sessionId) && !isAttachInFlight(s.sessionId)) {
+                    effects.setOwner(s.sessionId, s.uid, s.pkg, s.pid);
+                }
+                continue;
+            }
             int action = EnableGate.action(d.excluded, globallyDisabled, d.attach,
                     effects.isAttached(s.sessionId));
             if (action == EnableGate.ACTION_RELEASE) {
                 if (effects.isAttached(s.sessionId)) {
-                    effects.detach(s.sessionId);
+                    // Hard release: an excluded app / the master switch explicitly asked for "no
+                    // processing on this session", so a framework-owned instance is disabled too.
+                    effects.detachHard(s.sessionId);
                     bus.forgetSession(s.sessionId);
                     Log.i("detached session=" + s.sessionId + " pkg=" + s.pkg + " ("
                             + (globallyDisabled ? "global switch off, " : "")
@@ -1332,7 +1442,14 @@ public final class SessionWatcher {
                 noteAttachSuccess(s.sessionId);
                 effects.setOwner(s.sessionId, s.uid, s.pkg, s.pid);
                 bus.applyAll(s.sessionId, d.params);
-                effects.setEnabled(s.sessionId, true);
+                // The master switch is the authority: auto mode joins instances the framework
+                // already created and enabled, so an unconditional setEnabled(true) here would
+                // switch the DSP back on behind a user who turned it off (race: the switch flips
+                // between the policy decision and this task running).
+                boolean wantOn = config.isEnabled();
+                if (effects.isEnabled(s.sessionId) != wantOn) {
+                    effects.setEnabled(s.sessionId, wantOn);
+                }
                 Log.i("attached session=" + s.sessionId + " uid=" + s.uid
                         + " pkg=" + s.pkg + " (" + d.reason + ")");
             } else if (rc != EffectManager.ERR_BUSY) {

@@ -47,6 +47,11 @@ public final class PolicyEngine {
         public boolean attach;
         /** True when the policy forbids any effect for this session (must be released). */
         public boolean excluded;
+        /**
+         * True when the current view cannot answer the attach question yet: keep whatever
+         * handle is held and attach nothing new (auto mode, cheap-probe row).
+         */
+        public boolean keep;
         /** Effective policy mode (0 follow / 1 on / 2 exclude). */
         public int policyMode = JdspConst.POLICY_FOLLOW;
         /** Human readable reason, for logs and stats. */
@@ -209,6 +214,15 @@ public final class PolicyEngine {
         if (cfg.getMode() == JdspConst.MODE_BACKEND) {
             d.attach = true;
             d.reason = "backend mode";
+            return d;
+        }
+        if (info.probeOnly) {
+            // Auto mode turns on info.jdspPresent, and only a dump can answer it. Deriving it
+            // from the cheap view (always false there) made jdspd attach and detach the very
+            // same handle within 1 ms - measured on ColorOS 16: the daemon never held a handle
+            // in auto mode and parameters never reached the framework instance.
+            d.keep = true;
+            d.reason = "auto: cheap view, handle kept";
             return d;
         }
         d.attach = info.jdspPresent;
