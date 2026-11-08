@@ -90,8 +90,10 @@ topResumedActivity=james.dsp/...MainActivity，`logcat -b crash` 空；主界面
 
 - 不可持久化内容参数（8888/12000/12001/10004/10006/10009/10010/25000-25003、DDC/ArbEQ、脉冲响应）由 ContentReplay 记录，attach 后按到达顺序回放（8888 必须先于 12001）；
 - 无挂载会话时写这类参数：`setParamGlobal: no mounted session for content param 8888 (vsize=4), queued for the next session` 且返回 0（v2.1.12 是 -1002 丢弃，用户必须“播着再点一次运行”）；
-- 真机实测：连续写入 8888 / 12001(256 B) / 10010 → stats 里 `contentParams=3, contentBytes=262`；
-- **未完成**：attach 时的回放日志（`content replay: 3 value(s) into session=N`）本轮没抓到——最后一次尝试时设备从 adb 掉线（USB，此前也发生过）。单测 7 例覆盖顺序/8888 清空/多会话/上限/拷贝语义，但真机回放这一条要补。
+- 真机实测（App 路径，即真实用户路径）：没有会话时在 LiveProg 编辑器点"运行" → `stats` 里
+  `contentParams=4`（App 一次下发 8888 + 两个 12001 块 + 10010）；随后播放 → 新会话 attach 后立刻
+  `11-08 10:21:39.297 I/jdspd: content replay: 4 value(s) into session=105`，`contentReplays=1`。
+  即"不播放时点运行、之后再播放"这条路径现在能生效（v2.1.12 会静默丢弃）。
 
 ## 6. 静态检查
 
